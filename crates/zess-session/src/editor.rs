@@ -484,6 +484,7 @@ pub struct Session {
     height: u16,
     exiting: bool,
     mouse_regions: Vec<mouse::Region>,
+    command_mouse: Option<ui::CommandGrid>,
     mouse_context: zess_ui::MouseContext,
     mouse_drag: Option<ViewId>,
 }
@@ -524,6 +525,7 @@ impl Session {
             height: 24,
             exiting: false,
             mouse_regions: Vec::new(),
+            command_mouse: None,
             mouse_context: zess_ui::MouseContext::default(),
             mouse_drag: None,
         };
@@ -1074,6 +1076,16 @@ impl Session {
             scopes.push(scope);
         }
         (scopes, mode)
+    }
+
+    fn command_count(&self) -> CommandCount {
+        let view = &self.views[&self.focus];
+        match &self.buffers[&view.location.buffer] {
+            Buffer::Text(text)
+            | Buffer::Snapshot { text, .. }
+            | Buffer::PreviewText { text, .. } => text.view(self.focus).command_count(),
+            _ => view.count,
+        }
     }
 
     fn text_effect(&mut self, effect: TextEffect) -> Result<()> {
@@ -2228,6 +2240,148 @@ impl Session {
             view.register = RegisterInput::None;
         }
         result.map(|_| ())
+    }
+
+    pub fn frame(&mut self) -> Frame {
+        self.invalidate_text_prompt();
+        let previous_regions = std::mem::take(&mut self.mouse_regions);
+        let previous_command_mouse = self.command_mouse.take();
+        let width = usize::from(self.width);
+        let height = usize::from(self.height.saturating_sub(1));
+        let rectangles = self.visible_rectangles();
+        let mut rows = (0..height).map(|_| FrameRow::default()).collect::<Vec<_>>();
+        let mut cursor = None;
+        for (target, rect) in rectangles {
+            let (pane, position) = match target {
+                RenderTarget::View(id) => {
+                    self.render_view_at(id, rect.width, rect.height, (rect.x, rect.y))
+                }
+                RenderTarget::Surface { page, slot } => {
+                    (self.render_surface(page, &slot, rect), None)
+                }
+            };
+            for (offset, row) in pane.into_iter().enumerate().take(rect.height) {
+                let output = &mut rows[rect.y + offset].spans;
+                let used = output
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                    .sum::<usize>();
+                if used < rect.x {
+                    output.push(Span {
+                        base_style: None,
+                        text: format!("{}│", " ".repeat(rect.x - used - 1)),
+                        style: "window".into(),
+                    });
+                }
+                output.extend(clip_spans(row.spans, rect.width));
+            }
+            if let Some((x, y)) = position {
+                cursor = Some(((rect.x + x as usize) as u16, (rect.y + y as usize) as u16));
+            }
+        }
+        let input = self.active_prompt().map(Prompt::render_input);
+        let mut prompt = input
+            .as_ref()
+            .map(|(text, _)| text.clone())
+            .unwrap_or_else(|| self.pending_input());
+        if let Some((_, mut position)) = input {
+            while position >= width && !prompt.is_empty() {
+                let ch = prompt.chars().next().unwrap();
+                prompt.drain(..ch.len_utf8());
+                position = position.saturating_sub(ch.width().unwrap_or(0));
+            }
+            cursor = Some((position as u16, self.height - 1));
+        }
+        if self.help.is_some() {
+            self.mouse_regions.clear();
+        }
+        self.record_command_mouse();
+        self.render_help(&mut rows, width);
+        if self
+            .active_prompt()
+            .is_some_and(|prompt| !matches!(prompt.kind, PromptKind::Command))
+        {
+            self.mouse_regions.clear();
+        }
+        if self.mouse_regions.len() != previous_regions.len()
+            || self
+                .mouse_regions
+                .iter()
+                .zip(&previous_regions)
+                .any(|(current, previous)| {
+                    (&current.target, current.buffer, current.pane, current.body)
+                        != (
+                            &previous.target,
+                            previous.buffer,
+                            previous.pane,
+                            previous.body,
+                        )
+                })
+        {
+            self.mouse_context.layout_revision = self.mouse_context.layout_revision.wrapping_add(1);
+        }
+        if self.mouse_regions != previous_regions || self.command_mouse != previous_command_mouse {
+            self.mouse_context.content_revision =
+                self.mouse_context.content_revision.wrapping_add(1);
+        }
+        if let Some(error) = self
+            .active_prompt()
+            .and_then(|prompt| prompt.error.as_ref())
+            && let Some(row) = rows.last_mut()
+        {
+            let text = if UnicodeWidthStr::width(error.as_str()) > width {
+                let mut used = 1;
+                let tail = error
+                    .chars()
+                    .rev()
+                    .take_while(|ch| {
+                        used += ch.width().unwrap_or(0);
+                        used <= width
+                    })
+                    .collect::<String>();
+                format!("…{}", tail.chars().rev().collect::<String>())
+            } else {
+                error.clone()
+            };
+            row.spans = vec![Span {
+                base_style: None,
+                text: fit(&text, width),
+                style: "error".into(),
+            }];
+        }
+        if (self.help.is_some() && self.active_prompt().is_none()) || !self.pending.is_empty() {
+            cursor = None;
+        }
+        Frame {
+            mouse_context: self.mouse_context,
+            mouse_enabled: self.mouse_enabled(),
+            width: self.width,
+            height: self.height,
+            rows,
+            styles: self.services.borrow().git_styles(),
+            cursor,
+            cursor_shape: if self.active_prompt().is_some() {
+                CursorShape::Bar
+            } else {
+                let view = &self.views[&self.focus];
+                let mode = match &self.buffers[&view.location.buffer] {
+                    Buffer::Text(text)
+                    | Buffer::Snapshot { text, .. }
+                    | Buffer::PreviewText { text, .. } => text.view(self.focus).mode(),
+                    Buffer::Data { .. }
+                    | Buffer::Items { .. }
+                    | Buffer::PreviewRows { .. }
+                    | Buffer::PreviewDiff { .. } => view.location.mode.as_str(),
+                };
+                match mode {
+                    "insert" => CursorShape::Bar,
+                    "select" => CursorShape::Underline,
+                    _ => CursorShape::Block,
+                }
+            },
+            status: self.message.clone(),
+            prompt,
+        }
     }
 }
 

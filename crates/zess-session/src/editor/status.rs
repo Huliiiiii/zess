@@ -77,6 +77,13 @@ impl Session {
                     .sum::<usize>()
             };
             let left_width = length(&left).min(width);
+            let right_inset = context
+                .get("right_inset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(width.saturating_sub(left_width) as u64)
+                as usize;
+            let width = width - right_inset;
             let right_width = length(&right).min(width.saturating_sub(left_width));
             let center_width = length(&center).min(width.saturating_sub(left_width + right_width));
             let center_start = ((width.saturating_sub(center_width)) / 2)
@@ -95,6 +102,13 @@ impl Session {
                 style: String::new(),
             });
             spans.extend(clip_spans(right, right_width));
+            if right_inset > 0 {
+                spans.push(Span {
+                    base_style: None,
+                    text: " ".repeat(right_inset),
+                    style: String::new(),
+                });
+            }
             for span in &mut spans {
                 span.base_style = Some(style.into());
             }

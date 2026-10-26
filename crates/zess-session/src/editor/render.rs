@@ -194,6 +194,13 @@ impl Session {
             ),
         };
         let options = self.effective_view_options(id, &kind);
+        let pane_width = width;
+        let right_inset = usize::from(matches!(
+            kind.as_str(),
+            "files" | "git" | "git-commit-files"
+        ))
+        .min(width.saturating_sub(1));
+        let width = width - right_inset;
         let status_name = options
             .get("statusline")
             .and_then(Value::as_str)
@@ -463,13 +470,7 @@ impl Session {
             ));
         } else {
             let view = self.views.get_mut(&id).unwrap();
-            let right_padding = usize::from(matches!(
-                kind.as_str(),
-                "files" | "git" | "git-commit-files"
-            ))
-            .min(width.saturating_sub(1));
-            let list_width = width - right_padding;
-            view.viewport_width = list_width;
+            view.viewport_width = width;
             if view.location.horizontal_scroll > 0 {
                 view.location.horizontal_scroll = view
                     .location
@@ -588,19 +589,12 @@ impl Session {
                     });
                 }
                 skip_columns(&mut spans, view.location.horizontal_scroll);
-                let mut spans = align_row(
+                let spans = align_row(
                     spans,
                     &row.cells,
                     &style,
-                    &view.location.columns.layout(index, list_width),
+                    &view.location.columns.layout(index, width),
                 );
-                if right_padding > 0 {
-                    spans.push(Span {
-                        base_style: None,
-                        text: " ".into(),
-                        style: String::new(),
-                    });
-                }
                 rows.push(FrameRow { spans });
             }
             mouse_content = mouse::Content::Items {
@@ -626,8 +620,10 @@ impl Session {
         }
         rows.resize_with(pane_height, FrameRow::default);
         if !status_name.is_empty() {
+            context["width"] = json!(pane_width);
+            context["right_inset"] = json!(right_inset);
             rows.push(FrameRow {
-                spans: self.statusline(id, status_name, context, width, active),
+                spans: self.statusline(id, status_name, context, pane_width, active),
             });
         }
         let has_pane_layer =
@@ -639,7 +635,7 @@ impl Session {
                 pane: Rect {
                     x: origin.0,
                     y: origin.1,
-                    width,
+                    width: pane_width,
                     height,
                 },
                 body: Rect {
@@ -671,14 +667,37 @@ impl Session {
                     .unwrap_or(0)
                     .saturating_sub(view.location.scroll);
                 let start = (parent_row + 1).min(available.saturating_sub(overlay_height));
-                let (overlay, position) =
-                    self.render_view_at(child, width, overlay_height, (origin.0, origin.1 + start));
+                let (overlay, position) = self.render_view_at(
+                    child,
+                    pane_width,
+                    overlay_height,
+                    (origin.0, origin.1 + start),
+                );
                 for (offset, row) in overlay.into_iter().enumerate() {
                     rows[start + offset] = row;
                 }
                 cursor = position.map(|(x, y)| (x, y + start as u16));
             } else {
-                return self.render_view_at(child, width, height, origin);
+                return self.render_view_at(child, pane_width, height, origin);
+            }
+        }
+        if right_inset > 0 {
+            for (index, row) in rows.iter_mut().enumerate() {
+                let used = row
+                    .spans
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                    .sum::<usize>();
+                row.spans.push(Span {
+                    base_style: None,
+                    text: " ".repeat(pane_width.saturating_sub(used)),
+                    style: if index == pane_height && !status_name.is_empty() {
+                        if active { "status" } else { "status.inactive" }
+                    } else {
+                        ""
+                    }
+                    .into(),
+                });
             }
         }
         (rows, cursor)

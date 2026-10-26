@@ -15,13 +15,13 @@ impl Prompt {
     pub(super) fn render_input(&self) -> (String, usize) {
         let (prefix, text, cursor) = if let Some((kind, query)) = self.query() {
             let purpose = match self.kind {
-                PromptKind::Filter(_) => "Filter",
-                _ => "Find",
+                PromptKind::Filter(_) => "filter",
+                _ => "find",
             };
             let prefix = match kind {
-                zess_filter::QueryKind::Plain => format!("{purpose}: "),
-                zess_filter::QueryKind::Glob => format!("{purpose} (glob): "),
-                zess_filter::QueryKind::Regex => format!("{purpose} (regex): "),
+                zess_filter::QueryKind::Plain => format!("{purpose}:"),
+                zess_filter::QueryKind::Glob => format!("{purpose}(glob):"),
+                zess_filter::QueryKind::Regex => format!("{purpose}(re):"),
             };
             (prefix, query, self.cursor)
         } else {
@@ -41,10 +41,11 @@ impl Prompt {
 }
 
 pub(super) struct Completion {
-    prefix: String,
-    index: usize,
+    pub(super) prefix: String,
+    pub(super) index: usize,
 }
 
+#[derive(PartialEq)]
 pub(super) struct CommandCandidate {
     pub name: String,
     description: String,
@@ -88,6 +89,47 @@ pub(super) struct HelpContext {
 }
 
 impl Session {
+    pub(super) fn pending_input(&self) -> String {
+        let view = &self.views[&self.focus];
+        if let Some((_, target, _, read)) = &self.clipboard_read
+            && *target == self.focus
+        {
+            return format!("Reading register \"{} · Esc to cancel", read.register);
+        }
+        if let Some(jump) = &view.jump {
+            return if jump.input.is_empty() {
+                "Goto item: type a highlighted label · Esc to cancel".into()
+            } else {
+                format!(
+                    "Goto item: {}_ · type the second letter · Esc to cancel",
+                    jump.input
+                )
+            };
+        }
+        let pending = match &self.buffers[&view.location.buffer] {
+            Buffer::Text(text)
+            | Buffer::Snapshot { text, .. }
+            | Buffer::PreviewText { text, .. } => text.pending_input(self.focus),
+            _ => match view.register {
+                RegisterInput::None => String::new(),
+                RegisterInput::Selecting => "Register: type a name · Esc to cancel".into(),
+                RegisterInput::Selected(register) => format!("Register \"{register}"),
+            },
+        };
+        let mut parts = Vec::new();
+        let count = self.command_count();
+        if !count.is_empty() {
+            parts.push(count.to_string());
+        }
+        if !pending.is_empty() {
+            parts.push(pending);
+        }
+        if !self.pending.is_empty() {
+            parts.push(format!("{} … · Esc to cancel", self.pending.join(" ")));
+        }
+        parts.join(" · ")
+    }
+
     fn help_rows(&self, context: &HelpContext) -> Vec<DisplayRow> {
         let Some(scripts) = &self.scripts else {
             return Vec::new();
@@ -156,14 +198,13 @@ impl Session {
                                         &mut matcher,
                                         &mut indices,
                                     )?;
-                                    let priority = if !prefix.is_empty() && name != entry.name {
-                                        if name == prefix {
-                                            0
-                                        } else if name.starts_with(prefix) {
-                                            1
-                                        } else {
-                                            2
-                                        }
+                                    let priority = if !prefix.is_empty() && name == prefix {
+                                        0
+                                    } else if !prefix.is_empty()
+                                        && name != entry.name
+                                        && name.starts_with(prefix)
+                                    {
+                                        1
                                     } else {
                                         2
                                     };
@@ -240,8 +281,8 @@ impl Session {
                 (completion.index + candidates.len() - steps % candidates.len()) % candidates.len()
             }
             Some(completion) => (completion.index + steps) % candidates.len(),
-            None if backwards => candidates.len() - 1,
-            None => 0,
+            None if backwards => (candidates.len() - steps % candidates.len()) % candidates.len(),
+            None => steps % candidates.len(),
         };
         let prefix = prefix.to_owned();
         prompt.text = candidates[index].name.clone();
@@ -380,23 +421,48 @@ impl Session {
         }
         Ok(())
     }
+
+    pub(super) fn render_help(&mut self, rows: &mut [FrameRow], width: usize) {
+        if let Some(help) = &self.help {
+            let id = help.view;
+            let (rendered, _) = self.render_view(id, width, rows.len());
+            for (target, row) in rows.iter_mut().zip(rendered) {
+                *target = row;
+            }
+        }
+        if let Some(prompt) = self.active_prompt() {
+            if matches!(prompt.kind, PromptKind::Command)
+                && let Some(grid) = &self.command_mouse
+            {
+                grid.render(rows, width);
+            }
+        } else if !self.pending.is_empty() {
+            let (scopes, mode) = self.key_context();
+            let entries = self
+                .scripts
+                .as_ref()
+                .map(|scripts| {
+                    scripts.with_keymap(|keymap| {
+                        scripts.with_commands(|commands| {
+                            binding_entries(
+                                commands,
+                                keymap.effective_bindings(&scopes, &mode),
+                                &self.pending,
+                            )
+                        })
+                    })
+                })
+                .unwrap_or_default();
+            overlay(rows, width, &self.pending.join(" "), &entries);
+        }
+    }
 }
 
-fn overlay(
-    rows: &mut [FrameRow],
-    width: usize,
-    title: &str,
-    entries: &[(String, String)],
-    selected: Option<usize>,
-    scroll: usize,
-) {
+fn overlay(rows: &mut [FrameRow], width: usize, title: &str, entries: &[(String, String)]) {
     if entries.is_empty() || rows.len() < 3 || width < 8 {
         return;
     }
     let count = entries.len().min(rows.len() - 2).min(12);
-    let scroll = selected
-        .map_or(scroll, |index| index.saturating_sub(count - 1))
-        .min(entries.len().saturating_sub(count));
     let key_width = entries
         .iter()
         .map(|(key, _)| UnicodeWidthStr::width(key.as_str()))
@@ -405,7 +471,7 @@ fn overlay(
         .min(20);
     let popup_width = (entries
         .iter()
-        .map(|(_, label)| key_width + UnicodeWidthStr::width(label.as_str()) + 4)
+        .map(|(_, label)| key_width + 2 + UnicodeWidthStr::width(label.as_str()) + 2)
         .max()
         .unwrap_or(0))
     .max(UnicodeWidthStr::width(title) + 2)
@@ -415,22 +481,10 @@ fn overlay(
     let y = rows.len() - count - 2;
     for offset in 0..count + 1 {
         let (text, style) = if offset == 0 {
-            (format!(" {title}"), "status")
+            (title.to_owned(), "status")
         } else {
-            let index = scroll + offset - 1;
-            let (key, label) = &entries[index];
-            (
-                format!(
-                    " {} {} {label}",
-                    if selected == Some(index) { ">" } else { " " },
-                    fit(key, key_width)
-                ),
-                if selected == Some(index) {
-                    "selection"
-                } else {
-                    "popup"
-                },
-            )
+            let (key, label) = &entries[offset - 1];
+            (format!("{}  {label}", fit(key, key_width)), "popup")
         };
         let left = super::clip_spans(std::mem::take(&mut rows[y + offset].spans), x);
         rows[y + offset].spans = left;
@@ -448,93 +502,189 @@ fn overlay(
         }
         rows[y + offset].spans.push(Span {
             base_style: None,
-            text: fit(&text, popup_width),
+            text: format!(" {} ", fit(&text, popup_width - 2)),
             style: style.into(),
         });
     }
 }
 
-fn command_grid(
-    rows: &mut [FrameRow],
-    width: usize,
-    entries: &[CommandCandidate],
+#[derive(PartialEq)]
+pub(super) struct CommandGrid {
+    pub entries: Vec<CommandCandidate>,
+    pub prefix: String,
     selected: Option<usize>,
-    documentation: &[(String, &str)],
-) {
-    if rows.is_empty() || width == 0 {
-        return;
+    documentation: Vec<(String, &'static str)>,
+    cell: usize,
+    columns: usize,
+    count: usize,
+    start: usize,
+    y: usize,
+}
+
+impl Session {
+    pub(super) fn command_grid(&self, prompt: &Prompt, width: usize, height: usize) -> CommandGrid {
+        let prefix = prompt
+            .completion
+            .as_ref()
+            .map_or(prompt.text.as_str(), |completion| {
+                completion.prefix.as_str()
+            });
+        let entries = if prefix.contains(char::is_whitespace) {
+            Vec::new()
+        } else {
+            self.command_candidates(prefix)
+        };
+        let selected = (!entries.is_empty()).then(|| {
+            prompt
+                .completion
+                .as_ref()
+                .map_or(0, |completion| completion.index)
+        });
+        let documentation = selected
+            .and_then(|index| entries.get(index))
+            .map(CommandCandidate::documentation)
+            .or_else(|| {
+                let name = prompt.text.split_whitespace().next()?;
+                self.scripts.as_ref()?.with_commands(|catalog| {
+                    catalog.resolve_command_line(name).map(|command| {
+                        CommandCandidate::new(
+                            command,
+                            command.command_line.as_ref().unwrap(),
+                            Vec::new(),
+                        )
+                        .documentation()
+                    })
+                })
+            })
+            .unwrap_or_default();
+        let documentation = if width == 0 {
+            Vec::new()
+        } else {
+            documentation
+                .into_iter()
+                .flat_map(|(text, style)| {
+                    let mut lines = Vec::new();
+                    for line in text.lines() {
+                        let mut text = String::new();
+                        let mut used = 0;
+                        for grapheme in line.graphemes(true) {
+                            let size = UnicodeWidthStr::width(grapheme);
+                            if used + size > width && !text.is_empty() {
+                                lines.push((std::mem::take(&mut text), style));
+                                used = 0;
+                            }
+                            text.push_str(grapheme);
+                            used += size;
+                        }
+                        lines.push((text, style));
+                    }
+                    lines
+                })
+                .take(height.saturating_sub(usize::from(!entries.is_empty())))
+                .collect()
+        };
+        let cell = entries
+            .iter()
+            .map(|candidate| UnicodeWidthStr::width(candidate.label.as_str()) + 2)
+            .max()
+            .unwrap_or(1)
+            .min(width)
+            .max(1);
+        let columns = (width / cell).max(1);
+        let count = if width == 0 {
+            0
+        } else {
+            entries
+                .len()
+                .div_ceil(columns)
+                .min(height - documentation.len())
+                .min(8)
+        };
+        let start =
+            (selected.unwrap_or(0) / columns).saturating_sub(count.saturating_sub(1)) * columns;
+        let y = height - count - documentation.len();
+        CommandGrid {
+            entries,
+            prefix: prefix.to_owned(),
+            selected,
+            documentation,
+            cell,
+            columns,
+            count,
+            start,
+            y,
+        }
     }
-    let documentation = documentation
-        .iter()
-        .flat_map(|(text, style)| text.lines().map(move |line| (line, *style)))
-        .flat_map(|(line, style)| {
-            let mut lines = Vec::new();
-            let mut text = String::new();
-            let mut used = 0;
-            for grapheme in line.graphemes(true) {
-                let size = UnicodeWidthStr::width(grapheme);
-                if used + size > width && !text.is_empty() {
-                    lines.push((std::mem::take(&mut text), style));
-                    used = 0;
-                }
-                text.push_str(grapheme);
-                used += size;
-            }
-            lines.push((text, style));
-            lines
-        })
-        .take(rows.len().saturating_sub(usize::from(!entries.is_empty())))
-        .collect::<Vec<_>>();
-    let cell = (entries
-        .iter()
-        .map(|candidate| UnicodeWidthStr::width(candidate.label.as_str()) + 2)
-        .max()
-        .unwrap_or(1))
-    .min(width);
-    let columns = (width / cell).max(1);
-    let count = entries
-        .len()
-        .div_ceil(columns)
-        .min(rows.len() - documentation.len())
-        .min(8);
-    let start = (selected.unwrap_or(0) / columns).saturating_sub(count.saturating_sub(1)) * columns;
-    let y = rows.len() - count - documentation.len();
-    for (row, (text, style)) in rows[y..].iter_mut().zip(&documentation) {
-        row.spans = vec![Span {
-            base_style: None,
-            text: fit(text, width),
-            style: (*style).into(),
-        }];
+}
+
+impl CommandGrid {
+    pub(super) fn hit(&self, x: usize, y: usize, width: usize) -> Option<Option<usize>> {
+        if x >= width || y < self.y || y >= self.y + self.documentation.len() + self.count {
+            return None;
+        }
+        if y < self.y + self.documentation.len() {
+            return Some(None);
+        }
+        let column = x / self.cell;
+        let index = self.start + (y - self.y - self.documentation.len()) * self.columns + column;
+        Some((column < self.columns && index < self.entries.len()).then_some(index))
     }
-    for offset in 0..count {
-        let mut spans = Vec::<Span>::new();
-        for column in 0..columns {
-            let index = start + offset * columns + column;
-            if let Some(candidate) = entries.get(index) {
-                let base = if selected == Some(index) {
-                    "selection"
-                } else {
-                    "popup"
-                };
-                for (index, grapheme) in fit(&candidate.label, cell).graphemes(true).enumerate() {
-                    let style = if candidate.matches.contains(&index) {
-                        format!("{base}.match")
+
+    fn render(&self, rows: &mut [FrameRow], width: usize) {
+        for (row, (text, style)) in rows[self.y..].iter_mut().zip(&self.documentation) {
+            row.spans = vec![Span {
+                base_style: None,
+                text: fit(text, width),
+                style: (*style).into(),
+            }];
+        }
+        for offset in 0..self.count {
+            let mut spans = Vec::<Span>::new();
+            for column in 0..self.columns {
+                let index = self.start + offset * self.columns + column;
+                if let Some(candidate) = self.entries.get(index) {
+                    let base = if self.selected == Some(index) {
+                        "selection"
                     } else {
-                        base.into()
+                        "popup"
                     };
-                    if let Some(last) = spans.last_mut().filter(|span| span.style == style) {
-                        last.text.push_str(grapheme);
-                    } else {
+                    let mut used = 0;
+                    for (index, grapheme) in candidate.label.graphemes(true).enumerate() {
+                        if grapheme.chars().any(char::is_control) {
+                            continue;
+                        }
+                        let size = UnicodeWidthStr::width(grapheme);
+                        if used + size > self.cell {
+                            break;
+                        }
+                        used += size;
+                        let style = if candidate.matches.contains(&index) {
+                            format!("{base}.match")
+                        } else {
+                            base.into()
+                        };
+                        if let Some(last) = spans.last_mut().filter(|span| span.style == style) {
+                            last.text.push_str(grapheme);
+                        } else {
+                            spans.push(Span {
+                                base_style: None,
+                                text: grapheme.into(),
+                                style,
+                            });
+                        }
+                    }
+                    if used < self.cell {
                         spans.push(Span {
                             base_style: None,
-                            text: grapheme.into(),
-                            style,
+                            text: " ".repeat(self.cell - used),
+                            style: "popup".into(),
                         });
                     }
                 }
             }
+            rows[self.y + self.documentation.len() + offset].spans =
+                super::clip_spans(spans, width);
         }
-        rows[y + documentation.len() + offset].spans = super::clip_spans(spans, width);
     }
 }
 
