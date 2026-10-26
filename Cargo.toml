@@ -8,13 +8,12 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-zess-filter = { path = "crates/zess-filter" }
-regex = "1.13.1"
-globset = "0.4.21"
 anyhow = "1.0.104"
 git2 = { version = "0.21.0", default-features = false, features = ["unstable-sha256"] }
 insta = { version = "1.49.0", features = ["json"] }
 hegel = { package = "hegeltest", version = "0.50.3", features = ["static-engine"] }
+globset = "0.4.21"
+regex = "1.13.1"
 ignore = "0.4.33"
 notify = "8.2.1"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -39,6 +38,7 @@ helix-loader = { path = "vendor/helix-loader" }
 helix-core = { git = "https://github.com/helix-editor/helix", rev = "ba40e547426b0f9896c8bdc699a4ab11f2b37dbc" }
 helix-stdx = { git = "https://github.com/helix-editor/helix", rev = "ba40e547426b0f9896c8bdc699a4ab11f2b37dbc" }
 steel-core = { path = "vendor/steel-core", default-features = false, features = ["std", "modules", "sandbox"] }
+zess-filter = { path = "crates/zess-filter" }
 zess-ui = { path = "crates/zess-ui" }
 zess-protocol = { path = "crates/zess-protocol" }
 zess-ipc = { path = "crates/zess-ipc" }

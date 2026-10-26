@@ -1,0 +1,13 @@
+[package]
+name = "zess-script"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zess-filter.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+zess-wisp.workspace = true
+zess-plugin.workspace = true
+steel-core.workspace = true
+zess-ui.workspace = true
