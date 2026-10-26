@@ -19,12 +19,15 @@ use zess_plugin::{
 };
 use zess_plugin::{BufferId, EditorOptions, HostRequest, PluginInput, PluginOutput, ViewId};
 pub use zess_plugin::{
-    BufferKindId, IdentityRegistry, KeyResolution, KeyScopeId, ModeId, ModeRegistration,
+    BufferKindId, IdentityRegistry, KeyResolution, KeyScopeId, KeyState, ModeId, ModeRegistration,
 };
 
 mod bridge;
 mod registration;
 mod sources;
+
+#[cfg(test)]
+mod tests;
 
 const STANDARD_MODULES: [(&str, &str); 5] = [
     (
@@ -268,6 +271,223 @@ impl ScriptRuntime {
         Ok(())
     }
 
+    pub fn dispatch(&mut self, kind: &str, input: &PluginInput) -> Result<PluginOutput> {
+        let kind = self
+            .identities()
+            .buffer_kind(kind)
+            .ok_or_else(|| anyhow!("unknown buffer kind: {kind}"))?;
+        self.dispatch_by_id(kind, input)
+    }
+
+    pub fn dispatch_by_id(
+        &mut self,
+        kind: BufferKindId,
+        input: &PluginInput,
+    ) -> Result<PluginOutput> {
+        let backend = self
+            .registry
+            .borrow()
+            .plugins
+            .buffer_by_id(kind)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "unknown buffer kind: {}",
+                    self.identities().buffer_kind_name(kind)
+                )
+            })?;
+        let handler = match backend {
+            BufferBackend::External(handler) => handler,
+            BufferBackend::Native(backend) => return backend.borrow_mut().update(input),
+        };
+        let state = self
+            .states
+            .entry(input.buffer_id)
+            .or_insert_with(|| ScriptState {
+                value: SteelVal::Void.as_rooted(),
+                views: BTreeMap::new(),
+            });
+        if input.event == "view_cloned"
+            && let Some(source) = input.argument["source_view"].as_u64()
+            && let Some(source) = state.views.get(&source)
+        {
+            state.views.insert(
+                input.view_id,
+                ScriptView {
+                    value: source.value.value().as_rooted(),
+                    memories: source
+                        .memories
+                        .iter()
+                        .map(|(mode, value)| (mode.clone(), value.value().as_rooted()))
+                        .collect(),
+                },
+            );
+        }
+        let view = state
+            .views
+            .entry(input.view_id)
+            .or_insert_with(|| ScriptView {
+                value: SteelVal::Void.as_rooted(),
+                memories: BTreeMap::new(),
+            });
+        let arguments = vec![
+            bridge::input(input).map_err(script_error)?,
+            state.value.value().clone(),
+            view.value.value().clone(),
+            view.memories
+                .get(&input.mode)
+                .map(|v| v.value().clone())
+                .unwrap_or(SteelVal::Void),
+        ];
+        let input_value = self
+            .engine
+            .call_function_by_name_with_args("buffer-input", arguments)
+            .map_err(|e| self.source_error(e, None))?;
+        let result = self
+            .engine
+            .call_function_with_args(handler.function, vec![input_value])
+            .map_err(|e| self.source_error(e, None))?
+            .as_rooted();
+        let unpacked = self
+            .engine
+            .call_function_by_name_with_args("unpack-buffer-result", vec![result.value().clone()])
+            .map_err(|e| self.source_error(e, None))?;
+        let values = Vec::<SteelVal>::from_steelval(&unpacked).map_err(script_error)?;
+        let mut output = bridge::output(&values[3]).map_err(script_error)?;
+        let state = self.states.get_mut(&input.buffer_id).unwrap();
+        output.changed = state.value.value() != &values[0];
+        state.value = values[0].as_rooted();
+        let view = state.views.get_mut(&input.view_id).unwrap();
+        view.value = values[1].as_rooted();
+        view.memories
+            .insert(input.mode.clone(), values[2].as_rooted());
+        Ok(output)
+    }
+
+    pub fn is_native_buffer_id(&self, kind: BufferKindId) -> bool {
+        matches!(
+            self.registry.borrow().plugins.buffer_by_id(kind),
+            Some(BufferBackend::Native(_))
+        )
+    }
+
+    pub fn is_native_buffer(&self, kind: &str) -> bool {
+        matches!(
+            self.registry.borrow().plugins.buffer_backend(kind),
+            Some(BufferBackend::Native(_))
+        )
+    }
+
+    pub fn remove_view(&mut self, view: ViewId) {
+        for state in self.states.values_mut() {
+            state.views.remove(&view);
+        }
+        for backend in self.registry.borrow().plugins.buffer_backends() {
+            if let BufferBackend::Native(backend) = backend {
+                backend.borrow_mut().remove_view(view);
+            }
+        }
+    }
+
+    pub fn remove_buffer_view(&mut self, buffer: BufferId, view: ViewId) {
+        if let Some(state) = self.states.get_mut(&buffer) {
+            state.views.remove(&view);
+        }
+        for backend in self.registry.borrow().plugins.buffer_backends() {
+            if let BufferBackend::Native(backend) = backend {
+                backend.borrow_mut().remove_buffer_view(buffer, view);
+            }
+        }
+    }
+
+    pub fn remove_buffer(&mut self, buffer: BufferId) {
+        self.states.remove(&buffer);
+        for backend in self.registry.borrow().plugins.buffer_backends() {
+            if let BufferBackend::Native(backend) = backend {
+                backend.borrow_mut().remove_buffer(buffer);
+            }
+        }
+    }
+
+    pub fn register_native_command(&mut self, id: &str, description: &str) {
+        self.registry.borrow_mut().plugins.register_command(
+            id,
+            description,
+            CommandImplementation::Native,
+        );
+    }
+
+    pub fn register_native_action(&mut self, id: &str, description: &str) {
+        self.registry.borrow_mut().plugins.register_action(
+            id,
+            description,
+            CommandImplementation::Native,
+        );
+    }
+
+    pub fn resolve_command_line(&self, name: &str) -> Result<String> {
+        self.with_commands(|commands| {
+            commands
+                .resolve_command_line(name)
+                .map(|command| command.id.clone())
+                .ok_or_else(|| anyhow!("unknown command: {name}"))
+        })
+    }
+
+    pub fn register_command_line(&mut self, id: &str, name: &str) {
+        self.registry
+            .borrow_mut()
+            .plugins
+            .register_command_line(id, name);
+    }
+
+    pub fn register_command_alias(&mut self, alias: &str, name: &str) {
+        self.registry
+            .borrow_mut()
+            .plugins
+            .register_command_alias(alias, name);
+    }
+
+    pub fn command(&mut self, name: &str, argument: &Value) -> Result<CommandOutput> {
+        let (name, implementation) = {
+            let registry = self.registry.borrow();
+            let (name, implementation) = registry.plugins.lookup_command(name)?;
+            (name.to_owned(), implementation.clone())
+        };
+
+        match implementation {
+            CommandImplementation::Native => Ok(CommandOutput::Request(HostRequest::Action {
+                name,
+                argument: argument.clone(),
+            })),
+            CommandImplementation::Request(request) => Ok(CommandOutput::Request(request)),
+            CommandImplementation::External(handler) => {
+                let argument = argument.clone().into_steelval().map_err(script_error)?;
+                let value = self
+                    .engine
+                    .call_function_with_args(handler.function, vec![argument])
+                    .map_err(|error| self.source_error(error, None))?;
+                if let Ok(request) = bridge::Request::from_steelval(&value) {
+                    Ok(CommandOutput::Request(request.0))
+                } else {
+                    let value = Value::from_steelval(&value).map_err(script_error)?;
+                    if let Ok(request) = serde_json::from_value(value.clone()) {
+                        Ok(CommandOutput::Request(request))
+                    } else {
+                        Ok(CommandOutput::Value(value))
+                    }
+                }
+            }
+            CommandImplementation::BufferEvent { kind, event } => {
+                Ok(CommandOutput::Request(HostRequest::BufferEvent {
+                    kind,
+                    event,
+                    argument: argument.clone(),
+                }))
+            }
+        }
+    }
+
     pub fn register_native_module(&mut self, module: steel::steel_vm::builtin::BuiltInModule) {
         self.engine.register_module(module);
     }
@@ -292,8 +512,164 @@ impl ScriptRuntime {
             .with_context(|| format!("script API {name}"))
     }
 
+    pub fn event(&mut self, name: &str, argument: &Value) -> Result<Value> {
+        let handler = self
+            .registry
+            .borrow()
+            .plugins
+            .events
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown event: {name}"))?;
+
+        self.call(handler, argument)
+            .with_context(|| format!("event {name}"))
+    }
+
+    pub fn has_event(&self, name: &str) -> bool {
+        self.registry.borrow().plugins.events.contains_key(name)
+    }
+
+    pub fn editor_options(&self) -> EditorOptions {
+        self.registry.borrow().plugins.editor_options
+    }
+
+    pub fn view_options(&self, kind: &str) -> Value {
+        self.registry.borrow().plugins.view_options(kind)
+    }
+
+    pub fn validate_view_options(&self) -> Result<()> {
+        self.registry.borrow().plugins.validate_view_options()
+    }
+
+    pub fn validate_view_options_value(&self, options: &Value) -> Result<()> {
+        self.registry
+            .borrow()
+            .plugins
+            .validate_view_options_value(options)
+    }
+
+    pub fn format_statusline(&mut self, name: &str, context: &Value) -> Result<Value> {
+        let handler = self
+            .registry
+            .borrow()
+            .plugins
+            .statuslines
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown statusline: {name}"))?;
+
+        self.call(handler, context)
+            .with_context(|| format!("statusline {name}"))
+    }
+
+    fn call(&mut self, handler: Handler, argument: &Value) -> Result<Value> {
+        let argument = argument.clone().into_steelval().map_err(script_error)?;
+        let result = self
+            .engine
+            .call_function_with_args(handler.function, vec![argument]);
+
+        let result = result.map_err(|error| self.source_error(error, None))?;
+
+        Value::from_steelval(&result).map_err(|error| self.source_error(error, None))
+    }
+
     fn source_error(&self, error: SteelErr, fallback: Option<&Path>) -> anyhow::Error {
         self.sources.error(&self.engine, error, fallback)
+    }
+
+    pub fn commands(&self) -> Vec<String> {
+        self.with_commands(|commands| commands.iter().map(|command| command.id.clone()).collect())
+    }
+
+    pub fn with_commands<R>(&self, use_commands: impl FnOnce(&CommandCatalog) -> R) -> R {
+        use_commands(self.registry.borrow().plugins.catalog())
+    }
+
+    pub fn with_keymap<R>(&self, use_keymap: impl FnOnce(&Keymap) -> R) -> R {
+        use_keymap(&self.registry.borrow().plugins.keymap)
+    }
+
+    pub fn buffer_kinds(&self) -> Vec<String> {
+        let registry = self.registry.borrow();
+        registry
+            .plugins
+            .buffer_kinds()
+            .map(|kind| {
+                registry
+                    .plugins
+                    .identities()
+                    .buffer_kind_name(kind)
+                    .to_string()
+            })
+            .collect()
+    }
+
+    pub fn has_buffer_kind(&self, kind: &str) -> bool {
+        self.registry
+            .borrow()
+            .plugins
+            .buffer_backend(kind)
+            .is_some()
+    }
+
+    /// Heavy context fields requested by a buffer kind for the given event.
+    pub fn context_fields(&self, kind: &str, event: &str) -> Vec<String> {
+        self.registry.borrow().plugins.context_fields(kind, event)
+    }
+
+    pub fn identities(&self) -> IdentityRegistry {
+        self.registry.borrow().plugins.identities().clone()
+    }
+
+    pub fn resolve_keys_ids(
+        &self,
+        scopes: &[KeyScopeId],
+        mode: ModeId,
+        keys: &[String],
+    ) -> KeyResolution {
+        self.with_keymap(|keymap| match keymap.resolve_ids(scopes, mode, keys) {
+            KeyResolution::Command(command) => KeyResolution::Command(command.to_owned()),
+            KeyResolution::Prefix => KeyResolution::Prefix,
+            KeyResolution::Unbound => KeyResolution::Unbound,
+        })
+    }
+
+    pub fn resolve_keys(&self, scopes: &[&str], mode: &str, keys: &[String]) -> KeyResolution {
+        self.with_keymap(|keymap| match keymap.resolve(scopes, mode, keys) {
+            KeyResolution::Command(command) => KeyResolution::Command(command.to_owned()),
+            KeyResolution::Prefix => KeyResolution::Prefix,
+            KeyResolution::Unbound => KeyResolution::Unbound,
+        })
+    }
+
+    pub fn advance_key(
+        &self,
+        state: &mut KeyState,
+        scopes: &[&str],
+        mode: &str,
+        key: &str,
+    ) -> KeyResolution {
+        self.with_keymap(|keymap| match keymap.advance(state, scopes, mode, key) {
+            KeyResolution::Command(command) => KeyResolution::Command(command.to_owned()),
+            KeyResolution::Prefix => KeyResolution::Prefix,
+            KeyResolution::Unbound => KeyResolution::Unbound,
+        })
+    }
+
+    pub fn validate_bindings(&self) -> Result<()> {
+        self.registry.borrow().plugins.validate_bindings()
+    }
+
+    pub fn validate_bindings_for(&self, scopes: &[&str], mode: &str) -> Result<()> {
+        self.registry
+            .borrow()
+            .plugins
+            .validate_bindings_for(scopes, mode)
+    }
+
+    pub fn modes(&self) -> Vec<ModeRegistration> {
+        self.registry.borrow().plugins.modes().to_owned()
     }
 }
 
