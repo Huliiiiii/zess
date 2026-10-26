@@ -38,7 +38,8 @@ mod pages;
 mod preview;
 mod render;
 mod status;
-
+#[cfg(test)]
+mod tests;
 mod ui;
 use commands::{DataCommand, HelpCommand, NativeAction, PromptCommand};
 use pages::{PageId, RenderTarget};
@@ -862,6 +863,56 @@ impl Session {
         Ok(())
     }
 
+    pub fn input(&mut self, key: &str) {
+        self.mouse_drag = None;
+        self.invalidate_text_prompt();
+        self.clipboard_read = None;
+        self.message.clear();
+        let before = self.selection_snapshot();
+        if let Err(error) = self.handle_input(key) {
+            if self.active_prompt().is_none() {
+                self.cancel_text_command();
+            }
+            self.message = format!("error: {error:#}");
+        }
+        if !self.exiting() {
+            let result = (|| -> Result<()> {
+                self.emit_event(
+                    "input",
+                    json!({
+                        "key": key,
+                        "view_id": self.focus,
+                        "buffer_id": self.views[&self.focus].location.buffer,
+                    }),
+                )?;
+                let after = self.selection_snapshot();
+                if before != after {
+                    self.emit_event("selection-changed", after)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.message = format!("event: {error:#}");
+            }
+        }
+    }
+
+    fn selection_snapshot(&mut self) -> Value {
+        let view = &self.views[&self.focus];
+        if let Some(text) = self
+            .buffers
+            .get_mut(&view.location.buffer)
+            .and_then(Buffer::text)
+        {
+            json!({"view_id":self.focus,"buffer_id":view.location.buffer,"cursors":text.selections(self.focus)})
+        } else if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
+            let range = view.location.diff_selection.rows(diff);
+            json!({"view_id":self.focus,"buffer_id":view.location.buffer,"diff_selection":{"row": view.location.diff_selection.row(),"start_row":range.as_ref().map(|range| range.start()),"end_row":range.as_ref().map(|range| range.end())}})
+        } else {
+            json!({"view_id":self.focus,"buffer_id":view.location.buffer,"selection":view.location.selection})
+        }
+    }
+
     fn emit_event(&mut self, name: &str, argument: Value) -> Result<()> {
         if let Some(runtime) = &mut self.scripts
             && runtime.has_event(name)
@@ -1088,6 +1139,129 @@ impl Session {
         }
     }
 
+    fn handle_input(&mut self, key: &str) -> Result<()> {
+        if matches!(self.views[&self.focus].register, RegisterInput::Selecting) {
+            let key = if matches!(key, "space" | "Space") {
+                " "
+            } else {
+                key
+            };
+            let mut characters = key.chars();
+            let view = self.views.get_mut(&self.focus).unwrap();
+            view.register = match (characters.next(), characters.next()) {
+                (Some(character), None) => RegisterInput::Selected(character),
+                _ => {
+                    view.count.clear();
+                    RegisterInput::None
+                }
+            };
+            return Ok(());
+        }
+        if self.views[&self.focus].jump.is_some() {
+            return self.item_jump_input(key);
+        }
+        if self.help.is_none() && self.prompt.is_none() {
+            let buffer = self.views[&self.focus].location.buffer;
+            if self
+                .buffers
+                .get_mut(&buffer)
+                .and_then(Buffer::text)
+                .is_some_and(|text| text.has_pending_input(self.focus))
+            {
+                return self.text_input(key);
+            }
+        }
+        if self.pending.is_empty() {
+            self.key_state.reset();
+        }
+        let digit = key
+            .as_bytes()
+            .first()
+            .copied()
+            .filter(|_| key.len() == 1)
+            .filter(u8::is_ascii_digit)
+            .map(|digit| digit - b'0');
+        let mut previous_state = self.key_state.clone();
+        let match_key = if key == " " { "space" } else { key };
+        let mut key_state = std::mem::take(&mut self.key_state);
+        let (allows_count, resolution) = {
+            let (scopes, mode) = self.key_context();
+            let resolution = self
+                .scripts
+                .as_ref()
+                .context("plugin runtime unavailable")?
+                .advance_key(&mut key_state, &scopes, mode, match_key);
+            (matches!(mode, "normal" | "select"), resolution)
+        };
+        self.key_state = key_state;
+        if !self.key_state.shares_context(&previous_state) {
+            self.pending.clear();
+            previous_state = self.key_state.clone();
+            previous_state.reset();
+        }
+        if self.help.is_none() && self.active_prompt().is_none() && allows_count {
+            if let Some(digit) = digit {
+                let continuation = !self.command_count().is_empty();
+                let starts_count = digit != 0 && matches!(&resolution, KeyResolution::Unbound);
+                if continuation || starts_count {
+                    self.key_state = previous_state;
+                    let buffer = self.views[&self.focus].location.buffer;
+                    if let Some(text) = self.buffers.get_mut(&buffer).and_then(Buffer::text) {
+                        text.push_command_count(self.focus, digit);
+                    } else {
+                        self.views.get_mut(&self.focus).unwrap().count.push(digit);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        match resolution {
+            KeyResolution::Command(command) => {
+                self.pending.clear();
+                self.execute_command(&command, json!({}))
+            }
+            KeyResolution::Prefix => {
+                self.pending.push(match_key.to_owned());
+                Ok(())
+            }
+            KeyResolution::Unbound => {
+                let was_pending = !self.pending.is_empty();
+                self.views.get_mut(&self.focus).unwrap().register = RegisterInput::None;
+                self.views.get_mut(&self.focus).unwrap().count.clear();
+                self.pending.clear();
+                if was_pending {
+                    self.cancel_text_command();
+                    return Ok(());
+                }
+                if self.active_prompt().is_some() {
+                    return self.prompt_input(key);
+                }
+                self.cancel_text_command();
+                let buffer = self.views[&self.focus].location.buffer;
+                if self
+                    .buffers
+                    .get_mut(&buffer)
+                    .and_then(Buffer::text)
+                    .is_some_and(|text| text.view(self.focus).text_mode() == TextMode::Insert)
+                {
+                    self.text_input(key)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn text_input(&mut self, key: &str) -> Result<()> {
+        let buffer = self.views[&self.focus].location.buffer;
+        let effect = self
+            .buffers
+            .get_mut(&buffer)
+            .and_then(Buffer::text)
+            .context("command requires a text buffer")?
+            .input_text(self.focus, key)?;
+        self.text_effect(effect)
+    }
+
     fn text_effect(&mut self, effect: TextEffect) -> Result<()> {
         if let Some(text) = effect.clipboard {
             self.clipboard_writes.push(text);
@@ -1123,8 +1297,103 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn flush_clipboard_writes(
+        &mut self,
+        mut write: impl FnMut(String) -> Result<()>,
+    ) -> bool {
+        let writes = std::mem::take(&mut self.clipboard_writes);
+        let requested = !writes.is_empty();
+        for text in writes {
+            if let Err(error) = write(text) {
+                self.message = format!("clipboard: {error:#}");
+            }
+        }
+        requested
+    }
+
+    pub(crate) fn flush_primary_clipboard_writes(
+        &mut self,
+        mut write: impl FnMut(String) -> Result<()>,
+    ) -> bool {
+        let writes = std::mem::take(&mut self.primary_clipboard_writes);
+        let requested = !writes.is_empty();
+        for text in writes {
+            if let Err(error) = write(text) {
+                self.message = format!("clipboard: {error:#}");
+            }
+        }
+        requested
+    }
+
+    pub(crate) fn clipboard_request(&self) -> Option<(u64, bool)> {
+        self.clipboard_read
+            .as_ref()
+            .map(|(id, _, _, read)| (*id, read.register == '*'))
+    }
+
+    pub(crate) fn complete_clipboard_read(
+        &mut self,
+        id: u64,
+        text: Option<String>,
+        error: Option<String>,
+    ) {
+        let Some((request, view, buffer, read)) = self.clipboard_read.take() else {
+            return;
+        };
+        if request != id {
+            self.clipboard_read = Some((request, view, buffer, read));
+            return;
+        }
+        if let Some(error) = error {
+            self.message = format!("clipboard: {error}");
+            return;
+        }
+        let Some(text) = text else {
+            self.message = "clipboard: no data returned".into();
+            return;
+        };
+        if self.focus != view
+            || self
+                .views
+                .get(&view)
+                .is_none_or(|current| current.location.buffer != buffer)
+        {
+            return;
+        }
+        let before = self.selection_snapshot();
+        let result = self
+            .buffers
+            .get_mut(&buffer)
+            .and_then(Buffer::text)
+            .context("clipboard buffer no longer exists")
+            .and_then(|buffer| buffer.complete_clipboard_read(view, read, text))
+            .and_then(|effect| self.text_effect(effect));
+        if let Err(error) = result {
+            self.message = format!("clipboard: {error:#}");
+        } else {
+            let after = self.selection_snapshot();
+            if before != after
+                && let Err(error) = self.emit_event("selection-changed", after)
+            {
+                self.message = format!("event: {error:#}");
+            }
+        }
+    }
+
     fn diff_hunk(&mut self, forward: bool) -> Result<()> {
         self.move_diff(forward, true)
+    }
+
+    fn prompt_input(&mut self, key: &str) -> Result<()> {
+        let prompt = self.prompt.as_mut().unwrap();
+        prompt.completion = None;
+        let value = if key == "space" { " " } else { key };
+        if value.chars().count() == 1 && !value.contains(['\n', '\r']) {
+            prompt.error = None;
+            prompt.text.insert_str(prompt.cursor, value);
+            prompt.cursor += value.len();
+        }
+        self.update_prompt()
     }
 
     fn update_prompt(&mut self) -> Result<()> {
@@ -1270,7 +1539,20 @@ impl Session {
                     return result;
                 }
                 match &prompt.kind {
-                    PromptKind::Command => self.command(&prompt.text)?,
+                    PromptKind::Command => {
+                        let command = if prompt.completion.is_none()
+                            && !prompt.text.is_empty()
+                            && !prompt.text.contains(char::is_whitespace)
+                        {
+                            self.command_candidates(&prompt.text)
+                                .into_iter()
+                                .next()
+                                .map_or_else(|| prompt.text.clone(), |candidate| candidate.name)
+                        } else {
+                            prompt.text.clone()
+                        };
+                        self.command(&command)?;
+                    }
                     PromptKind::Text(kind) => {
                         let buffer = self.views[&prompt.view].location.buffer;
                         let effect = self

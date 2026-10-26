@@ -1,0 +1,102 @@
+---
+source: crates/zess-session/src/editor/tests/git_navigation/tree.rs
+expression: "session.views[&source].location.display.rows"
+---
+[
+  {
+    "id": "file:root.txt",
+    "text": "root.txt",
+    "cells": [
+      {
+        "spans": [
+          {
+            "text": "A",
+            "style": "git.added"
+          }
+        ]
+      },
+      {
+        "spans": [
+          {
+            "text": "+1",
+            "style": "git.added"
+          }
+        ]
+      },
+      {
+        "spans": [
+          {
+            "text": "-0",
+            "style": "git.deleted"
+          }
+        ]
+      }
+    ],
+    "style": "git.added",
+    "depth": 0
+  },
+  {
+    "id": "file:src/a.rs",
+    "text": "src/a.rs",
+    "cells": [
+      {
+        "spans": [
+          {
+            "text": "A",
+            "style": "git.added"
+          }
+        ]
+      },
+      {
+        "spans": [
+          {
+            "text": "+1",
+            "style": "git.added"
+          }
+        ]
+      },
+      {
+        "spans": [
+          {
+            "text": "-0",
+            "style": "git.deleted"
+          }
+        ]
+      }
+    ],
+    "style": "git.added",
+    "depth": 0
+  },
+  {
+    "id": "file:src/nested/b.rs",
+    "text": "src/nested/b.rs",
+    "cells": [
+      {
+        "spans": [
+          {
+            "text": "A",
+            "style": "git.added"
+          }
+        ]
+      },
+      {
+        "spans": [
+          {
+            "text": "+1",
+            "style": "git.added"
+          }
+        ]
+      },
+      {
+        "spans": [
+          {
+            "text": "-0",
+            "style": "git.deleted"
+          }
+        ]
+      }
+    ],
+    "style": "git.added",
+    "depth": 0
+  }
+]

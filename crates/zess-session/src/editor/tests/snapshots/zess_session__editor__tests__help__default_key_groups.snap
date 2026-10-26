@@ -1,0 +1,210 @@
+---
+source: crates/zess-session/src/editor/tests/help.rs
+expression: "view.location.display.rows.iter().map(|row|\n(&row.id, &row.text)).collect::<Vec<_>>()"
+---
+[
+  [
+    "",
+    "Files"
+  ],
+  [
+    "\"",
+    "\"                    Choose the register for the next command"
+  ],
+  [
+    "Enter",
+    "Enter                Open selected file"
+  ],
+  [
+    "H",
+    "H                    Scroll preview left"
+  ],
+  [
+    "J",
+    "J                    Scroll preview down"
+  ],
+  [
+    "K",
+    "K                    Scroll preview up"
+  ],
+  [
+    "L",
+    "L                    Scroll preview right"
+  ],
+  [
+    "R",
+    "R                    Refresh browser"
+  ],
+  [
+    "a, i",
+    "a, i                 Create file / directory"
+  ],
+  [
+    "d",
+    "d                    Mark selection for deletion"
+  ],
+  [
+    "e",
+    "e                    Edit file in a temporary fullscreen layer"
+  ],
+  [
+    "f",
+    "f                    Find files recursively"
+  ],
+  [
+    "g f",
+    "g f                  Open source file"
+  ],
+  [
+    "h",
+    "h                    Collapse / parent directory"
+  ],
+  [
+    "l",
+    "l                    Expand directory"
+  ],
+  [
+    "r",
+    "r                    Rename selection"
+  ],
+  [
+    "u",
+    "u                    Undo pending operations"
+  ],
+  [
+    "y a",
+    "y a                  Yank absolute paths"
+  ],
+  [
+    "y d",
+    "y d                  Yank file diffs"
+  ],
+  [
+    "y f",
+    "y f                  Yank file contents"
+  ],
+  [
+    "y n",
+    "y n                  Yank file names"
+  ],
+  [
+    "y p",
+    "y p                  Yank relative paths"
+  ],
+  [
+    "",
+    "Items"
+  ],
+  [
+    "%",
+    "%                    Select all items"
+  ],
+  [
+    ",",
+    ",                    Keep primary selection"
+  ],
+  [
+    "/",
+    "/                    Filter items"
+  ],
+  [
+    "?",
+    "?                    Show buffer keys"
+  ],
+  [
+    "C",
+    "C                    Add next item to selection"
+  ],
+  [
+    "C-d",
+    "C-d                  Half-page down"
+  ],
+  [
+    "C-u",
+    "C-u                  Half-page up"
+  ],
+  [
+    "Down, j",
+    "Down, j              Move selection down"
+  ],
+  [
+    "Esc",
+    "Esc                  Reset selection"
+  ],
+  [
+    "Up, k",
+    "Up, k                Move selection up"
+  ],
+  [
+    "g e",
+    "g e                  Last item"
+  ],
+  [
+    "g g",
+    "g g                  First item"
+  ],
+  [
+    "g w",
+    "g w                  Jump to a two-character item label"
+  ],
+  [
+    "v",
+    "v                    Toggle selection mode"
+  ],
+  [
+    "x",
+    "x                    Extend selection down"
+  ],
+  [
+    "",
+    "Global"
+  ],
+  [
+    ":",
+    ":                    Enter a command"
+  ],
+  [
+    "C-w C-h, C-w h",
+    "C-w C-h, C-w h       Focus left"
+  ],
+  [
+    "C-w C-j, C-w j",
+    "C-w C-j, C-w j       Focus down"
+  ],
+  [
+    "C-w C-k, C-w k",
+    "C-w C-k, C-w k       Focus up"
+  ],
+  [
+    "C-w C-l, C-w l",
+    "C-w C-l, C-w l       Focus right"
+  ],
+  [
+    "C-w C-s, C-w s",
+    "C-w C-s, C-w s       Split horizontally"
+  ],
+  [
+    "C-w C-v, C-w v",
+    "C-w C-v, C-w v       Split vertically"
+  ],
+  [
+    "C-w C-w, C-w w",
+    "C-w C-w, C-w w       Focus next window"
+  ],
+  [
+    "C-w q",
+    "C-w q                Close the current view"
+  ],
+  [
+    "space ?",
+    "space ?              Show buffer keys"
+  ],
+  [
+    "space e",
+    "space e              Open file tree"
+  ],
+  [
+    "space g",
+    "space g              Open Git changes"
+  ]
+]

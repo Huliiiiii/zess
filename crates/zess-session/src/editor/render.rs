@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(test)]
+mod tests;
+
 impl Session {
     pub(super) fn render_surface(&mut self, page: PageId, slot: &str, rect: Rect) -> Vec<FrameRow> {
         let rows = self.render_surface_content(page, slot, rect);

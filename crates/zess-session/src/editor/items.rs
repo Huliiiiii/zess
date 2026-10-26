@@ -271,4 +271,51 @@ impl Session {
         }
         Ok(())
     }
+
+    pub(super) fn item_jump_input(&mut self, key: &str) -> Result<()> {
+        let view = self.views.get_mut(&self.focus).unwrap();
+        let mut jump = view.jump.take().unwrap();
+        if key.len() != 1 || !key.as_bytes()[0].is_ascii_lowercase() {
+            return Ok(());
+        }
+        jump.input.push_str(key);
+        let outer = usize::from(jump.input.as_bytes()[0] - b'a') * 26;
+        if jump.input.len() == 1 {
+            if outer < jump.targets.len() {
+                view.jump = Some(jump);
+            }
+            return Ok(());
+        }
+        let index = outer + usize::from(jump.input.as_bytes()[1] - b'a');
+        let Some(target) = jump.targets.get(index) else {
+            return Ok(());
+        };
+        let ids = view.item_ids();
+        let Some(target_index) = ids.iter().position(|id| id == target) else {
+            return Ok(());
+        };
+        if view.location.mode == ViewMode::Select {
+            let anchor = view
+                .location
+                .selection
+                .anchor
+                .as_ref()
+                .and_then(|id| ids.iter().position(|other| other == id))
+                .unwrap_or(target_index);
+            view.location.selection.selected =
+                ids[anchor.min(target_index)..=anchor.max(target_index)].to_vec();
+        } else {
+            view.location.selection.selected = vec![target.clone()];
+            view.location.selection.anchor = Some(target.clone());
+        }
+        view.location.selection.primary = Some(target.clone());
+        view.location.manual_viewport = false;
+        self.dispatch(
+            self.focus,
+            "select",
+            serde_json::to_value(SelectionChange {
+                navigation: Some(ItemNavigation::Jump),
+            })?,
+        )
+    }
 }
