@@ -54,6 +54,24 @@ zess-wisp = { path = "crates/zess-wisp" }
 zess-plugin = { path = "crates/zess-plugin" }
 zess-plugins = { path = "crates/zess-plugins" }
 
+[package]
+name = "zess"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+zess-protocol.workspace = true
+zess-ipc.workspace = true
+zess-session.workspace = true
+zess-terminal.workspace = true
+zess-text.workspace = true
+
+[dev-dependencies]
+fnv.workspace = true
+tempfile.workspace = true
+
 [profile.dev]
 debug = 1
 
