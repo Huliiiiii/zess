@@ -1,0 +1,11 @@
+[package]
+name = "zess-wisp"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+
+[dependencies]
+anyhow.workspace = true
+
+[dev-dependencies]
+hegel.workspace = true
