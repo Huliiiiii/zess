@@ -1,0 +1,48 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["vendor/steel-core", "vendor/helix-loader"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+git2 = { version = "0.21.0", default-features = false, features = ["unstable-sha256"] }
+insta = { version = "1.49.0", features = ["json"] }
+hegel = { package = "hegeltest", version = "0.50.3", features = ["static-engine"] }
+ignore = "0.4.33"
+notify = "8.2.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+crossterm = "=0.29.0"
+libc = "0.2.191"
+toml = "1.1"
+unicode-width = "0.2.2"
+unicode-segmentation = "=1.13.3"
+etcetera = "0.11"
+tempfile = "=3.27.0"
+fnv = "1.0.7"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+helix-loader = { path = "vendor/helix-loader" }
+helix-core = { git = "https://github.com/helix-editor/helix", rev = "ba40e547426b0f9896c8bdc699a4ab11f2b37dbc" }
+helix-stdx = { git = "https://github.com/helix-editor/helix", rev = "ba40e547426b0f9896c8bdc699a4ab11f2b37dbc" }
+steel-core = { path = "vendor/steel-core", default-features = false, features = ["std", "modules", "sandbox"] }
+zess-ui = { path = "crates/zess-ui" }
+zess-protocol = { path = "crates/zess-protocol" }
+zess-ipc = { path = "crates/zess-ipc" }
+zess-text = { path = "crates/zess-text" }
+zess-script = { path = "crates/zess-script" }
+zess-services = { path = "crates/zess-services" }
+zess-session = { path = "crates/zess-session" }
+zess-terminal = { path = "crates/zess-terminal" }
+zess-wisp = { path = "crates/zess-wisp" }
+zess-plugin = { path = "crates/zess-plugin" }
+zess-plugins = { path = "crates/zess-plugins" }
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false

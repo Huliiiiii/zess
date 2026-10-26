@@ -1,0 +1,12 @@
+[package]
+name = "zess-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+unicode-width.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+hegel.workspace = true
