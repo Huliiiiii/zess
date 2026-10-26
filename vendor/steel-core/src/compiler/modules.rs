@@ -2023,7 +2023,11 @@ impl<'a> ModuleBuilder<'a> {
 
         #[cfg(not(target_family = "wasm"))]
         let name = if let Some(p) = name {
-            std::fs::canonicalize(p)?
+            if cfg!(feature = "sandbox") {
+                try_canonicalize(p)
+            } else {
+                std::fs::canonicalize(p)?
+            }
         } else {
             std::env::current_dir()?
         };
