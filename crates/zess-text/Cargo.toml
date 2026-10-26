@@ -1,0 +1,20 @@
+[package]
+name = "zess-text"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+zess-plugin.workspace = true
+zess-ui.workspace = true
+helix-core.workspace = true
+helix-stdx.workspace = true
+helix-loader.workspace = true
+etcetera.workspace = true
+toml.workspace = true
+unicode-width.workspace = true
+
+
+[dev-dependencies]
+tempfile.workspace = true

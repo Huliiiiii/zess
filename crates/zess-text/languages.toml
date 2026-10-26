@@ -1,0 +1,8 @@
+[[language]]
+name = "wisp"
+scope = "source.wisp"
+file-types = ["w", "wisp"]
+shebangs = ["wisp"]
+comment-token = ";"
+block-comment-tokens = [{ start = "#|", end = "|#" }]
+indent = { tab-width = 2, unit = "  " }

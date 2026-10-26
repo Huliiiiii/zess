@@ -1,0 +1,9 @@
+The query directories other than wisp are copied from Helix commit
+ba40e547426b0f9896c8bdc699a4ab11f2b37dbc,
+https://github.com/helix-editor/helix, under the Mozilla Public License 2.0.
+The original source remains available at that revision. No modifications have been made.
+
+rust/tags.scm is copied from the same Helix revision under the same license,
+with additional captures for static items and implementations.
+
+wisp/highlights.scm is the Zess query for the bundled tree-sitter-wisp grammar.
