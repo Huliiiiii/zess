@@ -628,6 +628,15 @@ pub(super) struct Search {
     pub manual_viewport: bool,
 }
 
+impl Search {
+    pub fn restore(&self, view: &mut super::View) {
+        view.location.diff_selection = self.selection.clone();
+        view.location.scroll = self.scroll;
+        view.location.horizontal_scroll = self.horizontal_scroll;
+        view.location.manual_viewport = self.manual_viewport;
+    }
+}
+
 fn display_line(raw: &str) -> String {
     let mut text = String::new();
     let mut column = 0;

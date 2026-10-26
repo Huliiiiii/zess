@@ -17,13 +17,13 @@ pub enum ColumnAlignment {
     All,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RowColumns {
     groups: Vec<ColumnGroup>,
     row_groups: Vec<usize>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ColumnGroup {
     text_width: usize,
     cell_widths: Vec<usize>,
