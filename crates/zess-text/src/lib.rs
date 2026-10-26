@@ -810,6 +810,29 @@ impl TextBuffer {
         self.registers = registers;
     }
 
+    pub fn complete_clipboard_read(
+        &mut self,
+        id: u64,
+        read: ClipboardRead,
+        text: String,
+    ) -> Result<TextEffect> {
+        self.registers
+            .values
+            .lock()
+            .unwrap()
+            .insert(read.register, vec![text]);
+        let view = self
+            .views
+            .get_mut(&id)
+            .context("clipboard view no longer exists")?;
+        view.register = Some(read.register);
+        view.count = read.count.into();
+        self.reading_clipboard = true;
+        let result = self.execute(id, read.command);
+        self.reading_clipboard = false;
+        result
+    }
+
     pub fn set_insert_history(&mut self, history: InsertHistory) {
         self.insert_history = history;
     }
@@ -1149,8 +1172,1596 @@ impl TextBuffer {
         self.refresh_cursors();
     }
 
+    fn replace_selections(&mut self, id: u64, values: &[String], insert: bool, before: bool) {
+        if values.is_empty() {
+            return;
+        }
+
+        let selection = self.views[&id].selection.clone();
+        let transaction = Transaction::change(
+            &self.rope,
+            selection.iter().enumerate().map(|(index, range)| {
+                let (from, to) = if insert {
+                    let pos = if before { range.from() } else { range.to() };
+
+                    (pos, pos)
+                } else {
+                    (range.from(), range.to())
+                };
+
+                (
+                    from,
+                    to,
+                    Some(values[index.min(values.len() - 1)].as_str().into()),
+                )
+            }),
+        );
+        let selection = selection.transform(|range| {
+            let pos = if insert && !before {
+                range.to()
+            } else {
+                range.from()
+            };
+
+            Range::point(transaction.changes().map_pos(pos, Assoc::After))
+        });
+
+        self.apply(id, transaction, Some(selection));
+    }
+
+    fn read_register(&self, id: u64, register: char) -> Result<Option<Vec<String>>> {
+        Ok(match register {
+            '_' => Some(Vec::new()),
+            '#' => Some(
+                (1..=self.views[&id].selection.len())
+                    .map(|i| i.to_string())
+                    .collect(),
+            ),
+            '.' => Some(
+                self.views[&id]
+                    .selection
+                    .fragments(self.rope.slice(..))
+                    .map(|s| s.into_owned())
+                    .collect(),
+            ),
+            '%' => Some(vec![
+                self.path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "[scratch]".into()),
+            ]),
+            _ => self
+                .registers
+                .values
+                .lock()
+                .unwrap()
+                .get(&register)
+                .cloned(),
+        })
+    }
+
+    fn yank(&mut self, id: u64, register: char) -> Result<Option<String>> {
+        let view = &self.views[&id];
+        let values = view
+            .selection
+            .fragments(self.rope.slice(..))
+            .map(|part| part.into_owned())
+            .collect::<Vec<_>>();
+
+        self.write_register(register, values)
+    }
+
     fn write_register(&self, register: char, values: Vec<String>) -> Result<Option<String>> {
         self.registers.write(register, values)
+    }
+
+    /// Executes a registered editing operation, returning an error for unknown command IDs.
+    pub fn execute_command(&mut self, id: u64, command: &str) -> Result<TextEffect> {
+        let command = TextCommand::parse(command)
+            .with_context(|| format!("unknown text command: {command}"))?;
+        self.execute(id, command)
+    }
+
+    pub fn execute(&mut self, id: u64, command: TextCommand) -> Result<TextEffect> {
+        self.ensure_view(id);
+        if !matches!(
+            command,
+            TextCommand::GotoWord
+                | TextCommand::SelectRegex
+                | TextCommand::SplitRegex
+                | TextCommand::SearchForward
+                | TextCommand::SearchBackward
+        ) {
+            self.views.get_mut(&id).unwrap().manual_viewport = false;
+        }
+
+        let old_version = self.version;
+        let mut effect = TextEffect::default();
+        let was_insert = self.views[&id].mode == TextMode::Insert;
+        if was_insert
+            && !self.replaying_insert
+            && command != TextCommand::RepeatInsert
+            && let Some(recording) = &mut self.views.get_mut(&id).unwrap().insert_recording
+        {
+            recording.events.push(InsertEvent::Command(command));
+        }
+
+        if command == TextCommand::Escape {
+            self.set_text_mode(id, TextMode::Normal)?;
+
+            return Ok(effect);
+        }
+
+        if let Some(digit) = match command {
+            TextCommand::Count0 => Some(0),
+            TextCommand::Count1 => Some(1),
+            TextCommand::Count2 => Some(2),
+            TextCommand::Count3 => Some(3),
+            TextCommand::Count4 => Some(4),
+            TextCommand::Count5 => Some(5),
+            TextCommand::Count6 => Some(6),
+            TextCommand::Count7 => Some(7),
+            TextCommand::Count8 => Some(8),
+            TextCommand::Count9 => Some(9),
+            _ => None,
+        } {
+            self.push_command_count(id, digit);
+
+            return Ok(effect);
+        }
+
+        if self.readonly
+            && matches!(
+                command,
+                TextCommand::Insert
+                    | TextCommand::Append
+                    | TextCommand::InsertLineStart
+                    | TextCommand::AppendLineEnd
+                    | TextCommand::OpenBelow
+                    | TextCommand::OpenAbove
+                    | TextCommand::Change
+                    | TextCommand::ChangeWithoutYank
+                    | TextCommand::Delete
+                    | TextCommand::DeleteWithoutYank
+                    | TextCommand::PasteAfter
+                    | TextCommand::PasteBefore
+                    | TextCommand::ReplaceWithYank
+                    | TextCommand::ReplaceCharacter
+                    | TextCommand::Undo
+                    | TextCommand::Redo
+                    | TextCommand::DeleteBackward
+                    | TextCommand::DeleteForward
+                    | TextCommand::InsertNewline
+                    | TextCommand::InsertTab
+                    | TextCommand::Indent
+                    | TextCommand::Unindent
+                    | TextCommand::Join
+                    | TextCommand::JoinSelectSpace
+                    | TextCommand::SwitchCase
+                    | TextCommand::Lowercase
+                    | TextCommand::Uppercase
+                    | TextCommand::RepeatInsert
+                    | TextCommand::SurroundAdd
+                    | TextCommand::SurroundReplace
+                    | TextCommand::SurroundDelete
+                    | TextCommand::ToggleComments
+                    | TextCommand::ToggleBlockComments
+                    | TextCommand::ToggleLineComments
+            )
+        {
+            self.views.get_mut(&id).unwrap().register = None;
+            self.views.get_mut(&id).unwrap().count = CommandCount::default();
+            effect.message = Some("buffer is read-only".into());
+
+            return Ok(effect);
+        }
+
+        let had_count = self.views[&id].count.value().is_some();
+        let count = self.views[&id].count.value().unwrap_or(1);
+        let pending = match command {
+            TextCommand::FindForward => PendingInput::Find {
+                direction: Direction::Forward,
+                till: false,
+            },
+            TextCommand::FindBackward => PendingInput::Find {
+                direction: Direction::Backward,
+                till: false,
+            },
+            TextCommand::TillForward => PendingInput::Find {
+                direction: Direction::Forward,
+                till: true,
+            },
+            TextCommand::TillBackward => PendingInput::Find {
+                direction: Direction::Backward,
+                till: true,
+            },
+            TextCommand::ReplaceCharacter => PendingInput::ReplaceCharacter,
+            TextCommand::SelectRegister => PendingInput::Register,
+            TextCommand::TextObjectInside => PendingInput::TextObject(TextObject::Inside),
+            TextCommand::TextObjectAround => PendingInput::TextObject(TextObject::Around),
+            TextCommand::SurroundAdd => PendingInput::SurroundAdd,
+            TextCommand::SurroundReplace => PendingInput::SurroundReplace,
+            TextCommand::SurroundDelete => PendingInput::SurroundDelete,
+            _ => PendingInput::None,
+        };
+
+        if !matches!(pending, PendingInput::None) {
+            if !matches!(pending, PendingInput::Register) {
+                self.views.get_mut(&id).unwrap().register = None;
+            }
+            self.views.get_mut(&id).unwrap().pending = pending;
+            return Ok(effect);
+        }
+
+        self.views.get_mut(&id).unwrap().count = CommandCount::default();
+        let selected_register = self.views.get_mut(&id).unwrap().register.take();
+        let register = selected_register.unwrap_or('"');
+
+        let read_register = if matches!(
+            command,
+            TextCommand::SearchNext | TextCommand::SearchPrevious
+        ) {
+            selected_register.unwrap_or(*self.registers.search_register.lock().unwrap())
+        } else {
+            register
+        };
+        if !self.reading_clipboard
+            && matches!(read_register, '+' | '*')
+            && matches!(
+                command,
+                TextCommand::PasteAfter
+                    | TextCommand::PasteBefore
+                    | TextCommand::ReplaceWithYank
+                    | TextCommand::SearchNext
+                    | TextCommand::SearchPrevious
+            )
+        {
+            effect.clipboard_read = Some(ClipboardRead {
+                register: read_register,
+                command,
+                count,
+            });
+            return Ok(effect);
+        }
+
+        if matches!(
+            command,
+            TextCommand::DeleteBackward
+                | TextCommand::DeleteForward
+                | TextCommand::InsertNewline
+                | TextCommand::InsertTab
+        ) {
+            if self.views[&id].mode != TextMode::Insert {
+                return Ok(effect);
+            }
+
+            match command {
+                TextCommand::DeleteBackward | TextCommand::DeleteForward => {
+                    let selection = self.views[&id].selection.clone();
+                    let slice = self.rope.slice(..);
+                    let transaction = Transaction::delete(
+                        &self.rope,
+                        selection.iter().map(|range| {
+                            if command == TextCommand::DeleteBackward {
+                                (prev_grapheme_boundary(slice, range.head), range.head)
+                            } else {
+                                (range.head, next_grapheme_boundary(slice, range.head))
+                            }
+                        }),
+                    );
+
+                    self.apply(id, transaction, None);
+                }
+                TextCommand::InsertNewline => {
+                    let positions = self.views[&id]
+                        .selection
+                        .iter()
+                        .map(|range| range.head)
+                        .collect::<Vec<_>>();
+                    let values = positions
+                        .into_iter()
+                        .map(|pos| format!("\n{}", self.newline_indentation(pos)))
+                        .collect::<Vec<_>>();
+
+                    self.replace_selections(id, &values, false, false);
+                }
+                _ => self.replace_selections(
+                    id,
+                    &[self.indentation().0.as_str().into()],
+                    false,
+                    false,
+                ),
+            }
+
+            self.refresh_cursors();
+            effect.changed = old_version != self.version;
+
+            return Ok(effect);
+        }
+
+        if self.views[&id].mode == TextMode::Insert
+            && matches!(
+                command,
+                TextCommand::MoveLeft
+                    | TextCommand::MoveRight
+                    | TextCommand::MoveUp
+                    | TextCommand::MoveDown
+                    | TextCommand::MoveWordStartForward
+                    | TextCommand::MoveWordStartBackward
+                    | TextCommand::MoveWordEndForward
+                    | TextCommand::MoveLongWordStartForward
+                    | TextCommand::MoveLongWordStartBackward
+                    | TextCommand::MoveLongWordEndForward
+            )
+        {
+            self.commit_group();
+        }
+
+        match command {
+            TextCommand::ToggleComments
+            | TextCommand::ToggleLineComments
+            | TextCommand::ToggleBlockComments => {
+                let selection = self.views[&id].selection.clone();
+                let config = self.language.as_ref().map(LanguageAttachment::config);
+                let line_tokens = config.and_then(|config| config.comment_tokens.as_deref());
+                let block_tokens = config.and_then(|config| config.block_comment_tokens.as_deref());
+                let slice = self.rope.slice(..);
+                let row = slice.char_to_line(selection.primary().cursor(slice));
+                let line_token = line_tokens.and_then(|tokens| {
+                    comment::get_comment_token(slice, tokens, row)
+                        .or_else(|| tokens.first().map(String::as_str))
+                });
+                let transaction = if let Some(tokens) = &block_tokens
+                    && command == TextCommand::ToggleBlockComments
+                {
+                    comment::toggle_block_comments(&self.rope, &selection, tokens)
+                } else if let Some(tokens) = &block_tokens
+                    && command == TextCommand::ToggleComments
+                {
+                    let split = comment::split_lines_of_selection(self.rope.slice(..), &selection);
+                    let (lines_commented, lines) =
+                        comment::find_block_comments(tokens, self.rope.slice(..), &split);
+                    let (selection_commented, changes) =
+                        comment::find_block_comments(tokens, self.rope.slice(..), &selection);
+                    if lines_commented {
+                        comment::create_block_comment_transaction(&self.rope, &split, true, lines).0
+                    } else if selection_commented {
+                        comment::create_block_comment_transaction(
+                            &self.rope, &selection, true, changes,
+                        )
+                        .0
+                    } else {
+                        comment::toggle_line_comments(&self.rope, &selection, line_token)
+                    }
+                } else {
+                    comment::toggle_line_comments(&self.rope, &selection, line_token)
+                };
+                self.apply(id, transaction, None);
+                self.views.get_mut(&id).unwrap().mode = TextMode::Normal;
+            }
+            TextCommand::SelectMode => {
+                let view = self.views.get_mut(&id).unwrap();
+
+                view.mode = if view.mode == TextMode::Select {
+                    TextMode::Normal
+                } else {
+                    TextMode::Select
+                };
+            }
+            TextCommand::GotoWord => self.start_word_jump(id),
+            TextCommand::MoveLeft
+            | TextCommand::MoveDown
+            | TextCommand::MoveUp
+            | TextCommand::MoveRight
+            | TextCommand::MoveWordStartForward
+            | TextCommand::MoveWordStartBackward
+            | TextCommand::MoveWordEndForward
+            | TextCommand::MoveLongWordStartForward
+            | TextCommand::MoveLongWordStartBackward
+            | TextCommand::MoveLongWordEndForward
+            | TextCommand::GotoLineStart
+            | TextCommand::GotoFirstNonwhitespace
+            | TextCommand::GotoLineEnd
+            | TextCommand::PageHalfUp
+            | TextCommand::PageHalfDown => self.move_selection(id, command, count),
+            TextCommand::GotoFileStart | TextCommand::GotoFileEnd => {
+                let line = if had_count || command == TextCommand::GotoFileStart {
+                    count.saturating_sub(1)
+                } else {
+                    self.rope.len_lines() - 1
+                };
+                let slice = self.rope.slice(..);
+                let pos = slice.line_to_char(line.min(slice.len_lines() - 1));
+                let extend = self.views[&id].mode == TextMode::Select;
+                let selection = self.views[&id]
+                    .selection
+                    .clone()
+                    .transform(|range| range.put_cursor(slice, pos, extend));
+
+                self.views.get_mut(&id).unwrap().selection = selection.ensure_invariants(slice);
+            }
+            TextCommand::SelectLines | TextCommand::ExtendLines => {
+                self.select_lines(id, count, command == TextCommand::ExtendLines)
+            }
+            TextCommand::SelectLinesAbove => {
+                let slice = self.rope.slice(..);
+                let view = self.views.get_mut(&id).unwrap();
+                view.selection = view
+                    .selection
+                    .clone()
+                    .transform(|range| {
+                        let (first, last) = range.line_range(slice);
+                        let end = slice.line_to_char((last + 1).min(slice.len_lines()));
+                        let selected =
+                            range.from() == slice.line_to_char(first) && range.to() == end;
+                        Range::new(
+                            end,
+                            slice
+                                .line_to_char(first.saturating_sub(count - usize::from(!selected))),
+                        )
+                    })
+                    .ensure_invariants(slice);
+            }
+            TextCommand::Join | TextCommand::JoinSelectSpace => {
+                self.join_lines(id, command == TextCommand::JoinSelectSpace);
+            }
+            TextCommand::Indent | TextCommand::Unindent => {
+                let (style, tab_width) = self.indentation();
+                let indent_width = style.indent_width(tab_width);
+                let slice = self.rope.slice(..);
+                let mut lines = self.views[&id]
+                    .selection
+                    .iter()
+                    .flat_map(|range| {
+                        let (first, last) = range.line_range(slice);
+                        first..=last
+                    })
+                    .collect::<Vec<_>>();
+                lines.sort_unstable();
+                lines.dedup();
+                let transaction = Transaction::change(
+                    &self.rope,
+                    lines.into_iter().filter_map(|row| {
+                        let line = slice.line(row);
+                        let start = slice.line_to_char(row);
+                        if command == TextCommand::Indent {
+                            if line.chars().all(char::is_whitespace) {
+                                return None;
+                            }
+                            let offset = match style {
+                                helix_core::indent::IndentStyle::Spaces(_) => {
+                                    line.chars()
+                                        .take_while(|ch| matches!(ch, ' ' | '\t'))
+                                        .count()
+                                        % indent_width
+                                }
+                                helix_core::indent::IndentStyle::Tabs => 0,
+                            };
+                            let indent = style.as_str().repeat(count);
+                            Some((start, start, Some(indent[offset..].into())))
+                        } else {
+                            let mut width = 0;
+                            let mut end = start;
+                            for ch in line.chars() {
+                                match ch {
+                                    ' ' => width += 1,
+                                    '\t' => width = (width / tab_width + 1) * tab_width,
+                                    _ => break,
+                                }
+                                end += 1;
+                                if width >= count * indent_width {
+                                    break;
+                                }
+                            }
+                            (end > start).then_some((start, end, None))
+                        }
+                    }),
+                );
+                self.apply(id, transaction, None);
+            }
+            TextCommand::SwitchCase | TextCommand::Lowercase | TextCommand::Uppercase => {
+                let transaction = Transaction::change_by_selection(
+                    &self.rope,
+                    &self.views[&id].selection,
+                    |range| {
+                        let text = range.fragment(self.rope.slice(..));
+                        let value = match command {
+                            TextCommand::Lowercase => text.to_lowercase(),
+                            TextCommand::Uppercase => text.to_uppercase(),
+                            _ => text
+                                .chars()
+                                .map(|ch| {
+                                    if ch.is_lowercase() {
+                                        ch.to_uppercase().collect::<String>()
+                                    } else {
+                                        ch.to_lowercase().collect::<String>()
+                                    }
+                                })
+                                .collect(),
+                        };
+                        (range.from(), range.to(), Some(value.into()))
+                    },
+                );
+                self.apply(id, transaction, None);
+            }
+            TextCommand::FlipSelections => {
+                let view = self.views.get_mut(&id).unwrap();
+                view.selection = view.selection.clone().transform(|range| range.flip());
+            }
+            TextCommand::SplitLines => {
+                let view = self.views.get_mut(&id).unwrap();
+                view.selection =
+                    helix_core::selection::split_on_newline(self.rope.slice(..), &view.selection);
+            }
+            TextCommand::MergeSelections => {
+                let view = self.views.get_mut(&id).unwrap();
+                view.selection = view.selection.clone().merge_ranges();
+            }
+            TextCommand::MatchBrackets => {
+                let slice = self.rope.slice(..);
+                let view = self.views.get_mut(&id).unwrap();
+                let extend = view.mode == TextMode::Select;
+                view.selection = view
+                    .selection
+                    .clone()
+                    .transform(|range| {
+                        helix_core::match_brackets::find_matching_bracket_plaintext(
+                            slice,
+                            range.cursor(slice),
+                        )
+                        .map(|pos| range.put_cursor(slice, pos, extend))
+                        .unwrap_or(range)
+                    })
+                    .ensure_invariants(slice);
+            }
+            TextCommand::Insert
+            | TextCommand::Append
+            | TextCommand::InsertLineStart
+            | TextCommand::AppendLineEnd => {
+                self.begin_group(id);
+
+                let slice = self.rope.slice(..);
+                let selection = self.views[&id].selection.clone().transform(|range| {
+                    let cursor = range.cursor(slice);
+                    let row = slice.char_to_line(cursor);
+                    let pos = match command {
+                        TextCommand::Insert => range.from(),
+                        TextCommand::Append => range.to(),
+                        TextCommand::InsertLineStart => {
+                            slice.line_to_char(row)
+                                + slice
+                                    .line(row)
+                                    .chars()
+                                    .take_while(|c| c.is_whitespace() && *c != '\n' && *c != '\r')
+                                    .count()
+                        }
+                        _ => self.line_end(row),
+                    };
+
+                    Range::point(pos)
+                });
+                let view = self.views.get_mut(&id).unwrap();
+
+                view.selection = selection;
+                view.mode = TextMode::Insert;
+            }
+            TextCommand::OpenBelow | TextCommand::OpenAbove => {
+                self.open_lines(id, command == TextCommand::OpenAbove, count)
+            }
+            TextCommand::Delete
+            | TextCommand::Change
+            | TextCommand::DeleteWithoutYank
+            | TextCommand::ChangeWithoutYank => {
+                let changing = matches!(
+                    command,
+                    TextCommand::Change | TextCommand::ChangeWithoutYank
+                );
+                let slice = self.rope.slice(..);
+                let whole_lines = changing
+                    && self.views[&id].selection.iter().all(|range| {
+                        let (first, last) = range.line_range(slice);
+                        range.slice(slice).len_lines() >= 2
+                            && range.from() == slice.line_to_char(first)
+                            && range.to() == slice.line_to_char((last + 1).min(slice.len_lines()))
+                    });
+                if matches!(command, TextCommand::Delete | TextCommand::Change) {
+                    effect.clipboard = self.yank(id, register)?;
+                }
+
+                if changing {
+                    self.views.get_mut(&id).unwrap().mode = TextMode::Insert;
+                }
+
+                self.replace_selections(id, &[String::new()], false, false);
+                if whole_lines {
+                    self.open_lines(id, true, count);
+                }
+            }
+            TextCommand::Yank => {
+                effect.clipboard = self.yank(id, register)?;
+                effect.message = Some(format!(
+                    "yanked {} selection(s)",
+                    self.views[&id].selection.len()
+                ));
+            }
+            TextCommand::YankToClipboard => {
+                effect.clipboard = Some(
+                    self.views[&id]
+                        .selection
+                        .fragments(self.rope.slice(..))
+                        .map(|part| part.into_owned())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                effect.message = Some("Clipboard write requested".into());
+            }
+            TextCommand::PasteAfter | TextCommand::PasteBefore | TextCommand::ReplaceWithYank => {
+                let values = self.read_register(id, register)?;
+
+                if let Some(values) = values.filter(|values| !values.is_empty()) {
+                    let values = values
+                        .into_iter()
+                        .map(|text| text.repeat(count))
+                        .collect::<Vec<_>>();
+
+                    if command == TextCommand::ReplaceWithYank {
+                        let transaction = Transaction::change(
+                            &self.rope,
+                            self.views[&id]
+                                .selection
+                                .iter()
+                                .enumerate()
+                                .map(|(index, range)| {
+                                    (
+                                        range.from(),
+                                        range.to(),
+                                        Some(values[index.min(values.len() - 1)].as_str().into()),
+                                    )
+                                }),
+                        );
+                        self.apply(id, transaction, None);
+                    } else {
+                        self.paste(id, &values, command == TextCommand::PasteBefore);
+                    }
+                }
+            }
+            TextCommand::Undo | TextCommand::Redo => {
+                self.commit_group();
+
+                for _ in 0..count {
+                    let transaction = if command == TextCommand::Undo {
+                        self.history.undo()
+                    } else {
+                        self.history.redo()
+                    }
+                    .cloned();
+
+                    if let Some(transaction) = transaction {
+                        self.apply_without_history(Some(id), &transaction, None);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            TextCommand::RepeatInsert => {
+                effect = self.repeat_insert(id, count)?;
+            }
+            TextCommand::SelectRegex
+            | TextCommand::SplitRegex
+            | TextCommand::SearchForward
+            | TextCommand::SearchBackward => {
+                let kind = match command {
+                    TextCommand::SelectRegex => TextPromptKind::Select,
+                    TextCommand::SplitRegex => TextPromptKind::Split,
+                    TextCommand::SearchForward => TextPromptKind::SearchForward,
+                    _ => TextPromptKind::SearchBackward,
+                };
+                let view = self.views.get_mut(&id).unwrap();
+                view.pending = PendingInput::Regex {
+                    kind,
+                    selection: view.selection.clone(),
+                    scroll: view.scroll,
+                    horizontal_scroll: view.horizontal_scroll,
+                    manual_viewport: view.manual_viewport,
+                    input: String::new(),
+                };
+                view.prompt_register = selected_register.unwrap_or('/');
+                effect.prompt = Some(kind);
+            }
+            TextCommand::SearchNext | TextCommand::SearchPrevious => {
+                let register =
+                    selected_register.unwrap_or(*self.registers.search_register.lock().unwrap());
+                let pattern = self
+                    .read_register(id, register)?
+                    .and_then(|values| values.first().cloned())
+                    .unwrap_or_default();
+
+                if !pattern.is_empty() {
+                    let regex = self.build_regex(&pattern)?;
+                    for _ in 0..count {
+                        self.regex_selection(
+                            id,
+                            if command == TextCommand::SearchNext {
+                                TextPromptKind::SearchForward
+                            } else {
+                                TextPromptKind::SearchBackward
+                            },
+                            &regex,
+                            Movement::Move,
+                        )?;
+                    }
+                }
+            }
+            TextCommand::CollapseSelection => {
+                let slice = self.rope.slice(..);
+                let view = self.views.get_mut(&id).unwrap();
+
+                view.selection = view
+                    .selection
+                    .clone()
+                    .cursors(slice)
+                    .ensure_invariants(slice);
+            }
+            TextCommand::KeepPrimary => {
+                let view = self.views.get_mut(&id).unwrap();
+
+                view.selection = view.selection.clone().into_single();
+            }
+            TextCommand::SelectAll => {
+                self.views.get_mut(&id).unwrap().selection =
+                    Selection::single(0, self.rope.len_chars())
+            }
+            TextCommand::CopySelectionDown => {
+                let slice = self.rope.slice(..);
+                let selection = self.views[&id].selection.clone();
+                let mut ranges = SmallVec::with_capacity(selection.len() * (count + 1));
+                let format = TextFormat::default();
+                let annotations = TextAnnotations::default();
+                let mut primary = selection.primary_index();
+
+                let column_at = |pos| {
+                    visual_offset_from_block(
+                        slice,
+                        slice.line_to_char(slice.char_to_line(pos)),
+                        pos,
+                        &format,
+                        &annotations,
+                    )
+                    .0
+                    .col
+                };
+                let position_at = |row, column| {
+                    char_idx_at_visual_offset(
+                        slice,
+                        slice.line_to_char(row),
+                        0,
+                        column,
+                        &format,
+                        &annotations,
+                    )
+                    .0
+                };
+
+                ranges.extend_from_slice(selection.ranges());
+
+                for (index, range) in selection.iter().enumerate() {
+                    let head = range.cursor(slice);
+                    let anchor = if range.anchor > range.head {
+                        prev_grapheme_boundary(slice, range.anchor)
+                    } else {
+                        range.anchor
+                    };
+                    let head_row = slice.char_to_line(head);
+                    let anchor_row = slice.char_to_line(anchor);
+                    let height = head_row.abs_diff(anchor_row) + 1;
+                    let head_column = column_at(head);
+                    let anchor_column = column_at(anchor);
+                    let mut copied = 0;
+
+                    for offset in 1.. {
+                        let target_head_row = head_row + offset * height;
+                        let target_anchor_row = anchor_row + offset * height;
+
+                        if target_head_row >= slice.len_lines()
+                            || target_anchor_row >= slice.len_lines()
+                        {
+                            break;
+                        }
+
+                        let head = position_at(target_head_row, head_column);
+                        let anchor = position_at(target_anchor_row, anchor_column);
+
+                        if column_at(head) != head_column || column_at(anchor) != anchor_column {
+                            continue;
+                        }
+
+                        if index == selection.primary_index() {
+                            primary = ranges.len();
+                        }
+
+                        ranges.push(Range::point(anchor).put_cursor(slice, head, true));
+                        copied += 1;
+
+                        if copied == count {
+                            break;
+                        }
+                    }
+                }
+
+                self.views.get_mut(&id).unwrap().selection =
+                    Selection::new(ranges, primary).ensure_invariants(slice);
+            }
+            TextCommand::Escape
+            | TextCommand::Count0
+            | TextCommand::Count1
+            | TextCommand::Count2
+            | TextCommand::Count3
+            | TextCommand::Count4
+            | TextCommand::Count5
+            | TextCommand::Count6
+            | TextCommand::Count7
+            | TextCommand::Count8
+            | TextCommand::Count9
+            | TextCommand::FindForward
+            | TextCommand::FindBackward
+            | TextCommand::TillForward
+            | TextCommand::TillBackward
+            | TextCommand::ReplaceCharacter
+            | TextCommand::SelectRegister
+            | TextCommand::TextObjectInside
+            | TextCommand::TextObjectAround
+            | TextCommand::SurroundAdd
+            | TextCommand::SurroundReplace
+            | TextCommand::SurroundDelete
+            | TextCommand::DeleteBackward
+            | TextCommand::DeleteForward
+            | TextCommand::InsertNewline
+            | TextCommand::InsertTab => unreachable!("text command is handled above"),
+        }
+
+        if register == '*' {
+            effect.primary_clipboard = effect.clipboard.take();
+        }
+        if self.views[&id].mode == TextMode::Select
+            && matches!(
+                command,
+                TextCommand::Delete
+                    | TextCommand::DeleteWithoutYank
+                    | TextCommand::Yank
+                    | TextCommand::YankToClipboard
+                    | TextCommand::PasteBefore
+                    | TextCommand::PasteAfter
+                    | TextCommand::ReplaceWithYank
+                    | TextCommand::Indent
+                    | TextCommand::Unindent
+                    | TextCommand::SwitchCase
+                    | TextCommand::Lowercase
+                    | TextCommand::Uppercase
+            )
+        {
+            self.views.get_mut(&id).unwrap().mode = TextMode::Normal;
+        }
+
+        if self.views[&id].mode != TextMode::Insert {
+            self.commit_group();
+        }
+
+        if !was_insert && self.views[&id].mode == TextMode::Insert && !self.replaying_insert {
+            self.views.get_mut(&id).unwrap().insert_recording = Some(InsertReplay {
+                command,
+                count,
+                register: selected_register,
+                events: Vec::new(),
+            });
+        }
+
+        self.refresh_cursors();
+        effect.changed = old_version != self.version;
+
+        Ok(effect)
+    }
+
+    /// Consumes an operation argument or a literal character in insert mode.
+    pub fn input_text(&mut self, id: u64, key: &str) -> Result<TextEffect> {
+        self.input_event(id, TextInput::parse(key))
+    }
+
+    fn input_event(&mut self, id: u64, key: TextInput) -> Result<TextEffect> {
+        self.ensure_view(id);
+
+        let old_version = self.version;
+        let pending = self.views[&id].pending.clone();
+        let mut effect = TextEffect::default();
+        let character = key.character();
+
+        if self.views[&id].mode == TextMode::Insert
+            && !self.replaying_insert
+            && let Some(recording) = &mut self.views.get_mut(&id).unwrap().insert_recording
+        {
+            recording.events.push(InsertEvent::Input(key));
+        }
+
+        if key == TextInput::Escape && !matches!(pending, PendingInput::None) {
+            self.cancel_pending_command(id);
+            return Ok(effect);
+        }
+
+        if let PendingInput::Regex {
+            kind,
+            mut input,
+            selection,
+            scroll,
+            horizontal_scroll,
+            manual_viewport,
+        } = pending
+        {
+            if key == TextInput::Enter {
+                effect = self.submit_prompt(id, kind, &input)?;
+            } else {
+                if key == TextInput::Backspace {
+                    input.pop();
+                } else if let Some(ch) = character {
+                    input.push(ch);
+                }
+                self.views.get_mut(&id).unwrap().pending = PendingInput::Regex {
+                    kind,
+                    selection,
+                    scroll,
+                    horizontal_scroll,
+                    manual_viewport,
+                    input: input.clone(),
+                };
+                self.preview_prompt(id, kind, &input)?;
+            }
+        } else if let PendingInput::GotoWord { words, first } = pending {
+            let Some(ch) = character.filter(char::is_ascii_lowercase) else {
+                self.cancel_pending_command(id);
+                return Ok(effect);
+            };
+            let index = (ch as u8 - b'a') as usize;
+            if let Some(first) = first {
+                let view = self.views.get_mut(&id).unwrap();
+                if let Some(mut range) = words.get(usize::from(first) * 26 + index).copied() {
+                    range = if view.mode == TextMode::Select {
+                        let primary = view.selection.primary();
+                        let anchor = if range.anchor < range.head {
+                            range.anchor.min(primary.from())
+                        } else {
+                            range.anchor.max(primary.to())
+                        };
+                        Range::new(anchor, range.head)
+                    } else {
+                        range.with_direction(Direction::Forward)
+                    };
+                    view.selection = Selection::single(range.anchor, range.head)
+                        .ensure_invariants(self.rope.slice(..));
+                    view.manual_viewport = false;
+                }
+            } else if index * 26 < words.len() {
+                self.views.get_mut(&id).unwrap().pending = PendingInput::GotoWord {
+                    words,
+                    first: Some(index as u8),
+                };
+                return Ok(effect);
+            }
+            self.cancel_pending_command(id);
+        } else if !matches!(pending, PendingInput::None) {
+            let count = self.views[&id].count.value().unwrap_or(1);
+
+            self.views.get_mut(&id).unwrap().pending = PendingInput::None;
+            if !matches!(pending, PendingInput::Register) {
+                self.views.get_mut(&id).unwrap().count = CommandCount::default();
+            }
+
+            match pending {
+                PendingInput::SurroundAdd if key == TextInput::Enter || character.is_some() => {
+                    let (open, close) = if key == TextInput::Enter {
+                        ("\n".to_owned(), "\n".to_owned())
+                    } else {
+                        let (open, close) =
+                            helix_core::match_brackets::get_pair(character.unwrap());
+                        (open.to_string(), close.to_string())
+                    };
+                    let selection = self.views[&id].selection.clone();
+                    let mut changes = Vec::new();
+                    let mut ranges = SmallVec::new();
+                    let mut offset = 0;
+                    for range in &selection {
+                        changes.push((range.from(), range.from(), Some(open.as_str().into())));
+                        changes.push((range.to(), range.to(), Some(close.as_str().into())));
+                        ranges.push(
+                            Range::new(range.from() + offset, range.to() + offset + 2)
+                                .with_direction(range.direction()),
+                        );
+                        offset += 2;
+                    }
+                    let transaction = Transaction::change(&self.rope, changes.into_iter());
+                    self.apply(
+                        id,
+                        transaction,
+                        Some(Selection::new(ranges, selection.primary_index())),
+                    );
+                    self.views.get_mut(&id).unwrap().mode = TextMode::Normal;
+                }
+                PendingInput::SurroundReplace | PendingInput::SurroundDelete
+                    if character.is_some() =>
+                {
+                    let ch = character.unwrap();
+                    let positions = surround::get_surround_pos(
+                        None,
+                        self.rope.slice(..),
+                        &self.views[&id].selection,
+                        (ch != 'm').then_some(ch),
+                        count,
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    if matches!(pending, PendingInput::SurroundReplace) {
+                        let view = self.views.get_mut(&id).unwrap();
+                        view.pending = PendingInput::SurroundReplaceWith(positions);
+                    } else {
+                        let mut positions = positions;
+                        positions.sort_unstable();
+                        let transaction = Transaction::delete(
+                            &self.rope,
+                            positions.into_iter().map(|pos| (pos, pos + 1)),
+                        );
+                        self.apply(id, transaction, None);
+                        self.views.get_mut(&id).unwrap().mode = TextMode::Normal;
+                    }
+                }
+                PendingInput::SurroundReplaceWith(positions) if character.is_some() => {
+                    let (open, close) = helix_core::match_brackets::get_pair(character.unwrap());
+                    let mut changes = positions
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .flat_map(|pair| [(pair[0], open), (pair[1], close)])
+                        .collect::<Vec<_>>();
+                    changes.sort_unstable_by_key(|(pos, _)| *pos);
+                    let transaction = Transaction::change(
+                        &self.rope,
+                        changes
+                            .into_iter()
+                            .map(|(pos, ch)| (pos, pos + 1, Some(ch.to_string().into()))),
+                    );
+                    self.apply(id, transaction, None);
+                    self.views.get_mut(&id).unwrap().mode = TextMode::Normal;
+                }
+                PendingInput::TextObject(object) => {
+                    if let Some(ch) = character {
+                        let slice = self.rope.slice(..);
+                        let selection =
+                            self.views[&id]
+                                .selection
+                                .clone()
+                                .transform(|range| match ch {
+                                    'w' | 'W' => textobject::textobject_word(
+                                        slice,
+                                        range,
+                                        object,
+                                        count,
+                                        ch == 'W',
+                                    ),
+                                    'p' => textobject::textobject_paragraph(
+                                        slice, range, object, count,
+                                    ),
+                                    _ => textobject::textobject_pair_surround(
+                                        None, slice, range, object, ch, count,
+                                    ),
+                                });
+
+                        self.views.get_mut(&id).unwrap().selection =
+                            selection.ensure_invariants(slice);
+                    }
+                }
+                PendingInput::Find { direction, till } if character.is_some() => {
+                    self.find_character(id, direction, till, character.unwrap(), count)
+                }
+                PendingInput::ReplaceCharacter if !self.readonly => {
+                    let replacement = if key == TextInput::Enter {
+                        Some('\n')
+                    } else {
+                        character
+                    };
+
+                    if let Some(replacement) = replacement {
+                        let values = self.views[&id]
+                            .selection
+                            .iter()
+                            .map(|range| {
+                                replacement.to_string().repeat(
+                                    range
+                                        .fragment(self.rope.slice(..))
+                                        .graphemes(true)
+                                        .count()
+                                        .max(1),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+
+                        self.replace_selections(id, &values, false, false);
+                    }
+                }
+                PendingInput::Register => {
+                    if let Some(ch) = character {
+                        self.views.get_mut(&id).unwrap().register = Some(ch);
+                    }
+                }
+                _ => {}
+            }
+        } else if self.views[&id].mode == TextMode::Insert
+            && !self.readonly
+            && let Some(ch) = character
+        {
+            if ch == '}' && self.is_rust() {
+                self.insert_closing_brace(id);
+            } else {
+                self.replace_selections(id, &[ch.to_string()], false, false);
+            }
+        }
+
+        if self.views[&id].mode != TextMode::Insert {
+            self.commit_group();
+        }
+
+        self.refresh_cursors();
+        effect.changed = old_version != self.version;
+
+        Ok(effect)
+    }
+
+    fn line_end(&self, row: usize) -> usize {
+        let line = self.rope.line(row);
+
+        self.rope.line_to_char(row)
+            + line
+                .to_string()
+                .trim_end_matches(['\r', '\n'])
+                .chars()
+                .count()
+    }
+
+    fn repeat_insert(&mut self, id: u64, count: usize) -> Result<TextEffect> {
+        anyhow::ensure!(!self.replaying_insert, "Cannot repeat insert recursively");
+        anyhow::ensure!(
+            self.views[&id].mode != TextMode::Insert,
+            "Finish the current insertion before repeating"
+        );
+        let Some(recording) = self.insert_history.0.lock().unwrap().clone() else {
+            return Ok(TextEffect::default());
+        };
+        self.replaying_insert = true;
+        let result = (|| {
+            let mut effect = TextEffect::default();
+            for _ in 0..count {
+                let view = self.views.get_mut(&id).unwrap();
+                view.count = recording.count.into();
+                view.register = recording.register;
+                let entry = self.execute(id, recording.command)?;
+                effect.clipboard = entry.clipboard.or(effect.clipboard);
+                effect.primary_clipboard = entry.primary_clipboard.or(effect.primary_clipboard);
+                for event in &recording.events {
+                    let step = match event {
+                        InsertEvent::Command(command) => self.execute(id, *command)?,
+                        InsertEvent::Input(input) => self.input_event(id, *input)?,
+                    };
+                    effect.clipboard = step.clipboard.or(effect.clipboard);
+                    effect.primary_clipboard = step.primary_clipboard.or(effect.primary_clipboard);
+                }
+            }
+            Ok(effect)
+        })();
+        self.replaying_insert = false;
+        result
+    }
+
+    fn join_lines(&mut self, id: u64, select_space: bool) {
+        let slice = self.rope.slice(..);
+        let mut changes = Vec::new();
+        for range in &self.views[&id].selection {
+            let (first, mut last) = range.line_range(slice);
+            if first == last {
+                last = (last + 1).min(slice.len_lines() - 1);
+            }
+            let comment_token = |row| {
+                let line = slice.line(row).to_string();
+                let line = line.trim_start_matches([' ', '\t']);
+                ["///", "//!", "//"]
+                    .into_iter()
+                    .find(|token| line.starts_with(token))
+            };
+            let mut token = self.is_rust().then(|| comment_token(first)).flatten();
+            for row in first..last {
+                let from = self.line_end(row);
+                let mut to = slice.line_to_char(row + 1);
+                while to < slice.len_chars() && matches!(slice.char(to), ' ' | '\t') {
+                    to += 1;
+                }
+                if self.is_rust()
+                    && let Some(next_token) = comment_token(row + 1)
+                {
+                    if token == Some(next_token) {
+                        to += next_token.chars().count();
+                        while to < slice.len_chars() && matches!(slice.char(to), ' ' | '\t') {
+                            to += 1;
+                        }
+                    } else {
+                        token = Some(next_token);
+                    }
+                }
+                let separator = (to != self.line_end(row + 1)).then(|| " ".into());
+                changes.push((from, to, separator));
+            }
+        }
+        changes.sort_unstable_by_key(|(from, _, _)| *from);
+        changes.dedup();
+        if changes.is_empty() {
+            return;
+        }
+        let transaction = Transaction::change(&self.rope, changes.iter().cloned());
+        let selection = if select_space {
+            let ranges = changes
+                .iter()
+                .filter(|(_, _, value)| value.is_some())
+                .map(|(from, _, _)| {
+                    let pos = transaction.changes().map_pos(*from, Assoc::Before);
+                    Range::new(pos, pos + 1)
+                })
+                .collect::<SmallVec<_>>();
+            (!ranges.is_empty()).then(|| Selection::new(ranges, 0))
+        } else {
+            None
+        };
+        self.apply(id, transaction, selection);
+    }
+
+    fn paste(&mut self, id: u64, values: &[String], before: bool) {
+        if values.is_empty() {
+            return;
+        }
+        let slice = self.rope.slice(..);
+        let selection = self.views[&id].selection.clone();
+        let linewise = values
+            .iter()
+            .any(|value| helix_core::line_ending::get_line_ending_of_str(value).is_some());
+        let mut offset = 0;
+        let mut ranges = SmallVec::new();
+        let transaction = Transaction::change(
+            &self.rope,
+            selection.iter().enumerate().map(|(index, range)| {
+                let pos = match (before, linewise) {
+                    (true, true) => slice.line_to_char(slice.char_to_line(range.from())),
+                    (false, true) => {
+                        slice.line_to_char((range.line_range(slice).1 + 1).min(slice.len_lines()))
+                    }
+                    (true, false) => range.from(),
+                    (false, false) => range.to(),
+                };
+                let value = &values[index.min(values.len() - 1)];
+                let len = value.chars().count();
+                ranges.push(
+                    Range::new(pos + offset, pos + offset + len).with_direction(range.direction()),
+                );
+                offset += len;
+                (pos, pos, Some(value.as_str().into()))
+            }),
+        );
+        let selection = (self.views[&id].mode == TextMode::Normal)
+            .then(|| Selection::new(ranges, selection.primary_index()));
+        self.apply(id, transaction, selection);
+    }
+
+    fn start_word_jump(&mut self, id: u64) {
+        let slice = self.rope.slice(..);
+        let view = &self.views[&id];
+        let start = slice.line_to_char(view.scroll.min(slice.len_lines() - 1));
+        let end = slice.line_to_char((view.scroll + view.viewport_height).min(slice.len_lines()));
+        let cursor = view.selection.primary().cursor(slice);
+        let mut forward = Range::point(cursor);
+        let mut backward = Range::point(cursor);
+        let mut words = Vec::new();
+
+        // Keep Helix's alternating, nearest-word-first label order.
+        if slice.get_char(cursor).is_some_and(|ch| !ch.is_whitespace()) {
+            let word_end = movement::move_next_word_end(slice, forward, 1);
+            if word_end.anchor == cursor {
+                forward = word_end;
+            }
+            let word_start = movement::move_prev_word_start(slice, backward, 1);
+            if word_start.anchor == next_grapheme_boundary(slice, cursor) {
+                backward = word_start;
+            }
+        }
+        'outer: loop {
+            let mut changed = false;
+            while forward.head < end {
+                forward = movement::move_next_word_end(slice, forward, 1);
+                if slice
+                    .slice(..forward.head)
+                    .graphemes_rev()
+                    .take(2)
+                    .take_while(|grapheme| grapheme.chars().all(char_is_word))
+                    .count()
+                    != 2
+                {
+                    continue;
+                }
+                changed = true;
+                forward.anchor += slice
+                    .chars_at(forward.anchor)
+                    .take_while(|&ch| !char_is_word(ch))
+                    .count();
+                if forward.from() < start || forward.to() > end {
+                    continue;
+                }
+                words.push(forward);
+                if words.len() == 26 * 26 {
+                    break 'outer;
+                }
+                break;
+            }
+            while backward.head > start {
+                backward = movement::move_prev_word_start(slice, backward, 1);
+                if slice
+                    .slice(backward.head..)
+                    .graphemes()
+                    .take(2)
+                    .take_while(|grapheme| grapheme.chars().all(char_is_word))
+                    .count()
+                    != 2
+                {
+                    continue;
+                }
+                changed = true;
+                backward.anchor -= slice
+                    .chars_at(backward.anchor)
+                    .reversed()
+                    .take_while(|&ch| !char_is_word(ch))
+                    .count();
+                if backward.from() < start || backward.to() > end {
+                    continue;
+                }
+                words.push(backward);
+                if words.len() == 26 * 26 {
+                    break 'outer;
+                }
+                break;
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let view = self.views.get_mut(&id).unwrap();
+        view.pending = if words.is_empty() {
+            PendingInput::None
+        } else {
+            PendingInput::GotoWord { words, first: None }
+        };
+    }
+
+    fn move_selection(&mut self, id: u64, command: TextCommand, count: usize) {
+        let slice = self.rope.slice(..);
+        let extend = self.views[&id].mode == TextMode::Select;
+        let insert = self.views[&id].mode == TextMode::Insert;
+        let behaviour = if extend {
+            Movement::Extend
+        } else {
+            Movement::Move
+        };
+        let page_scroll = match command {
+            TextCommand::PageHalfDown => Some(zess_ui::HalfPageScroll::new(
+                self.views[&id].viewport_height,
+                count,
+                zess_ui::ScrollDirection::Down,
+            )),
+            TextCommand::PageHalfUp => Some(zess_ui::HalfPageScroll::new(
+                self.views[&id].viewport_height,
+                count,
+                zess_ui::ScrollDirection::Up,
+            )),
+            _ => None,
+        };
+        let vertical_count = page_scroll
+            .as_ref()
+            .map_or(count, |scroll| scroll.distance());
+        let selection = self.views[&id].selection.clone().transform(|range| {
+            let cursor = range.cursor(slice);
+            let row = slice.char_to_line(cursor);
+            let mut annotations = TextAnnotations::default();
+            let format = TextFormat::default();
+            let moved = match command {
+                TextCommand::MoveLeft => movement::move_horizontally(
+                    slice,
+                    range,
+                    Direction::Backward,
+                    count,
+                    behaviour,
+                    &format,
+                    &mut annotations,
+                ),
+                TextCommand::MoveRight => movement::move_horizontally(
+                    slice,
+                    range,
+                    Direction::Forward,
+                    count,
+                    behaviour,
+                    &format,
+                    &mut annotations,
+                ),
+                TextCommand::MoveDown | TextCommand::PageHalfDown => movement::move_vertically(
+                    slice,
+                    range,
+                    Direction::Forward,
+                    vertical_count,
+                    behaviour,
+                    &format,
+                    &mut annotations,
+                ),
+                TextCommand::MoveUp | TextCommand::PageHalfUp => movement::move_vertically(
+                    slice,
+                    range,
+                    Direction::Backward,
+                    vertical_count,
+                    behaviour,
+                    &format,
+                    &mut annotations,
+                ),
+                TextCommand::MoveWordStartForward => {
+                    movement::move_next_word_start(slice, range, count)
+                }
+                TextCommand::MoveWordStartBackward => {
+                    movement::move_prev_word_start(slice, range, count)
+                }
+                TextCommand::MoveWordEndForward => {
+                    movement::move_next_word_end(slice, range, count)
+                }
+                TextCommand::MoveLongWordStartForward => {
+                    movement::move_next_long_word_start(slice, range, count)
+                }
+                TextCommand::MoveLongWordStartBackward => {
+                    movement::move_prev_long_word_start(slice, range, count)
+                }
+                TextCommand::MoveLongWordEndForward => {
+                    movement::move_next_long_word_end(slice, range, count)
+                }
+                TextCommand::GotoLineStart => {
+                    range.put_cursor(slice, slice.line_to_char(row), extend)
+                }
+                TextCommand::GotoFirstNonwhitespace => {
+                    let start = slice.line_to_char(row);
+                    let offset = slice
+                        .line(row)
+                        .chars()
+                        .take_while(|c| c.is_whitespace() && *c != '\n' && *c != '\r')
+                        .count();
+
+                    range.put_cursor(slice, start + offset, extend)
+                }
+                TextCommand::GotoLineEnd => {
+                    let end = self.line_end(row);
+                    let end = if end > slice.line_to_char(row) {
+                        prev_grapheme_boundary(slice, end)
+                    } else {
+                        end
+                    };
+
+                    range.put_cursor(slice, end, extend)
+                }
+                _ => range,
+            };
+            let moved = if extend
+                && matches!(
+                    command,
+                    TextCommand::MoveWordStartForward
+                        | TextCommand::MoveWordStartBackward
+                        | TextCommand::MoveWordEndForward
+                        | TextCommand::MoveLongWordStartForward
+                        | TextCommand::MoveLongWordStartBackward
+                        | TextCommand::MoveLongWordEndForward
+                ) {
+                Range::new(range.anchor, moved.head)
+            } else {
+                moved
+            };
+
+            if insert {
+                Range::point(moved.cursor(slice))
+            } else {
+                moved
+            }
+        });
+
+        let view = self.views.get_mut(&id).unwrap();
+        view.selection = if insert {
+            selection
+        } else {
+            selection.ensure_invariants(slice)
+        };
+        if let Some(page_scroll) = page_scroll {
+            let row = slice.char_to_line(view.selection.primary().cursor(slice));
+            view.scroll = page_scroll.viewport_start(view.scroll, row, 5);
+        }
+    }
+
+    fn select_lines(&mut self, id: u64, count: usize, bounds_only: bool) {
+        let slice = self.rope.slice(..);
+        let selection = self.views[&id].selection.clone().transform(|range| {
+            let (first, last) = range.line_range(slice);
+            let from = slice.line_to_char(first);
+            let end = if last + 1 == slice.len_lines() {
+                slice.len_chars()
+            } else {
+                slice.line_to_char(last + 1)
+            };
+            let additional = if bounds_only {
+                1
+            } else {
+                count + usize::from(range.from() == from && range.to() == end)
+            };
+            let to_line = (last + additional).min(slice.len_lines());
+            let to = if to_line == slice.len_lines() {
+                slice.len_chars()
+            } else {
+                slice.line_to_char(to_line)
+            };
+
+            if bounds_only {
+                Range::new(from, to).with_direction(range.direction())
+            } else {
+                Range::new(from, to)
+            }
+        });
+
+        self.views.get_mut(&id).unwrap().selection = selection.ensure_invariants(slice);
+    }
+
+    fn open_lines(&mut self, id: u64, above: bool, count: usize) {
+        self.begin_group(id);
+
+        let selection = self.views[&id].selection.clone();
+        let mut changes = Vec::new();
+        let mut positions = Vec::new();
+
+        for range in &selection {
+            let row = self.rope.char_to_line(range.cursor(self.rope.slice(..)));
+            let pos = if above {
+                self.rope.line_to_char(row)
+            } else {
+                self.line_end(row)
+            };
+            let indentation = if above {
+                self.line_indentation(self.line_end(row))
+            } else {
+                self.newline_indentation(pos)
+            };
+            let text = if above {
+                format!("{indentation}\n").repeat(count)
+            } else {
+                format!("\n{indentation}").repeat(count)
+            };
+
+            positions.push((pos, indentation.chars().count()));
+            changes.push((pos, pos, Some(text.into())));
+        }
+
+        let transaction = Transaction::change(&self.rope, changes.into_iter());
+        let selection = Selection::new(
+            positions
+                .into_iter()
+                .map(|(pos, indentation)| {
+                    Range::point(if above {
+                        transaction.changes().map_pos(pos, Assoc::Before) + indentation
+                    } else {
+                        transaction.changes().map_pos(pos, Assoc::After)
+                    })
+                })
+                .collect(),
+            selection.primary_index(),
+        );
+
+        self.views.get_mut(&id).unwrap().mode = TextMode::Insert;
+        self.apply(id, transaction, Some(selection));
     }
 
     pub fn language_id(&self) -> Option<&str> {
@@ -1185,6 +2796,14 @@ impl TextBuffer {
         }
     }
 
+    pub fn syntax_error(&self) -> Option<&str> {
+        self.language.as_ref().and_then(LanguageAttachment::error)
+    }
+
+    fn is_rust(&self) -> bool {
+        self.language_id() == Some("rust")
+    }
+
     fn indentation(&self) -> (helix_core::indent::IndentStyle, usize) {
         self.language
             .as_ref()
@@ -1192,8 +2811,160 @@ impl TextBuffer {
             .unwrap_or((helix_core::indent::IndentStyle::Spaces(4), 4))
     }
 
-    pub fn syntax_error(&self) -> Option<&str> {
-        self.language.as_ref().and_then(LanguageAttachment::error)
+    fn line_indentation(&self, pos: usize) -> String {
+        let start = self.rope.line_to_char(self.rope.char_to_line(pos));
+
+        self.rope
+            .slice(start..pos)
+            .chars()
+            .take_while(|ch| *ch == ' ' || *ch == '\t')
+            .collect()
+    }
+
+    fn newline_indentation(&mut self, pos: usize) -> String {
+        let mut indentation = self.line_indentation(pos);
+        let indent_style = self.indentation().0;
+
+        if self.is_rust() {
+            let text = self.text();
+
+            let syntax = self
+                .language
+                .as_mut()
+                .and_then(|language| language.syntax(&self.rope));
+
+            let byte = self.rope.char_to_byte(pos);
+            let line = self.rope.char_to_line(pos);
+            let start = self.rope.line_to_byte(line);
+            let prefix = text[start..byte].trim_end();
+
+            if prefix.ends_with('{') {
+                let byte = start + prefix.len() - 1;
+                let opener = syntax.and_then(|syntax| {
+                    syntax.descendant_for_byte_range(byte as u32, (byte + 1) as u32)
+                });
+
+                if opener.is_some_and(|node| node.kind() == "{") {
+                    indentation.push_str(indent_style.as_str());
+                }
+            }
+        }
+
+        indentation
+    }
+
+    fn insert_closing_brace(&mut self, id: u64) {
+        self.begin_group(id);
+
+        let text = self.text();
+
+        let syntax = self
+            .language
+            .as_mut()
+            .and_then(|language| language.syntax(&self.rope));
+
+        let slice = self.rope.slice(..);
+        let selection = self.views[&id].selection.clone().transform(|range| {
+            let byte = slice.char_to_byte(range.head);
+            let byte = text[..byte].trim_end().len().saturating_sub(1);
+            let mut node = syntax.and_then(|syntax| {
+                syntax.descendant_for_byte_range(byte as u32, (byte + 1).min(text.len()) as u32)
+            });
+            let code_boundary = node
+                .as_ref()
+                .is_some_and(|node| matches!(node.kind(), "{" | "}" | ";" | ")" | "]"));
+
+            while let Some(current) = node {
+                if current.kind() == "ERROR" && !code_boundary {
+                    return range;
+                }
+
+                if matches!(
+                    current.kind(),
+                    "string_literal"
+                        | "raw_string_literal"
+                        | "char_literal"
+                        | "line_comment"
+                        | "block_comment"
+                ) {
+                    return range;
+                }
+
+                node = current.parent();
+            }
+
+            let start = slice.line_to_char(slice.char_to_line(range.head));
+            let prefix = slice.slice(start..range.head).to_string();
+
+            if prefix.chars().all(|ch| ch == ' ' || ch == '\t') {
+                let removed = if prefix.ends_with('\t') {
+                    1
+                } else {
+                    prefix
+                        .chars()
+                        .rev()
+                        .take_while(|ch| *ch == ' ')
+                        .take(4)
+                        .count()
+                };
+
+                Range::new(range.head - removed, range.head)
+            } else {
+                range
+            }
+        });
+
+        self.views.get_mut(&id).unwrap().selection = selection;
+        self.replace_selections(id, &["}".into()], false, false);
+    }
+
+    fn find_character(
+        &mut self,
+        id: u64,
+        direction: Direction,
+        till: bool,
+        target: char,
+        count: usize,
+    ) {
+        let slice = self.rope.slice(..);
+        let forward = direction == Direction::Forward;
+        let extend = self.views[&id].mode == TextMode::Select;
+        let selection = self.views[&id].selection.clone().transform(|range| {
+            let start = range.cursor(slice);
+            let found = if forward {
+                slice
+                    .chars_at((start + 1).min(slice.len_chars()))
+                    .enumerate()
+                    .filter(|(_, ch)| *ch == target)
+                    .nth(count - 1)
+                    .map(|(offset, _)| start + offset + 1)
+            } else {
+                let mut chars = slice.chars_at(start);
+
+                chars.reverse();
+                chars
+                    .enumerate()
+                    .filter(|(_, ch)| *ch == target)
+                    .nth(count - 1)
+                    .map(|(offset, _)| start - offset - 1)
+            };
+
+            if let Some(mut pos) = found {
+                if till {
+                    pos = if forward {
+                        prev_grapheme_boundary(slice, pos)
+                    } else {
+                        next_grapheme_boundary(slice, pos)
+                    };
+                }
+
+                range.put_cursor(slice, pos, extend)
+            } else {
+                range
+            }
+        });
+
+        self.views.get_mut(&id).unwrap().selection = selection.ensure_invariants(slice);
     }
 
     fn build_regex(&self, pattern: &str) -> Result<helix_stdx::rope::Regex> {
