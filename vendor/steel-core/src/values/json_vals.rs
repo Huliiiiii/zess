@@ -7,6 +7,7 @@ use crate::{
     rvals::{FromSteelVal, IntoSteelVal, Result, SteelVal},
 };
 use core::convert::{TryFrom, TryInto};
+use num_traits::ToPrimitive;
 use serde_json::{Map, Number, Value};
 use steel_derive::function;
 
@@ -110,8 +111,24 @@ impl TryFrom<Value> for SteelVal {
 impl TryFrom<Number> for SteelVal {
     type Error = SteelErr;
     fn try_from(n: Number) -> core::result::Result<Self, Self::Error> {
-        let result = n.as_f64().unwrap();
-        Ok(SteelVal::NumV(result))
+        if let Some(n) = n.as_i64() {
+            return Ok(match isize::try_from(n) {
+                Ok(n) => SteelVal::IntV(n),
+                Err(_) => SteelVal::BigNum(Gc::new(n.into())),
+            });
+        }
+
+        if let Some(n) = n.as_u64() {
+            return Ok(match isize::try_from(n) {
+                Ok(n) => SteelVal::IntV(n),
+                Err(_) => SteelVal::BigNum(Gc::new(n.into())),
+            });
+        }
+
+        match n.as_f64() {
+            Some(n) if n.is_finite() => Ok(SteelVal::NumV(n)),
+            _ => stop!(ConversionError => "JSON number is not finite"),
+        }
     }
 }
 
@@ -135,8 +152,20 @@ impl TryFrom<SteelVal> for Value {
     fn try_from(val: SteelVal) -> core::result::Result<Self, Self::Error> {
         match val {
             SteelVal::BoolV(b) => Ok(Value::Bool(b)),
-            SteelVal::NumV(n) => Ok(Value::Number(Number::from_f64(n).unwrap())),
+            SteelVal::NumV(n) => match Number::from_f64(n) {
+                Some(n) => Ok(Value::Number(n)),
+                None => stop!(ConversionError => "non-finite number is not JSON serializable"),
+            },
             SteelVal::IntV(n) => Ok(Value::Number(Number::from(n))),
+            SteelVal::BigNum(n) => {
+                if let Some(n) = n.to_i64() {
+                    Ok(Value::Number(Number::from(n)))
+                } else if let Some(n) = n.to_u64() {
+                    Ok(Value::Number(Number::from(n)))
+                } else {
+                    stop!(ConversionError => "integer exceeds the JSON integer range")
+                }
+            }
             SteelVal::CharV(c) => Ok(Value::String(c.to_string())),
             // SteelVal::Pair(_) => Ok(Value::Array(
             //     SteelVal::iter(val)
