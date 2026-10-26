@@ -18,3 +18,7 @@ unicode-width.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[bench]]
+name = "render"
+harness = false

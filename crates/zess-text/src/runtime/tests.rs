@@ -62,3 +62,51 @@ fn selected_grammars_keep_the_pinned_sources_and_subdirectories() {
     assert_eq!(revision, "75b3874edb2dc714fb1fd77a32013d0f8699989f");
     assert_eq!(subpath.as_deref(), Some("typescript"));
 }
+
+#[test]
+fn building_the_bundled_grammar_installs_inherited_language_queries() {
+    if env::var_os("ZESS_TEST_QUERY_INSTALLATION").is_some() {
+        let directory = build_grammars(None, &["wisp".into()]).unwrap();
+        assert!(
+            helix_loader::grammar::get_language("wisp")
+                .unwrap()
+                .is_some()
+        );
+        let query = helix_core::syntax::read_query("typescript", "highlights.scm");
+        assert!(query.contains("@keyword.function"));
+        assert!(query.contains("type_identifier"));
+        assert!(directory.join("queries/python/highlights.scm").is_file());
+        let mut buffer =
+            crate::TextBuffer::new_with_path("\ndefine : example\n  #t\n", Path::new("example.w"));
+        let frame = buffer.render(1, 40, 4, false);
+        assert_eq!(
+            frame
+                .rows
+                .iter()
+                .flat_map(|row| &row.spans)
+                .filter(|span| span.style == "keyword")
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "define"
+        );
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::tests::building_the_bundled_grammar_installs_inherited_language_queries",
+            "--nocapture",
+        ])
+        .env("ZESS_TEST_QUERY_INSTALLATION", "1")
+        .env("ZESS_RUNTIME", directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

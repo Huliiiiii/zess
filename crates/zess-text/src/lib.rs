@@ -38,6 +38,9 @@ pub mod runtime;
 
 use language::LanguageAttachment;
 
+#[cfg(test)]
+mod tests;
+
 macro_rules! text_commands {
     ($( $variant:ident => ($id:literal, $description:literal) ),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, PartialEq)]
@@ -486,6 +489,7 @@ enum LanguageDetection {
 
 pub struct TextBuffer {
     rope: Rope,
+    line_width: Option<(u64, usize, usize)>,
     path: Option<PathBuf>,
     version: u64,
     history: History,
@@ -505,6 +509,7 @@ impl TextBuffer {
     pub fn new(text: &str) -> Self {
         Self {
             rope: Rope::from_str(text),
+            line_width: None,
             path: None,
             version: 0,
             history: History::default(),
@@ -566,6 +571,7 @@ impl TextBuffer {
             let detected = language::detect(&path);
             if detected.as_ref().map(LanguageAttachment::id) != self.language_id() {
                 self.language = detected;
+                self.invalidate_viewport_widths();
             }
         }
         self.path = Some(path);
@@ -596,6 +602,80 @@ impl TextBuffer {
     }
     pub fn view(&self, id: u64) -> &TextView {
         &self.views[&id]
+    }
+
+    /// Cancels pending input, restoring the selection from before a pattern preview.
+    pub fn cancel_pending_command(&mut self, id: u64) {
+        if let Some(view) = self.views.get_mut(&id) {
+            view.cancel_pending_input();
+        }
+        self.refresh_cursors();
+    }
+
+    pub fn replace_readonly(&mut self, contents: &str) -> Result<()> {
+        if !self.readonly {
+            anyhow::bail!("cannot replace contents of a writable text buffer");
+        }
+
+        if self.rope == contents {
+            return Ok(());
+        }
+
+        let old_slice = self.rope.slice(..);
+        let new_rope = Rope::from_str(contents);
+        let new_slice = new_rope.slice(..);
+        let remap_position = |position: usize| {
+            let old_row = old_slice.char_to_line(position.min(old_slice.len_chars()));
+            let old_column = position.saturating_sub(old_slice.line_to_char(old_row));
+            let row = old_row.min(new_slice.len_lines().saturating_sub(1));
+            let start = new_slice.line_to_char(row);
+            let line = new_slice.line(row).to_string();
+            let line_length = line.trim_end_matches(['\r', '\n']).chars().count();
+
+            start + old_column.min(line_length)
+        };
+
+        for view in self.views.values_mut() {
+            view.cancel_pending_input();
+            let ranges = view
+                .selection
+                .iter()
+                .map(|range| Range::new(remap_position(range.anchor), remap_position(range.head)))
+                .collect();
+
+            view.selection =
+                Selection::new(ranges, view.selection.primary_index()).ensure_invariants(new_slice);
+            view.scroll = view.scroll.min(new_slice.len_lines().saturating_sub(1));
+        }
+
+        if let Some(language) = &mut self.language {
+            let transaction = Transaction::change(
+                &self.rope,
+                std::iter::once((0, self.rope.len_chars(), Some(contents.into()))),
+            );
+            language.update(&self.rope, &new_rope, transaction.changes());
+        }
+        self.rope = new_rope;
+        self.version += 1;
+        self.refresh_cursors();
+
+        Ok(())
+    }
+
+    pub fn set_readonly(&mut self, readonly: bool) {
+        self.commit_group();
+        self.readonly = readonly;
+
+        if readonly {
+            let slice = self.rope.slice(..);
+
+            for view in self.views.values_mut() {
+                view.cancel_pending_input();
+                view.mode = TextMode::Normal;
+                view.selection = view.selection.clone().ensure_invariants(slice);
+            }
+            self.refresh_cursors();
+        }
     }
 
     pub fn ensure_view(&mut self, id: u64) {
@@ -791,6 +871,217 @@ impl TextBuffer {
         self.language
             .as_mut()
             .map_or_else(Vec::new, |language| language.outline(&self.rope))
+    }
+
+    /// Move or extend the primary Helix selection to a rendered character position.
+    pub fn select_at(&mut self, id: u64, position: usize, extend: bool) {
+        self.ensure_view(id);
+        self.commit_group();
+        self.cancel_pending_command(id);
+        let slice = self.rope.slice(..);
+        let position = position.min(slice.len_chars());
+        let view = self.views.get_mut(&id).unwrap();
+        let selection = if extend {
+            let range = view.selection.primary().put_cursor(slice, position, true);
+            Selection::single(range.anchor, range.head)
+        } else {
+            Selection::point(position)
+        };
+        view.selection = if view.mode == TextMode::Insert && !extend {
+            selection
+        } else {
+            selection.ensure_invariants(slice)
+        };
+        view.manual_viewport = false;
+        self.refresh_cursors();
+    }
+
+    pub fn scroll_view(&mut self, id: u64, horizontal: isize, vertical: isize) {
+        self.ensure_view(id);
+        let line_count = self.rope.len_lines();
+        let maximum_column = if horizontal == 0 {
+            None
+        } else {
+            Some(self.maximum_line_width())
+        };
+
+        let view = self.views.get_mut(&id).unwrap();
+        let maximum_row = line_count.saturating_sub(view.viewport_height.max(1));
+        view.scroll = view.scroll.saturating_add_signed(vertical).min(maximum_row);
+
+        if let Some(maximum_column) = maximum_column {
+            view.horizontal_scroll = view
+                .horizontal_scroll
+                .saturating_add_signed(horizontal)
+                .min(maximum_column.saturating_sub(view.viewport_width));
+        }
+
+        view.manual_viewport = true;
+    }
+
+    fn maximum_line_width(&mut self) -> usize {
+        let tab_width = self.indentation().1;
+        if let Some((version, tabs, width)) = self.line_width {
+            if version == self.version && tabs == tab_width {
+                return width;
+            }
+        }
+        let width = self
+            .rope
+            .lines()
+            .map(|line| visual_width(line.to_string().trim_end_matches(['\r', '\n']), tab_width))
+            .max()
+            .unwrap_or(0);
+        self.line_width = Some((self.version, tab_width, width));
+        width
+    }
+
+    /// Renders text without allocating editing state.
+    pub fn render_preview(
+        &mut self,
+        viewport: &mut PreviewViewport,
+        width: usize,
+        height: usize,
+    ) -> Vec<FrameRow> {
+        if viewport.horizontal_scroll > 0 {
+            viewport.horizontal_scroll = viewport
+                .horizontal_scroll
+                .min(self.maximum_line_width().saturating_sub(width));
+        }
+        viewport.width = width;
+        viewport.height = height;
+        viewport.scroll = viewport
+            .scroll
+            .min(self.line_count().saturating_sub(height.max(1)));
+        let tab_width = self.indentation().1;
+        paint_text(
+            &self.rope,
+            &mut self.language,
+            self.readonly,
+            tab_width,
+            TextPaint {
+                viewport: PreviewViewport {
+                    scroll: viewport.scroll,
+                    horizontal_scroll: viewport.horizontal_scroll,
+                    width,
+                    height,
+                },
+                selection: None,
+                focused: false,
+                jump_labels: &HashMap::new(),
+            },
+        )
+        .0
+    }
+
+    pub fn render(&mut self, id: u64, width: usize, height: usize, focused: bool) -> RenderResult {
+        self.ensure_view(id);
+        self.refresh_cursors();
+        let tab_width = self.indentation().1;
+
+        let view = &self.views[&id];
+        let maximum_column = if !view.manual_viewport
+            || view.horizontal_scroll == 0
+            || (view.viewport_width == width && view.viewport_version == self.version)
+        {
+            None
+        } else {
+            Some(self.maximum_line_width())
+        };
+        let slice = self.rope.slice(..);
+        let view = self.views.get_mut(&id).unwrap();
+        if let Some(maximum_column) = maximum_column {
+            view.horizontal_scroll = view
+                .horizontal_scroll
+                .min(maximum_column.saturating_sub(width));
+        }
+        view.viewport_width = width;
+        view.viewport_height = height;
+        view.viewport_version = self.version;
+        if view.manual_viewport {
+            view.scroll = view
+                .scroll
+                .min(slice.len_lines().saturating_sub(height.max(1)));
+        }
+        let (row, _) = view.cursor;
+        let cursor_char = if view.mode == TextMode::Insert {
+            view.selection.primary().head
+        } else {
+            view.selection.primary().cursor(slice)
+        };
+        let line_start = slice.line_to_char(row);
+        let cursor_column =
+            visual_width(&slice.slice(line_start..cursor_char).to_string(), tab_width);
+
+        if !view.manual_viewport && row < view.scroll {
+            view.scroll = row;
+        } else if !view.manual_viewport && row >= view.scroll + height.max(1) {
+            view.scroll = row + 1 - height.max(1);
+        }
+
+        if !view.manual_viewport && cursor_column < view.horizontal_scroll {
+            view.horizontal_scroll = cursor_column;
+        } else if !view.manual_viewport && cursor_column >= view.horizontal_scroll + width.max(1) {
+            view.horizontal_scroll = cursor_column + 1 - width.max(1);
+        }
+
+        let words = match &view.pending {
+            PendingInput::GotoWord { words, .. } => words.as_slice(),
+            _ => &[],
+        };
+        let jump_labels = words
+            .iter()
+            .enumerate()
+            .flat_map(|(index, range)| {
+                [
+                    (range.from(), char::from(b'a' + (index / 26) as u8)),
+                    (
+                        next_grapheme_boundary(slice, range.from()),
+                        char::from(b'a' + (index % 26) as u8),
+                    ),
+                ]
+            })
+            .collect::<HashMap<_, _>>();
+        let (rows, hit_positions) = paint_text(
+            &self.rope,
+            &mut self.language,
+            self.readonly,
+            tab_width,
+            TextPaint {
+                viewport: PreviewViewport {
+                    scroll: view.scroll,
+                    horizontal_scroll: view.horizontal_scroll,
+                    width,
+                    height,
+                },
+                selection: Some(&view.selection),
+                focused,
+                jump_labels: &jump_labels,
+            },
+        );
+
+        let cursor = if focused
+            && width > 0
+            && height > 0
+            && row >= view.scroll
+            && row < view.scroll + height
+            && cursor_column >= view.horizontal_scroll
+            && cursor_column < view.horizontal_scroll + width
+        {
+            Some((
+                (cursor_column - view.horizontal_scroll) as u16,
+                (row - view.scroll) as u16,
+            ))
+        } else {
+            None
+        };
+
+        RenderResult {
+            hit_positions,
+            rows,
+            cursor,
+            scroll: view.scroll,
+        }
     }
 }
 
