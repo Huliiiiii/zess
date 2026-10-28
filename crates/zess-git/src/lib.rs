@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub mod patch;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffSide {
