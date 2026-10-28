@@ -1,0 +1,323 @@
+use super::*;
+use std::{cell::RefCell, rc::Rc, time::Duration};
+use zess_plugin::{ItemSelection, PluginContext};
+use zess_services::NativeServices;
+
+fn services() -> Services {
+    Rc::new(RefCell::new(
+        NativeServices::new(std::env::current_dir().unwrap()).unwrap(),
+    ))
+}
+
+fn input() -> PluginInput {
+    PluginInput {
+        buffer_id: 1,
+        view_id: 1,
+        generation: 1,
+        preview_debounce: Duration::from_secs(60),
+        preview_area: None,
+        event: "select".into(),
+        argument: serde_json::Value::Null,
+        query: None,
+        options: serde_json::Value::Null,
+        mode: "normal".into(),
+        selection: ItemSelection::default(),
+        register: None,
+        context: PluginContext::default(),
+    }
+}
+
+fn output() -> PluginOutput {
+    PluginOutput {
+        display: Some(Display::default()),
+        ..PluginOutput::default()
+    }
+}
+
+fn commit(oid: &str) -> Commit {
+    Commit {
+        oid: oid.into(),
+        author: "author".into(),
+        date: "2026-01-01".into(),
+        message: "message".into(),
+    }
+}
+
+fn next_handle(services: &Services) -> u64 {
+    services
+        .borrow_mut()
+        .call("service.stats", serde_json::Value::Null)["next_handle"]
+        .as_u64()
+        .unwrap()
+}
+
+#[test]
+fn navigation_cancels_a_running_summary_even_at_the_same_commit() {
+    let services = services();
+    let input = input();
+    let selected = commit("1111111111111111111111111111111111111111");
+    let task = Task::start(
+        &services,
+        QueryRequest::CommitFiles {
+            commit: selected.oid.clone(),
+        },
+    )
+    .unwrap();
+    let mut preview = HistoryPreview {
+        state: QueryState::Running {
+            query: selected.oid.clone(),
+            task,
+        },
+        commit: Some("previous commit".into()),
+        info: vec![DisplayRow {
+            text: "previous info".into(),
+            ..DisplayRow::default()
+        }],
+        summary: vec![DisplayRow {
+            text: "previous summary".into(),
+            ..DisplayRow::default()
+        }],
+        ..HistoryPreview::default()
+    };
+    let now = Instant::now();
+    let before = next_handle(&services);
+
+    preview
+        .advance(
+            &services,
+            Event::Select,
+            &input,
+            Some(&selected),
+            &mut output(),
+            now,
+        )
+        .unwrap();
+
+    assert!(
+        matches!(preview.state, QueryState::Waiting { ready_at, .. } if ready_at == now + input.preview_debounce)
+    );
+    assert_eq!(preview.info[0].text, "previous info");
+    assert_eq!(preview.summary[0].text, "previous summary");
+    assert_eq!(
+        services
+            .borrow_mut()
+            .call("service.stats", serde_json::Value::Null)["jobs"],
+        0
+    );
+    assert_eq!(next_handle(&services), before + 2);
+}
+
+#[test]
+fn navigation_keeps_the_previous_commit_visible_until_the_last_selection_settles() {
+    let services = services();
+    let input = input();
+    let first = commit("1111111111111111111111111111111111111111");
+    let last = commit("2222222222222222222222222222222222222222");
+    let now = Instant::now();
+    let mut preview = HistoryPreview {
+        commit: Some("previous commit".into()),
+        info: vec![DisplayRow {
+            text: "previous info".into(),
+            ..DisplayRow::default()
+        }],
+        summary: vec![DisplayRow {
+            text: "previous summary".into(),
+            ..DisplayRow::default()
+        }],
+        ..HistoryPreview::default()
+    };
+    let before = next_handle(&services);
+    for (event, commit, elapsed) in [
+        (Event::Select, &first, 0),
+        (Event::Select, &last, 10),
+        (Event::FilterChanged, &last, 20),
+        (Event::MiniBufferChanged, &last, 30),
+        (Event::parse("tick"), &last, 89),
+    ] {
+        let mut output = output();
+        preview
+            .advance(
+                &services,
+                event,
+                &input,
+                Some(commit),
+                &mut output,
+                now + Duration::from_secs(elapsed),
+            )
+            .unwrap();
+        assert_eq!(preview.info[0].text, "previous info");
+        assert_eq!(preview.summary[0].text, "previous summary");
+        for request in output.requests {
+            if let HostRequest::PreviewGroup { panes, .. } = request {
+                assert!(panes.iter().all(|pane| matches!(pane, PreviewPane::View { path, .. } if path == "previous commit")));
+                assert!(
+                    matches!(&panes[1], PreviewPane::View { content: PreviewContent::Rows { rows, .. }, .. } if rows[0].text == "previous summary")
+                );
+            }
+        }
+    }
+
+    assert!(matches!(
+        preview.state,
+        QueryState::Waiting { ready_at, .. } if ready_at == now + Duration::from_secs(90)
+    ));
+    assert_eq!(preview.state.query(), Some(&last.oid));
+    // The second stats request consumes one handle; no query was started.
+    assert_eq!(next_handle(&services), before + 1);
+}
+
+#[test]
+fn ticks_start_the_last_selected_commit_once_after_the_delay() {
+    let services = services();
+    let input = input();
+    let selected = commit("1111111111111111111111111111111111111111");
+    let now = Instant::now();
+    let mut preview = HistoryPreview {
+        state: QueryState::Waiting {
+            query: selected.oid.clone(),
+            ready_at: now,
+        },
+        ..HistoryPreview::default()
+    };
+    let before = next_handle(&services);
+    for _ in 0..2 {
+        preview
+            .advance(
+                &services,
+                Event::parse("tick"),
+                &input,
+                Some(&selected),
+                &mut output(),
+                now,
+            )
+            .unwrap();
+    }
+
+    assert!(!matches!(preview.state, QueryState::Waiting { .. }));
+    assert_eq!(preview.state.query(), Some(&selected.oid));
+    assert_eq!(next_handle(&services), before + 2);
+}
+
+#[test]
+fn an_explicit_preview_starts_without_waiting_for_navigation_to_settle() {
+    let services = services();
+    let input = input();
+    let selected = commit("1111111111111111111111111111111111111111");
+    let now = Instant::now();
+    let mut preview = HistoryPreview::default();
+    let mut output = output();
+    preview
+        .advance(
+            &services,
+            Event::Preview,
+            &input,
+            Some(&selected),
+            &mut output,
+            now,
+        )
+        .unwrap();
+
+    assert!(!matches!(preview.state, QueryState::Waiting { .. }));
+    assert_eq!(preview.state.query(), Some(&selected.oid));
+    assert!(
+        output
+            .requests
+            .iter()
+            .any(|request| matches!(request, HostRequest::PreviewGroup { focus: true, .. }))
+    );
+}
+
+#[test]
+fn leaving_the_view_releases_the_running_commit_query() {
+    let services = services();
+    let input = input();
+    let selected = commit("1111111111111111111111111111111111111111");
+    let task = Task::start(
+        &services,
+        QueryRequest::CommitFiles {
+            commit: selected.oid.clone(),
+        },
+    )
+    .unwrap();
+    let mut preview = HistoryPreview {
+        state: QueryState::Running {
+            query: selected.oid.clone(),
+            task,
+        },
+        ..HistoryPreview::default()
+    };
+    let mut output = output();
+    preview
+        .advance(
+            &services,
+            Event::ViewLeaving,
+            &input,
+            Some(&selected),
+            &mut output,
+            Instant::now(),
+        )
+        .unwrap();
+
+    assert!(matches!(preview.state, QueryState::Idle { query: None }));
+    assert_eq!(
+        services
+            .borrow_mut()
+            .call("service.stats", serde_json::Value::Null)["jobs"],
+        0
+    );
+    assert!(output.requests.is_empty());
+}
+
+#[test]
+fn an_empty_completed_source_clears_the_previous_commit() {
+    let services = services();
+    let input = input();
+    let mut preview = HistoryPreview {
+        commit: Some("previous commit".into()),
+        info: vec![DisplayRow {
+            text: "previous info".into(),
+            ..DisplayRow::default()
+        }],
+        summary: vec![DisplayRow {
+            text: "previous summary".into(),
+            ..DisplayRow::default()
+        }],
+        ..HistoryPreview::default()
+    };
+    let mut loading = output();
+    loading.display.as_mut().unwrap().loading = true;
+    preview
+        .advance(
+            &services,
+            Event::FilterChanged,
+            &input,
+            None,
+            &mut loading,
+            Instant::now(),
+        )
+        .unwrap();
+    assert_eq!(preview.summary[0].text, "previous summary");
+    preview
+        .advance(
+            &services,
+            Event::parse("tick"),
+            &input,
+            None,
+            &mut output(),
+            Instant::now(),
+        )
+        .unwrap();
+
+    assert!(preview.commit.is_none());
+    assert!(preview.info.is_empty());
+    assert!(preview.summary.is_empty());
+    assert_eq!(
+        preview.totals.status(),
+        json!({"git": {
+            "state": "ready",
+            "additions": 0,
+            "deletions": 0,
+            "unknown_files": 0,
+        }})
+    );
+}

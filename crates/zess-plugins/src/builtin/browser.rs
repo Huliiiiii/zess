@@ -533,6 +533,7 @@ pub(super) fn register_file_actions(
     open_description: &str,
     layer_description: &str,
 ) {
+    super::file_actions::register(registry, kind);
     bind_event(registry, kind, "edit", open_description, &["g", "f"]);
     bind_event(registry, kind, "edit-layer", layer_description, &["e"]);
 }
