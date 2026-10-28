@@ -1,0 +1,14 @@
+[package]
+name = "zess-services"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zess-git.workspace = true
+anyhow.workspace = true
+ignore.workspace = true
+notify.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+zess-plugin.workspace = true
+zess-ui.workspace = true

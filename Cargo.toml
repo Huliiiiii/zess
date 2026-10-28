@@ -10,6 +10,7 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1.0.104"
 git2 = { version = "0.21.0", default-features = false, features = ["unstable-sha256"] }
+gix = { version = "0.90.0", default-features = false, features = ["sha1", "sha256"] }
 insta = { version = "1.49.0", features = ["json"] }
 hegel = { package = "hegeltest", version = "0.50.3", features = ["static-engine"] }
 globset = "0.4.21"
