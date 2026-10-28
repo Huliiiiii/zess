@@ -580,6 +580,42 @@ impl TextBuffer {
         Ok(())
     }
 
+    pub fn reload(&mut self, id: u64) -> Result<()> {
+        let path = self.path.as_deref().context("buffer has no file name")?;
+        let contents =
+            fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        self.ensure_view(id);
+        self.reload_with_selection(&contents, self.views[&id].selection.clone());
+        Ok(())
+    }
+
+    /// Applies a disk snapshot to every attached view, including hidden buffers.
+    pub fn reload_contents(&mut self, contents: &str) {
+        let selection = self
+            .views
+            .iter()
+            .min_by_key(|(id, _)| *id)
+            .map_or_else(|| Selection::point(0), |(_, view)| view.selection.clone());
+        self.reload_with_selection(contents, selection);
+    }
+
+    fn reload_with_selection(&mut self, contents: &str, selection: Selection) {
+        self.commit_group();
+        if self.rope != contents {
+            let original = State {
+                doc: self.rope.clone(),
+                selection,
+            };
+            let transaction =
+                helix_core::diff::compare_ropes(&self.rope, &Rope::from_str(contents));
+            let selection = original.selection.clone().map(transaction.changes());
+            self.apply_without_history(None, &transaction, None);
+            self.history
+                .commit_revision(&transaction.with_selection(selection), &original);
+        }
+        self.saved_revision = self.history.current_revision();
+    }
+
     pub fn text(&self) -> String {
         self.rope.to_string()
     }
@@ -604,12 +640,120 @@ impl TextBuffer {
         &self.views[&id]
     }
 
+    pub fn push_command_count(&mut self, id: u64, digit: u8) {
+        self.ensure_view(id);
+        self.views.get_mut(&id).unwrap().count.push(digit);
+    }
+
+    /// Changes editing mode and clears any partially entered operation.
+    pub fn set_mode(&mut self, id: u64, mode: &str) -> Result<()> {
+        self.set_text_mode(id, TextMode::parse(mode))
+    }
+
+    pub fn set_text_mode(&mut self, id: u64, mode: TextMode) -> Result<()> {
+        self.ensure_view(id);
+
+        if self.readonly && mode == TextMode::Insert {
+            anyhow::bail!("buffer is read-only");
+        }
+        self.cancel_pending_command(id);
+
+        let was_insert = self.views[&id].mode == TextMode::Insert;
+
+        if mode != TextMode::Insert {
+            self.commit_group();
+        } else if !was_insert {
+            self.begin_group(id);
+        }
+
+        let slice = self.rope.slice(..);
+        let view = self.views.get_mut(&id).unwrap();
+
+        if was_insert && mode == TextMode::Normal {
+            view.selection = view
+                .selection
+                .clone()
+                .transform(|range| Range::point(prev_grapheme_boundary(slice, range.head)))
+                .ensure_invariants(slice);
+        } else if was_insert && mode != TextMode::Insert {
+            view.selection = view.selection.clone().ensure_invariants(slice);
+        } else if !was_insert && mode == TextMode::Insert {
+            view.selection = view
+                .selection
+                .clone()
+                .transform(|range| Range::point(range.from()));
+        }
+
+        view.mode = mode.clone();
+        view.pending = PendingInput::None;
+        view.count = CommandCount::default();
+        view.register = None;
+        if !self.replaying_insert {
+            if was_insert && mode != TextMode::Insert {
+                if let Some(mut recording) = view.insert_recording.take() {
+                    if !matches!(recording.events.last(), Some(InsertEvent::Command(command)) if *command == TextCommand::Escape)
+                    {
+                        recording
+                            .events
+                            .push(InsertEvent::Command(TextCommand::Escape));
+                    }
+                    *self.insert_history.0.lock().unwrap() = Some(recording);
+                }
+            } else if !was_insert && mode == TextMode::Insert {
+                view.insert_recording = Some(InsertReplay {
+                    command: TextCommand::Insert,
+                    count: 1,
+                    register: None,
+                    events: Vec::new(),
+                });
+            }
+        }
+        self.refresh_cursors();
+
+        Ok(())
+    }
+
+    pub fn has_pending_input(&self, id: u64) -> bool {
+        self.views
+            .get(&id)
+            .is_some_and(|view| !matches!(view.pending, PendingInput::None))
+    }
+
+    pub fn pending_prompt(&self, id: u64) -> Option<TextPromptKind> {
+        match &self.views.get(&id)?.pending {
+            PendingInput::Regex { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
     /// Cancels pending input, restoring the selection from before a pattern preview.
     pub fn cancel_pending_command(&mut self, id: u64) {
         if let Some(view) = self.views.get_mut(&id) {
             view.cancel_pending_input();
         }
         self.refresh_cursors();
+    }
+
+    pub fn pending_input(&self, id: u64) -> String {
+        let Some(view) = self.views.get(&id) else {
+            return String::new();
+        };
+        let label = match &view.pending {
+            PendingInput::None => {
+                return view
+                    .register
+                    .map(|register| format!("Register \"{register}"))
+                    .unwrap_or_default();
+            }
+            PendingInput::GotoWord {
+                first: Some(first), ..
+            } => format!(
+                "Goto word: {}_ (type the second letter)",
+                char::from(b'a' + first)
+            ),
+            _ => view.pending.label().to_owned(),
+        };
+        format!("{label} · Esc to cancel")
     }
 
     pub fn replace_readonly(&mut self, contents: &str) -> Result<()> {
@@ -662,6 +806,14 @@ impl TextBuffer {
         Ok(())
     }
 
+    pub fn set_registers(&mut self, registers: Registers) {
+        self.registers = registers;
+    }
+
+    pub fn set_insert_history(&mut self, history: InsertHistory) {
+        self.insert_history = history;
+    }
+
     pub fn set_readonly(&mut self, readonly: bool) {
         self.commit_group();
         self.readonly = readonly;
@@ -676,6 +828,105 @@ impl TextBuffer {
             }
             self.refresh_cursors();
         }
+    }
+
+    /// Previews patterns against the selection captured when the prompt opened.
+    pub fn preview_prompt(
+        &mut self,
+        id: u64,
+        prompt: TextPromptKind,
+        value: &str,
+    ) -> Result<TextEffect> {
+        self.ensure_view(id);
+        if self.pending_prompt(id) != Some(prompt) {
+            return Ok(TextEffect::default());
+        }
+        let view = self.views.get_mut(&id).unwrap();
+        if let PendingInput::Regex {
+            selection,
+            scroll,
+            horizontal_scroll,
+            manual_viewport,
+            ..
+        } = &view.pending
+        {
+            view.selection = selection.clone();
+            view.scroll = *scroll;
+            view.horizontal_scroll = *horizontal_scroll;
+            view.manual_viewport = *manual_viewport;
+        }
+        if !value.is_empty()
+            && let Ok(regex) = self.build_regex(value)
+        {
+            let movement = if self.views[&id].mode == TextMode::Select {
+                Movement::Extend
+            } else {
+                Movement::Move
+            };
+            let _ = self.regex_selection(id, prompt, &regex, movement);
+        }
+        self.refresh_cursors();
+        Ok(TextEffect::default())
+    }
+
+    pub fn submit_prompt(
+        &mut self,
+        id: u64,
+        prompt: TextPromptKind,
+        value: &str,
+    ) -> Result<TextEffect> {
+        self.ensure_view(id);
+        anyhow::ensure!(
+            self.pending_prompt(id) == Some(prompt),
+            "text prompt is no longer active"
+        );
+
+        let view = self.views.get_mut(&id).unwrap();
+        if let PendingInput::Regex {
+            selection,
+            scroll,
+            horizontal_scroll,
+            manual_viewport,
+            ..
+        } = &view.pending
+        {
+            view.selection = selection.clone();
+            view.scroll = *scroll;
+            view.horizontal_scroll = *horizontal_scroll;
+            view.manual_viewport = *manual_viewport;
+        }
+        let register = view.prompt_register;
+        let result = if value.is_empty() {
+            Ok(())
+        } else {
+            let movement = if self.views[&id].mode == TextMode::Select {
+                Movement::Extend
+            } else {
+                Movement::Move
+            };
+            self.build_regex(value)
+                .and_then(|regex| self.regex_selection(id, prompt, &regex, movement))
+        };
+        self.refresh_cursors();
+        result?;
+        let clipboard = self.write_register(register, vec![value.into()])?;
+        let view = self.views.get_mut(&id).unwrap();
+        view.pending = PendingInput::None;
+        if matches!(
+            prompt,
+            TextPromptKind::SearchForward | TextPromptKind::SearchBackward
+        ) {
+            *self.registers.search_register.lock().unwrap() = register;
+        }
+        Ok(TextEffect {
+            clipboard: if register == '*' {
+                None
+            } else {
+                clipboard.clone()
+            },
+            primary_clipboard: if register == '*' { clipboard } else { None },
+            ..TextEffect::default()
+        })
     }
 
     pub fn ensure_view(&mut self, id: u64) {
@@ -807,6 +1058,23 @@ impl TextBuffer {
         }
     }
 
+    fn begin_group(&mut self, id: u64) {
+        if self.group.as_ref().is_some_and(|group| group.view_id != id) {
+            self.commit_group();
+        }
+
+        if self.group.is_none() {
+            self.group = Some(EditGroup {
+                original: State {
+                    doc: self.rope.clone(),
+                    selection: self.views[&id].selection.clone(),
+                },
+                transaction: Transaction::new(&self.rope),
+                view_id: id,
+            });
+        }
+    }
+
     fn commit_group(&mut self) {
         if let Some(group) = self.group.take()
             && !group.transaction.changes().is_empty()
@@ -822,6 +1090,67 @@ impl TextBuffer {
                 &group.original,
             );
         }
+    }
+
+    fn apply(&mut self, id: u64, transaction: Transaction, selection: Option<Selection>) {
+        if self.readonly {
+            return;
+        }
+
+        self.begin_group(id);
+        self.apply_without_history(Some(id), &transaction, selection);
+
+        let group = self.group.as_mut().unwrap();
+
+        group.transaction = group.transaction.clone().compose(transaction);
+    }
+
+    fn apply_without_history(
+        &mut self,
+        id: Option<u64>,
+        transaction: &Transaction,
+        selection: Option<Selection>,
+    ) {
+        if self.readonly {
+            return;
+        }
+
+        let old_rope = self.language.as_ref().map(|_| self.rope.clone());
+        if !transaction.apply(&mut self.rope) {
+            return;
+        }
+
+        if let (Some(language), Some(old_rope)) = (&mut self.language, old_rope) {
+            language.update(&old_rope, &self.rope, transaction.changes());
+        }
+
+        for view in self.views.values_mut() {
+            if !transaction.changes().is_empty() {
+                view.cancel_pending_input();
+            }
+            view.selection = view.selection.clone().map(transaction.changes());
+        }
+
+        if let Some(id) = id
+            && let Some(selection) = selection.or_else(|| transaction.selection().cloned())
+        {
+            self.views.get_mut(&id).unwrap().selection = selection;
+        }
+
+        let slice = self.rope.slice(..);
+
+        for view in self.views.values_mut() {
+            if view.mode != TextMode::Insert {
+                view.selection = view.selection.clone().ensure_invariants(slice);
+            }
+        }
+
+        self.version += 1;
+        self.refresh_cursors();
+    }
+
+    fn write_register(&self, register: char, values: Vec<String>) -> Result<Option<String>> {
+        self.registers.write(register, values)
     }
 
     pub fn language_id(&self) -> Option<&str> {
@@ -865,6 +1194,81 @@ impl TextBuffer {
 
     pub fn syntax_error(&self) -> Option<&str> {
         self.language.as_ref().and_then(LanguageAttachment::error)
+    }
+
+    fn build_regex(&self, pattern: &str) -> Result<helix_stdx::rope::Regex> {
+        helix_stdx::rope::RegexBuilder::new()
+            .syntax(
+                helix_stdx::rope::Config::new()
+                    .case_insensitive(!pattern.chars().any(char::is_uppercase))
+                    .multi_line(true)
+                    .crlf(
+                        helix_core::line_ending::auto_detect_line_ending(&self.rope)
+                            == Some(helix_core::LineEnding::Crlf),
+                    ),
+            )
+            .build(pattern)
+            .context("invalid regular expression")
+    }
+
+    fn regex_selection(
+        &mut self,
+        id: u64,
+        operation: TextPromptKind,
+        regex: &helix_stdx::rope::Regex,
+        movement: Movement,
+    ) -> Result<()> {
+        let slice = self.rope.slice(..);
+        let view = self.views.get_mut(&id).unwrap();
+        if matches!(operation, TextPromptKind::Select | TextPromptKind::Split) {
+            let selection = if operation == TextPromptKind::Select {
+                helix_core::selection::select_on_matches(slice, &view.selection, regex)
+                    .context("nothing selected")?
+            } else {
+                helix_core::selection::split_on_matches(slice, &view.selection, regex)
+            };
+            view.selection = selection.ensure_invariants(slice);
+            view.manual_viewport = false;
+            return Ok(());
+        }
+
+        let primary = view.selection.primary();
+        let start = if operation == TextPromptKind::SearchBackward {
+            helix_core::graphemes::ensure_grapheme_boundary_prev(slice, primary.from())
+        } else {
+            helix_core::graphemes::ensure_grapheme_boundary_next(slice, primary.to())
+        };
+        let start = slice.char_to_byte(start);
+        let found = if operation == TextPromptKind::SearchBackward {
+            regex
+                .find_iter(slice.regex_input_at_bytes(..start))
+                .last()
+                .or_else(|| regex.find_iter(slice.regex_input_at_bytes(start..)).last())
+        } else {
+            regex
+                .find(slice.regex_input_at_bytes(start..))
+                .or_else(|| regex.find(slice.regex_input()))
+        };
+
+        if let Some(found) = found
+            && found.end() != 0
+        {
+            let range = Range::new(
+                slice.byte_to_char(found.start()),
+                slice.byte_to_char(found.end()),
+            )
+            .with_direction(primary.direction());
+            view.selection = match movement {
+                Movement::Extend => view.selection.clone().push(range),
+                Movement::Move => view
+                    .selection
+                    .clone()
+                    .replace(view.selection.primary_index(), range),
+            }
+            .ensure_invariants(slice);
+            view.manual_viewport = false;
+        }
+        Ok(())
     }
 
     pub fn outline(&mut self) -> Vec<OutlineSymbol> {
