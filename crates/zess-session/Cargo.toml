@@ -1,0 +1,25 @@
+[package]
+name = "zess-session"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zess-filter.workspace = true
+zess-git.workspace = true
+anyhow.workspace = true
+helix-core.workspace = true
+serde_json.workspace = true
+zess-plugin.workspace = true
+zess-ui.workspace = true
+zess-protocol.workspace = true
+zess-ipc.workspace = true
+zess-text.workspace = true
+zess-script.workspace = true
+zess-services.workspace = true
+zess-plugins.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+hegel.workspace = true
+insta.workspace = true
