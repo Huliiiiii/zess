@@ -1,0 +1,25 @@
+[package]
+name = "zess-plugin"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zess-filter.workspace = true
+zess-git.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+string-interner.workspace = true
+smallvec.workspace = true
+zess-ui.workspace = true
+
+[dev-dependencies]
+blart.workspace = true
+fst.workspace = true
+trie-rs.workspace = true
+yada.workspace = true
+qp-trie.workspace = true
+
+[[bench]]
+name = "keymap"
+harness = false

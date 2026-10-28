@@ -8,6 +8,9 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+zess-filter = { path = "crates/zess-filter" }
+regex = "1.13.1"
+globset = "0.4.21"
 anyhow = "1.0.104"
 git2 = { version = "0.21.0", default-features = false, features = ["unstable-sha256"] }
 insta = { version = "1.49.0", features = ["json"] }
@@ -24,6 +27,13 @@ unicode-segmentation = "=1.13.3"
 etcetera = "0.11"
 tempfile = "=3.27.0"
 fnv = "1.0.7"
+string-interner = "0.20.0"
+smallvec = "1.16.4"
+blart = "0.6.0"
+fst = "0.4.7"
+trie-rs = "0.4.2"
+yada = "0.7.0"
+qp-trie = "0.8.2"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 helix-loader = { path = "vendor/helix-loader" }
 helix-core = { git = "https://github.com/helix-editor/helix", rev = "ba40e547426b0f9896c8bdc699a4ab11f2b37dbc" }
@@ -34,6 +44,7 @@ zess-protocol = { path = "crates/zess-protocol" }
 zess-ipc = { path = "crates/zess-ipc" }
 zess-text = { path = "crates/zess-text" }
 zess-script = { path = "crates/zess-script" }
+zess-git = { path = "crates/zess-git" }
 zess-services = { path = "crates/zess-services" }
 zess-session = { path = "crates/zess-session" }
 zess-terminal = { path = "crates/zess-terminal" }

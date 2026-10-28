@@ -1,0 +1,8 @@
+[package]
+name = "zess-filter"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+globset.workspace = true
+regex.workspace = true
