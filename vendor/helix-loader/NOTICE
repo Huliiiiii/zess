@@ -1,0 +1,8 @@
+Copied from https://github.com/helix-editor/helix at revision
+ba40e547426b0f9896c8bdc699a4ab11f2b37dbc under the Mozilla Public License 2.0.
+
+Zess changes:
+- Standalone Cargo metadata and retained built-in languages.toml include.
+- One-time injection of an isolated runtime directory.
+- Public wrappers for building and fetching an explicitly configured grammar.
+- Use the equivalent cc::Tool::get_envs API with the locked cc version.

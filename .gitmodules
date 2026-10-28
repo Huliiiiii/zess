@@ -1,0 +1,3 @@
+[submodule "tree-sitter-wisp"]
+	path = vendor/tree-sitter-wisp
+	url = https://github.com/nagy/tree-sitter-wisp.git
