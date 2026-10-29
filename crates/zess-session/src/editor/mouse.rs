@@ -13,6 +13,7 @@ pub(super) enum Content {
     },
     Diff {
         scroll: usize,
+        presentation: diff::Presentation,
     },
     Rows,
 }
@@ -215,9 +216,9 @@ impl Session {
                                 5,
                             )
                         }
-                        Buffer::PreviewDiff { diff, .. } => {
-                            diff.rows.len().saturating_sub(view.viewport_height.max(1))
-                        }
+                        Buffer::PreviewDiff { diff, .. } => diff
+                            .display_rows(view.location.diff_presentation)
+                            .saturating_sub(view.viewport_height.max(1)),
                         Buffer::PreviewRows { .. } => view
                             .location
                             .display
@@ -246,7 +247,7 @@ impl Session {
                 enum Target {
                     Text(usize),
                     Item(String),
-                    Diff(usize),
+                    Diff(usize, diff::Presentation),
                     None,
                 }
                 let target = match &region.content {
@@ -260,7 +261,10 @@ impl Session {
                         .filter(|id| !id.is_empty())
                         .cloned()
                         .map_or(Target::None, Target::Item),
-                    Content::Diff { scroll } => Target::Diff(scroll + row),
+                    Content::Diff {
+                        scroll,
+                        presentation,
+                    } => Target::Diff(scroll + row, *presentation),
                     Content::Rows => Target::None,
                 };
                 if matches!(target, Target::None) {
@@ -277,12 +281,24 @@ impl Session {
                             .unwrap()
                             .select_at(id, position, extend);
                     }
-                    Target::Diff(row) => {
+                    Target::Diff(row, presentation) => {
                         let Buffer::PreviewDiff { diff, .. } = &self.buffers[&buffer] else {
                             return Ok(());
                         };
                         let view = self.views.get_mut(&id).unwrap();
-                        if view.location.diff_selection.select_at(diff, row, extend) {
+                        let row = match presentation {
+                            diff::Presentation::Raw => Some(row),
+                            diff::Presentation::Rendered => diff
+                                .raw_row(presentation, row)
+                                .filter(|_| diff.mapped_rendering())
+                                .or_else(|| diff.raw_selection_at_rendered(row).row()),
+                        };
+                        if let Some(row) = row
+                            && view
+                                .location
+                                .diff_selection
+                                .select_at(&diff.index, row, extend)
+                        {
                             view.location.manual_viewport = false;
                         }
                     }

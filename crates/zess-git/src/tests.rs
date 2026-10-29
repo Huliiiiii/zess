@@ -140,7 +140,7 @@ fn every_unmerged_index_state_is_a_conflict() {
     }
 }
 
-struct Execute;
+pub(super) struct Execute;
 impl Execution for Execute {
     fn check(&self) -> anyhow::Result<()> {
         Ok(())
@@ -148,11 +148,145 @@ impl Execution for Execute {
     fn output(&self, command: &mut Command) -> anyhow::Result<std::process::Output> {
         Ok(command.output()?)
     }
+    fn output_with_input(
+        &self,
+        command: &mut Command,
+        input: &[u8],
+    ) -> anyhow::Result<std::process::Output> {
+        use std::io::Write;
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || stdin.write_all(input));
+            let output = child.wait_with_output();
+            writer.join().unwrap().unwrap();
+            output
+        });
+        Ok(writer?)
+    }
 }
 
-struct Repository(PathBuf);
+#[test]
+fn configured_external_renderers_do_not_change_the_patch_used_for_staging() {
+    let repo = Repository::new();
+    repo.commit("old\n");
+    fs::write(repo.0.join("file"), "new\n").unwrap();
+    fs::write(
+        repo.0.join("renderer.sh"),
+        "printf '\\033[35mrenderer:%s\\033[0m\\n' \"$1\"\ncat \"$2\" \"$5\"\n",
+    )
+    .unwrap();
+    repo.git(&["config", "diff.external", "sh ./renderer.sh"]);
+    repo.git(&["config", "pager.diff", "false"]);
+    let repository = crate::Repository::open(&repo.0).unwrap();
+    let raw = repo.diff(DiffSide::Unstaged);
+    let rendered = repository
+        .diff_renderer(&crate::DiffRenderOptions::default(), &Execute)
+        .unwrap()
+        .render(
+            &repository,
+            &crate::DiffSource::Changes {
+                side: DiffSide::Unstaged,
+            },
+            &crate::DiffTarget {
+                path: "file".into(),
+                original_path: None,
+            },
+            &raw,
+            &Execute,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(rendered.text.contains("renderer:file"));
+    assert!(rendered.text.contains("old\nnew\n"));
+    assert!(raw.contains("@@ -1 +1 @@\n-old\n+new\n"));
+    let start = row(&raw, "-old");
+    let end = row(&raw, "+new");
+    repo.apply(raw, DiffSide::Unstaged, vec![start..=end])
+        .unwrap();
+    assert_eq!(repo.git(&["show", ":file"]), "new\n");
+}
+
+#[test]
+fn configured_text_conversion_is_only_used_for_the_human_readable_rendering() {
+    let repo = Repository::new();
+    repo.commit("raw-old\n");
+    fs::write(repo.0.join("file"), "raw-new\n").unwrap();
+    fs::write(repo.0.join(".gitattributes"), "file diff=converted\n").unwrap();
+    fs::write(
+        repo.0.join("convert.sh"),
+        "sed 's/raw/converted/g' \"$1\"\n",
+    )
+    .unwrap();
+    repo.git(&["config", "diff.external", ""]);
+    repo.git(&["config", "diff.converted.textconv", "sh ./convert.sh"]);
+    repo.git(&["config", "pager.diff", "false"]);
+    let repository = crate::Repository::open(&repo.0).unwrap();
+    let raw = repo.diff(DiffSide::Unstaged);
+    let rendered = repository
+        .diff_renderer(&crate::DiffRenderOptions::default(), &Execute)
+        .unwrap()
+        .render(
+            &repository,
+            &crate::DiffSource::Changes {
+                side: DiffSide::Unstaged,
+            },
+            &crate::DiffTarget {
+                path: "file".into(),
+                original_path: None,
+            },
+            &raw,
+            &Execute,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(rendered.text.contains("converted-old"));
+    assert!(rendered.text.contains("converted-new"));
+    assert!(raw.contains("-raw-old\n+raw-new\n"));
+}
+
+#[test]
+fn external_renderers_receive_empty_old_content_for_a_root_commit() {
+    let repo = Repository::new();
+    repo.commit("committed\n");
+    fs::write(
+        repo.0.join("renderer.sh"),
+        "printf 'old:'; cat \"$2\"; printf 'new:'; cat \"$5\"\n",
+    )
+    .unwrap();
+    repo.git(&["config", "diff.external", "sh ./renderer.sh"]);
+    repo.git(&["config", "pager.diff", "false"]);
+    let commit = repo.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let repository = crate::Repository::open(&repo.0).unwrap();
+    let raw = repository
+        .commit_diff(&commit, "file", None, &Execute)
+        .unwrap();
+    let rendered = repository
+        .diff_renderer(&crate::DiffRenderOptions::default(), &Execute)
+        .unwrap()
+        .render(
+            &repository,
+            &crate::DiffSource::Commit { commit },
+            &crate::DiffTarget {
+                path: "file".into(),
+                original_path: None,
+            },
+            &raw,
+            &Execute,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(rendered.text, "old:new:committed\n");
+    assert!(raw.contains("+committed\n"));
+}
+
+pub(super) struct Repository(pub(super) PathBuf);
 impl Repository {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "zess-git-patch-{}-{}",
@@ -164,7 +298,7 @@ impl Repository {
         repo.git(&["init", "--quiet"]);
         repo
     }
-    fn git(&self, args: &[&str]) -> String {
+    pub(super) fn git(&self, args: &[&str]) -> String {
         let output = Command::new("git")
             .args([
                 "-c",
@@ -187,12 +321,12 @@ impl Repository {
         );
         String::from_utf8(output.stdout).unwrap()
     }
-    fn commit(&self, content: &str) {
+    pub(super) fn commit(&self, content: &str) {
         fs::write(self.0.join("file"), content).unwrap();
         self.git(&["add", "file"]);
         self.git(&["commit", "--quiet", "-m", "baseline"]);
     }
-    fn diff(&self, side: DiffSide) -> String {
+    pub(super) fn diff(&self, side: DiffSide) -> String {
         crate::Repository::open(&self.0)
             .unwrap()
             .diff("file", None, Some(side), &Execute)

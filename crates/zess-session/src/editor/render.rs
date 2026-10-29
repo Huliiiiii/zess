@@ -90,16 +90,17 @@ impl Session {
                 let viewport = &mut surface.viewport;
                 viewport.scroll = viewport
                     .scroll
-                    .min(diff.rows.len().saturating_sub(content_height.max(1)));
+                    .min(diff.index.rows.len().saturating_sub(content_height.max(1)));
                 viewport.horizontal_scroll = viewport
                     .horizontal_scroll
                     .min(diff.width.saturating_sub(rect.width));
-                for row in viewport.scroll..(viewport.scroll + content_height).min(diff.rows.len())
+                for row in
+                    viewport.scroll..(viewport.scroll + content_height).min(diff.index.rows.len())
                 {
-                    let style = match diff.rows[row].kind {
+                    let style = match diff.index.rows[row].kind {
                         Some(zess_git::patch::LineKind::Addition) => "git.added",
                         Some(zess_git::patch::LineKind::Deletion) => "git.deleted",
-                        _ if diff.rows[row].hunk.is_some() => "keyword",
+                        _ if diff.index.rows[row].hunk.is_some() => "keyword",
                         _ => "",
                     };
                     let mut spans = vec![Span {
@@ -347,107 +348,151 @@ impl Session {
             let view = self.views.get_mut(&id).unwrap();
             view.viewport_width = width;
             view.viewport_height = content_height;
-            let selection = view.location.diff_selection.rows(diff);
-            if !view.location.manual_viewport {
-                if let Some(selection) = &selection {
-                    if *selection.start() < view.location.scroll {
-                        view.location.scroll = *selection.start();
-                    }
-                    if content_height > 0
-                        && let Some(row) = view.location.diff_selection.row()
-                        && row >= view.location.scroll + content_height
-                    {
-                        view.location.scroll = row + 1 - content_height;
-                    }
-                }
-            }
-            view.location.scroll = view
-                .location
-                .scroll
-                .min(diff.rows.len().saturating_sub(content_height.max(1)));
-            let digits = diff.line_number_width;
-            let gutter = if options.get("gutter").is_some_and(|value| value == false) {
-                0
-            } else {
-                (digits + gutter_left_padding + 1).min(width.saturating_sub(1))
-            };
-            view.location.horizontal_scroll = view
-                .location
-                .horizontal_scroll
-                .min(diff.width.saturating_sub(width - gutter));
-            mouse_gutter = gutter;
-            mouse_content = mouse::Content::Diff {
-                scroll: view.location.scroll,
-            };
-            for row in
-                view.location.scroll..(view.location.scroll + content_height).min(diff.rows.len())
+            if matches!(
+                view.location.diff_presentation,
+                diff::Presentation::Rendered
+            ) && let Some(rendered) = &diff.rendered
             {
-                let metadata = &diff.rows[row];
-                let base = match metadata.kind {
-                    Some(zess_git::patch::LineKind::Addition) => "git.added",
-                    Some(zess_git::patch::LineKind::Deletion) => "git.deleted",
-                    _ if metadata.hunk.is_some() && metadata.kind.is_none() => "keyword",
-                    _ => "",
+                view.location.scroll = view
+                    .location
+                    .scroll
+                    .min(rendered.rows.len().saturating_sub(content_height.max(1)));
+                view.location.horizontal_scroll = view
+                    .location
+                    .horizontal_scroll
+                    .min(rendered.width.saturating_sub(width));
+                let layout = zess_ui::RowColumns::default();
+                mouse_content = mouse::Content::Diff {
+                    scroll: view.location.scroll,
+                    presentation: diff::Presentation::Rendered,
                 };
-                let style = if active && view.location.diff_selection.contains(diff, row) {
-                    if base.is_empty() {
-                        "selection".into()
-                    } else {
-                        format!("selection.{base}")
-                    }
-                } else {
-                    base.into()
-                };
-                let mut spans = vec![Span {
-                    base_style: None,
-                    text: diff.display_line(row),
-                    style: style.clone(),
-                }];
-                skip_columns(&mut spans, view.location.horizontal_scroll);
-                let mut spans = align_row(
-                    spans,
-                    &[],
-                    &style,
-                    &zess_ui::RowColumns::default().layout(0, width - gutter),
-                );
-                if gutter > 0 {
-                    let number = metadata
-                        .new_line
-                        .or(metadata.old_line)
-                        .map(|line| line.to_string())
-                        .unwrap_or_default();
-                    spans.insert(
-                        0,
-                        Span {
-                            base_style: None,
-                            text: fit(&format!("{number:>digits$} ", digits = gutter - 1), gutter),
-                            style: if active && view.location.diff_selection.contains(diff, row) {
-                                "linenr.current"
-                            } else {
-                                "linenr"
-                            }
-                            .into(),
-                        },
-                    );
+                for row in rendered
+                    .rows
+                    .iter()
+                    .skip(view.location.scroll)
+                    .take(content_height)
+                {
+                    let mut spans = row.spans.clone();
+                    skip_columns(&mut spans, view.location.horizontal_scroll);
+                    rows.push(FrameRow {
+                        spans: align_row(spans, &[], "", &layout.layout(0, width)),
+                    });
                 }
-                rows.push(FrameRow { spans });
+                context["mode"] = json!("browse");
+                context["selection_count"] = json!(0);
+                context["source_position"] = json!({"old_line": null, "new_line": null});
+                context["old_line"] = Value::Null;
+                context["new_line"] = Value::Null;
+            } else {
+                let selection = view.location.diff_selection.rows(&diff.index);
+                if !view.location.manual_viewport {
+                    if let Some(selection) = &selection {
+                        if *selection.start() < view.location.scroll {
+                            view.location.scroll = *selection.start();
+                        }
+                        if content_height > 0
+                            && let Some(row) = view.location.diff_selection.row()
+                            && row >= view.location.scroll + content_height
+                        {
+                            view.location.scroll = row + 1 - content_height;
+                        }
+                    }
+                }
+                view.location.scroll = view
+                    .location
+                    .scroll
+                    .min(diff.index.rows.len().saturating_sub(content_height.max(1)));
+                let digits = diff.line_number_width;
+                let gutter = if options.get("gutter").is_some_and(|value| value == false) {
+                    0
+                } else {
+                    (digits + gutter_left_padding + 1).min(width.saturating_sub(1))
+                };
+                view.location.horizontal_scroll = view
+                    .location
+                    .horizontal_scroll
+                    .min(diff.width.saturating_sub(width - gutter));
+                mouse_gutter = gutter;
+                mouse_content = mouse::Content::Diff {
+                    scroll: view.location.scroll,
+                    presentation: diff::Presentation::Raw,
+                };
+                for row in view.location.scroll
+                    ..(view.location.scroll + content_height).min(diff.index.rows.len())
+                {
+                    let metadata = &diff.index.rows[row];
+                    let base = match metadata.kind {
+                        Some(zess_git::patch::LineKind::Addition) => "git.added",
+                        Some(zess_git::patch::LineKind::Deletion) => "git.deleted",
+                        _ if metadata.hunk.is_some() && metadata.kind.is_none() => "keyword",
+                        _ => "",
+                    };
+                    let style = if active && view.location.diff_selection.contains(&diff.index, row)
+                    {
+                        if base.is_empty() {
+                            "selection".into()
+                        } else {
+                            format!("selection.{base}")
+                        }
+                    } else {
+                        base.into()
+                    };
+                    let mut spans = vec![Span {
+                        base_style: None,
+                        text: diff.display_line(row),
+                        style: style.clone(),
+                    }];
+                    skip_columns(&mut spans, view.location.horizontal_scroll);
+                    let mut spans = align_row(
+                        spans,
+                        &[],
+                        &style,
+                        &zess_ui::RowColumns::default().layout(0, width - gutter),
+                    );
+                    if gutter > 0 {
+                        let number = metadata
+                            .new_line
+                            .or(metadata.old_line)
+                            .map(|line| line.to_string())
+                            .unwrap_or_default();
+                        spans.insert(
+                            0,
+                            Span {
+                                base_style: None,
+                                text: fit(
+                                    &format!("{number:>digits$} ", digits = gutter - 1),
+                                    gutter,
+                                ),
+                                style: if active
+                                    && view.location.diff_selection.contains(&diff.index, row)
+                                {
+                                    "linenr.current"
+                                } else {
+                                    "linenr"
+                                }
+                                .into(),
+                            },
+                        );
+                    }
+                    rows.push(FrameRow { spans });
+                }
+                let position = view
+                    .location
+                    .diff_selection
+                    .row()
+                    .and_then(|row| diff.index.rows.get(row));
+                let old = position.and_then(|row| row.old_line);
+                let new = position.and_then(|row| row.new_line);
+                context["mode"] = json!(match view.location.diff_selection {
+                    diff::Selection::Block { .. } => "hunk",
+                    diff::Selection::Line { .. } => "line",
+                    diff::Selection::Range { .. } => "range",
+                });
+                context["selection_count"] = json!(usize::from(position.is_some()));
+                context["source_position"] = json!({"old_line": old, "new_line": new});
+                context["old_line"] = json!(old);
+                context["new_line"] = json!(new);
             }
-            let position = view
-                .location
-                .diff_selection
-                .row()
-                .and_then(|row| diff.rows.get(row));
-            let old = position.and_then(|row| row.old_line);
-            let new = position.and_then(|row| row.new_line);
-            context["mode"] = json!(match view.location.diff_selection {
-                diff::Selection::Block { .. } => "hunk",
-                diff::Selection::Line { .. } => "line",
-                diff::Selection::Range { .. } => "range",
-            });
-            context["selection_count"] = json!(usize::from(position.is_some()));
-            context["source_position"] = json!({"old_line": old, "new_line": new});
-            context["old_line"] = json!(old);
-            context["new_line"] = json!(new);
         } else if matches!(self.buffers[&buffer], Buffer::PreviewRows { .. }) {
             let view = self.views.get_mut(&id).unwrap();
             view.viewport_width = width;

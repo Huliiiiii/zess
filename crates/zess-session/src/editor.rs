@@ -166,6 +166,7 @@ struct ViewLocation {
     columns: zess_ui::RowColumns,
     selection: ItemSelection,
     diff_selection: diff::Selection,
+    diff_presentation: diff::Presentation,
     statusline: Vec<Span>,
     scroll: usize,
     horizontal_scroll: usize,
@@ -194,6 +195,7 @@ impl ViewLocation {
             columns: zess_ui::RowColumns::default(),
             selection: ItemSelection::default(),
             diff_selection: diff::Selection::default(),
+            diff_presentation: diff::Presentation::Raw,
             statusline: Vec::new(),
             scroll: 0,
             horizontal_scroll: 0,
@@ -906,7 +908,7 @@ impl Session {
         {
             json!({"view_id":self.focus,"buffer_id":view.location.buffer,"cursors":text.selections(self.focus)})
         } else if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
-            let range = view.location.diff_selection.rows(diff);
+            let range = view.location.diff_selection.rows(&diff.index);
             json!({"view_id":self.focus,"buffer_id":view.location.buffer,"diff_selection":{"row": view.location.diff_selection.row(),"start_row":range.as_ref().map(|range| range.start()),"end_row":range.as_ref().map(|range| range.end())}})
         } else {
             json!({"view_id":self.focus,"buffer_id":view.location.buffer,"selection":view.location.selection})
@@ -1027,6 +1029,7 @@ impl Session {
         self.ensure_focus_allowed(view)?;
         if self.focus != view {
             self.cancel_input_context()?;
+            self.blur_diff(self.focus);
         }
         self.activate_view(view);
         Ok(())
@@ -1034,6 +1037,7 @@ impl Session {
 
     fn activate_view(&mut self, view: ViewId) {
         self.focus = view;
+        self.focus_diff(view);
         self.views.activate_preview(view);
     }
 
@@ -1434,9 +1438,12 @@ impl Session {
                 let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] else {
                     bail!("search requires a diff")
                 };
-                if let Some(row) =
-                    diff.search(&prompt.text, search.selection.row(), search.forward)?
-                {
+                if let Some(row) = diff.search(
+                    diff::Presentation::Raw,
+                    &prompt.text,
+                    search.selection.row(),
+                    search.forward,
+                )? {
                     view.location.diff_selection.set_head(Some(row));
                     view.location.manual_viewport = false;
                 }
@@ -1578,8 +1585,12 @@ impl Session {
                             bail!("search requires a diff")
                         };
                         if !prompt.text.is_empty() {
-                            match diff.search(&prompt.text, search.selection.row(), search.forward)
-                            {
+                            match diff.search(
+                                diff::Presentation::Raw,
+                                &prompt.text,
+                                search.selection.row(),
+                                search.forward,
+                            ) {
                                 Ok(Some(row)) => {
                                     view.location.diff_selection.set_head(Some(row));
                                     view.location.manual_viewport = false;
@@ -2634,13 +2645,21 @@ impl Session {
         if (self.help.is_some() && self.active_prompt().is_none()) || !self.pending.is_empty() {
             cursor = None;
         }
+        let mut styles = self.services.borrow().git_styles();
+        for buffer in self.buffers.values() {
+            if let Buffer::PreviewDiff { diff, .. } = buffer
+                && let Some(rendered) = &diff.rendered
+            {
+                styles.extend(rendered.styles.clone());
+            }
+        }
         Frame {
             mouse_context: self.mouse_context,
             mouse_enabled: self.mouse_enabled(),
             width: self.width,
             height: self.height,
             rows,
-            styles: self.services.borrow().git_styles(),
+            styles,
             cursor,
             cursor_shape: if self.active_prompt().is_some() {
                 CursorShape::Bar

@@ -978,6 +978,7 @@ fn batch_diff_notifications_match_the_complete_request() {
                 path: "first.txt".into(),
                 original_path: None,
             }],
+            render: zess_git::DiffRenderOptions::default(),
         },
         path: "directory".into(),
     };

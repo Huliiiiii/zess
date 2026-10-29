@@ -92,8 +92,13 @@ impl Workspace {
                     cancellation,
                 )?,
             }),
-            QueryRequest::DiffFiles { source, files } => {
+            QueryRequest::DiffFiles {
+                source,
+                files,
+                render,
+            } => {
                 let repository = zess_git::Repository::open(&self.root)?;
+                let renderer = repository.diff_renderer(render, cancellation)?;
                 let mut diffs = Vec::with_capacity(files.len());
                 for target in files {
                     cancellation.check()?;
@@ -113,6 +118,13 @@ impl Workspace {
                     };
                     diffs.push(zess_git::FileDiff {
                         target: target.clone(),
+                        rendered: renderer.render(
+                            &repository,
+                            source,
+                            target,
+                            &raw,
+                            cancellation,
+                        )?,
                         raw,
                     });
                 }

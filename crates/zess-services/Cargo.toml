@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 zess-git.workspace = true
 anyhow.workspace = true
+libc.workspace = true
 ignore.workspace = true
 notify.workspace = true
 serde_json.workspace = true

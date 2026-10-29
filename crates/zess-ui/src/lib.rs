@@ -4,6 +4,9 @@ use serde_json::Value;
 mod style;
 pub use style::{StyleAttribute, StyleColor, TextStyle};
 
+mod ansi;
+pub use ansi::{AnsiText, DiffLineKind, DiffLineMetadata};
+
 mod columns;
 pub use columns::{ColumnAlignment, RowColumns, RowLayout};
 

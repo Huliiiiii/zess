@@ -27,7 +27,7 @@ fn selected_diff_row(session: &mut Session, content: &str) {
         .location
         .diff_selection;
     *selection = diff::Selection::Line { head: None };
-    assert!(selection.select_at(diff, row, false));
+    assert!(selection.select_at(&diff.index, row, false));
 }
 
 fn finish_patch(session: &mut Session) {
@@ -125,7 +125,7 @@ fn hunk_navigation_selects_change_blocks_and_line_mode_moves_between_rows() {
     let Buffer::PreviewDiff { diff, .. } = &session.buffers[&buffer] else {
         panic!("expected diff")
     };
-    let blocks = diff.blocks.clone();
+    let blocks = diff.index.blocks.clone();
     assert_eq!(blocks.len(), 2);
     assert!(matches!(
         session.views[&target].location.diff_selection,
@@ -135,7 +135,7 @@ fn hunk_navigation_selects_change_blocks_and_line_mode_moves_between_rows() {
         session.views[&target]
             .location
             .diff_selection
-            .rows(diff)
+            .rows(&diff.index)
             .unwrap(),
         blocks[0]
     );
@@ -457,7 +457,7 @@ fn diff_row_dragging_and_refresh_preserve_selection_and_scroll_without_a_text_cu
         session.views[&target]
             .location
             .diff_selection
-            .rows(diff)
+            .rows(&diff.index)
             .unwrap(),
         5..=6
     );
@@ -509,7 +509,7 @@ fn diff_row_dragging_and_refresh_preserve_selection_and_scroll_without_a_text_cu
         session.views[&target]
             .location
             .diff_selection
-            .rows(diff)
+            .rows(&diff.index)
             .unwrap(),
         5..=6
     );
@@ -935,9 +935,9 @@ fn diff_boundary_navigation_preserves_ranges_and_skips_metadata() {
     };
     let selection = &session.views[&target].location.diff_selection;
     assert_eq!(selection.row(), Some(9));
-    assert_eq!(selection.rows(diff).unwrap(), 4..=9);
+    assert_eq!(selection.rows(&diff.index).unwrap(), 4..=9);
     assert!(matches!(selection, diff::Selection::Range { .. }));
-    assert!(!selection.contains(diff, 7));
+    assert!(!selection.contains(&diff.index, 7));
     for key in ["2", "g", "g"] {
         session.input(key);
     }

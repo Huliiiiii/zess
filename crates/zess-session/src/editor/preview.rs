@@ -36,6 +36,61 @@ pub(super) struct PendingPatch {
 }
 
 impl Session {
+    pub(super) fn focus_diff(&mut self, id: ViewId) {
+        let view = self.views.get_mut(&id).unwrap();
+        if view.location.diff_presentation != diff::Presentation::Rendered {
+            return;
+        }
+        let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] else {
+            return;
+        };
+        if view.location.manual_viewport {
+            let selection = diff.raw_selection_at_rendered(view.location.scroll);
+            let current = view.location.diff_selection.row();
+            let same_file = current
+                .and_then(|row| diff.file_at(row))
+                .map(|file| &file.target)
+                == selection
+                    .row()
+                    .and_then(|row| diff.file_at(row))
+                    .map(|file| &file.target);
+            let visible = view.location.scroll
+                ..view
+                    .location
+                    .scroll
+                    .saturating_add(view.viewport_height.max(1));
+            let visible_selection =
+                current.is_some_and(|row| visible.contains(&diff.rendered_row_at_raw(row)));
+            if !same_file || (diff.mapped_rendering() && !visible_selection) {
+                view.location.diff_selection = selection;
+            }
+        }
+        view.location.diff_presentation = diff::Presentation::Raw;
+        view.location.scroll = view.location.diff_selection.row().unwrap_or(0);
+        view.location.horizontal_scroll = 0;
+        view.location.manual_viewport = false;
+    }
+
+    pub(super) fn blur_diff(&mut self, id: ViewId) {
+        let Some(view) = self.views.get_mut(&id) else {
+            return;
+        };
+        let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] else {
+            return;
+        };
+        if diff.rendered.is_some() {
+            view.location.scroll = diff.rendered_row_at_raw(
+                view.location
+                    .diff_selection
+                    .row()
+                    .unwrap_or(view.location.scroll),
+            );
+            view.location.horizontal_scroll = 0;
+            view.location.diff_presentation = diff::Presentation::Rendered;
+            view.location.manual_viewport = true;
+        }
+    }
+
     pub(super) fn preview_source(&self, target: ViewId) -> Option<ViewId> {
         let page = self.views.page(target);
         (page.main.id != target).then_some(page.main.id)
@@ -152,7 +207,7 @@ impl Session {
             self.retire_preview_slot(source, slot);
         }
         if focused {
-            self.focus = source;
+            self.activate_view(source);
         }
         Ok(())
     }
@@ -282,7 +337,7 @@ impl Session {
                 .any(|(_, target)| *target == self.focus);
         if removed_focus {
             self.cancel_input_context()?;
-            self.focus = source;
+            self.activate_view(source);
         }
         let mut retired = self.views.take_previews(page);
         for (index, target) in retained_views {
@@ -345,7 +400,7 @@ impl Session {
             },
             PreviewContent::GitDiff { diff } => Buffer::PreviewDiff {
                 path: path.to_owned(),
-                diff: diff::Diff::from_git(diff),
+                diff: diff::Diff::from_git(diff, &self.workspace),
             },
             PreviewContent::Snapshot { snapshot } => {
                 let mut text = TextBuffer::new_preview_with_path(
@@ -476,10 +531,11 @@ impl Session {
             }
             let diff = match content {
                 PreviewContent::Diff { text } => diff::Diff::new(text),
-                PreviewContent::GitDiff { diff } => diff::Diff::from_git(diff),
+                PreviewContent::GitDiff { diff } => diff::Diff::from_git(diff, &self.workspace),
                 _ => unreachable!(),
             };
             let reused = target.filter(|id| matches!(&self.buffers[&self.views[id].location.buffer], Buffer::PreviewDiff { path: old, diff: previous } if old == &path && previous.source == diff.source)).map(|id| self.views[&id].location.buffer);
+            let mut reselect = false;
             if let Some(buffer) = reused {
                 let Buffer::PreviewDiff { diff: old, .. } = &self.buffers[&buffer] else {
                     unreachable!()
@@ -489,11 +545,34 @@ impl Session {
                     .values_mut()
                     .filter(|view| view.location.buffer == buffer)
                 {
-                    view.location.diff_selection.reconcile(old, &diff);
+                    let presentation = if diff.rendered.is_some() && view.id != self.focus {
+                        diff::Presentation::Rendered
+                    } else {
+                        diff::Presentation::Raw
+                    };
+                    reselect |= view.location.diff_selection.reconcile(
+                        old,
+                        &diff,
+                        diff::Presentation::Raw,
+                        diff::Presentation::Raw,
+                    );
+                    if view.location.diff_presentation != presentation {
+                        view.location.scroll = view.location.diff_selection.row().unwrap_or(0);
+                        view.location.horizontal_scroll = 0;
+                    } else if presentation == diff::Presentation::Rendered {
+                        view.location.scroll =
+                            diff.reconcile_rendered_scroll(old, view.location.scroll);
+                    }
+                    view.location.diff_presentation = presentation;
                 }
             }
-            let selection = diff.initial_selection();
+            if reselect {
+                self.message = "Diff layout changed; reselect changes before staging".into();
+            }
+            let selection = diff.index.initial_selection();
+            let external = diff.rendered.is_some();
             let first = diff
+                .index
                 .rows
                 .iter()
                 .position(|row| row.hunk.is_some())
@@ -517,8 +596,21 @@ impl Session {
             {
                 if reused.is_none() {
                     view.location.diff_selection = selection.clone();
-                    view.location.scroll = first;
+                    view.location.diff_presentation = if external && view.id != self.focus {
+                        diff::Presentation::Rendered
+                    } else {
+                        diff::Presentation::Raw
+                    };
+                    view.location.scroll =
+                        if view.location.diff_presentation == diff::Presentation::Rendered {
+                            0
+                        } else {
+                            first
+                        };
                     view.location.horizontal_scroll = 0;
+                }
+                if !external {
+                    view.location.diff_presentation = diff::Presentation::Raw;
                 }
                 view.location.selection = ItemSelection::default();
             }
@@ -691,15 +783,20 @@ impl Session {
             Buffer::PreviewText { text, .. } => text.scroll_view(target, horizontal, vertical),
             Buffer::PreviewDiff { diff, .. } => {
                 let view = self.views.get_mut(&target).unwrap();
-                view.location.scroll = view
-                    .location
-                    .scroll
-                    .saturating_add_signed(vertical)
-                    .min(diff.rows.len().saturating_sub(view.viewport_height.max(1)));
+                view.location.scroll = view.location.scroll.saturating_add_signed(vertical).min(
+                    diff.display_rows(view.location.diff_presentation)
+                        .saturating_sub(view.viewport_height.max(1)),
+                );
                 view.location.horizontal_scroll = view
                     .location
                     .horizontal_scroll
                     .saturating_add_signed(horizontal);
+                if view.location.diff_presentation == diff::Presentation::Rendered {
+                    view.location.horizontal_scroll = view.location.horizontal_scroll.min(
+                        diff.display_width(view.location.diff_presentation)
+                            .saturating_sub(view.viewport_width),
+                    );
+                }
                 view.location.manual_viewport = true;
             }
             Buffer::PreviewRows { .. } => {
@@ -764,8 +861,12 @@ impl Session {
                     .location
                     .scroll
                     .saturating_add(view.viewport_height.max(1));
-            if view.location.manual_viewport {
-                view.location.diff_selection.focus_visible(diff, visible);
+            if view.location.manual_viewport
+                && view.location.diff_presentation == diff::Presentation::Raw
+            {
+                view.location
+                    .diff_selection
+                    .focus_visible(&diff.index, visible);
                 view.location.manual_viewport = false;
             }
         }
@@ -814,7 +915,12 @@ impl Session {
             .search_pattern()
             .filter(|pattern| !pattern.is_empty())
         {
-            if let Some(row) = diff.search(&pattern, view.location.diff_selection.row(), forward)? {
+            if let Some(row) = diff.search(
+                diff::Presentation::Raw,
+                &pattern,
+                view.location.diff_selection.row(),
+                forward,
+            )? {
                 view.location.diff_selection.set_head(Some(row));
                 view.location.manual_viewport = false;
             }
@@ -825,7 +931,9 @@ impl Session {
     pub(super) fn move_diff(&mut self, forward: bool, block: bool) -> Result<()> {
         let view = self.views.get_mut(&self.focus).unwrap();
         if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
-            view.location.diff_selection.move_by(diff, forward, block);
+            view.location
+                .diff_selection
+                .move_by(&diff.index, forward, block);
             view.location.manual_viewport = false;
         }
         Ok(())
@@ -840,7 +948,7 @@ impl Session {
         match command {
             PreviewCommand::DiffGotoFirst | PreviewCommand::DiffGotoLast => {
                 view.location.diff_selection.move_to_edge(
-                    diff,
+                    &diff.index,
                     command == PreviewCommand::DiffGotoLast,
                     count,
                 );
@@ -866,7 +974,7 @@ impl Session {
                 } else {
                     row.saturating_sub(page.distance())
                 };
-                view.location.diff_selection.move_to(diff, target);
+                view.location.diff_selection.move_to(&diff.index, target);
                 if let Some(row) = view.location.diff_selection.row() {
                     view.location.scroll = page.viewport_start(view.location.scroll, row, 5);
                 }
@@ -880,7 +988,7 @@ impl Session {
     pub(super) fn select_diff_hunk(&mut self) -> Result<()> {
         let view = self.views.get_mut(&self.focus).unwrap();
         if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
-            view.location.diff_selection.select_block(diff);
+            view.location.diff_selection.select_block(&diff.index);
         }
         Ok(())
     }
@@ -888,7 +996,7 @@ impl Session {
     pub(super) fn toggle_diff_selection(&mut self) -> Result<()> {
         let view = self.views.get_mut(&self.focus).unwrap();
         if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
-            view.location.diff_selection.toggle(diff);
+            view.location.diff_selection.toggle(&diff.index);
         }
         Ok(())
     }
@@ -947,7 +1055,7 @@ impl Session {
         self.ensure_diff_ready(self.focus)?;
         let view = &self.views[&self.focus];
         let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] else {
-            bail!("staging requires a raw diff");
+            bail!("staging requires a Git diff");
         };
         let zess_git::DiffSource::Changes { side } =
             diff.source.as_ref().context("this diff cannot be staged")?
@@ -955,21 +1063,9 @@ impl Session {
             bail!("historical diffs cannot be staged");
         };
         let side = *side;
-        let range = view
-            .location
-            .diff_selection
-            .rows(diff)
-            .context("this diff has no selected text lines")?;
-        let file = diff
-            .file_at(*range.start())
-            .context("selected line has no Git file")?;
-        anyhow::ensure!(
-            diff.file_at(*range.end())
-                .is_some_and(|last| last.target == file.target),
-            "cannot stage a selection across files"
-        );
+        let (file, rows) =
+            diff.selected_patch_rows(diff::Presentation::Raw, &view.location.diff_selection)?;
         let raw = file.raw.clone();
-        let rows = vec![view.location.diff_selection.patch_rows(diff).unwrap()];
         // Validate before starting work so unsupported/binary patches and empty
         // selections fail immediately without an index operation.
         zess_git::patch::RawPatch::parse(&raw)?.selection(side, &rows)?;
@@ -1031,7 +1127,10 @@ impl Session {
             .diff_selection
             .row()
             .context("this diff has no selected source line")?;
-        let mut line = diff.rows[row]
+        let row = diff
+            .raw_row(diff::Presentation::Raw, row)
+            .context("this diff has no selected source line")?;
+        let mut line = diff.index.rows[row]
             .source_line
             .context("this diff has no selected source line")?;
         let Some(source) = &diff.source else {

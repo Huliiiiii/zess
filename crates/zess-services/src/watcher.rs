@@ -84,7 +84,7 @@ impl QueryKey {
                 original_path,
                 ..
             } => Self::diff(path, original_path.as_deref()),
-            QueryRequest::DiffFiles { source, files } => {
+            QueryRequest::DiffFiles { source, files, .. } => {
                 for target in files {
                     fs_cache::key(&target.path)?;
                     if let Some(original) = &target.original_path {
@@ -755,7 +755,18 @@ impl Plan {
                     }
                     QueryKey::GitDiffFiles { files, .. } => {
                         for target in files {
-                            plan.exact(&workspace.path(&target.path)?)?;
+                            let path = workspace.path(&target.path)?;
+                            plan.exact(&path)?;
+                            for directory in path
+                                .parent()
+                                .context("Git target has no parent")?
+                                .ancestors()
+                            {
+                                plan.exact(&directory.join(".gitattributes"))?;
+                                if directory == repository.unwrap_or(&workspace.root) {
+                                    break;
+                                }
+                            }
                             if let Some(original) = &target.original_path {
                                 plan.exact(&workspace.path(original)?)?;
                             }

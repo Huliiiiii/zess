@@ -38,6 +38,8 @@ pub enum QueryRequest {
     DiffFiles {
         source: DiffSource,
         files: Vec<DiffTarget>,
+        #[serde(default)]
+        render: zess_git::DiffRenderOptions,
     },
     #[serde(rename = "git.log")]
     Log {},

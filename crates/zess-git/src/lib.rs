@@ -10,6 +10,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub mod patch;
+mod renderer;
+pub use renderer::{DiffRenderOptions, DiffRenderer};
 mod stats;
 #[cfg(test)]
 mod tests;
@@ -17,6 +19,7 @@ mod tests;
 pub trait Execution {
     fn check(&self) -> Result<()>;
     fn output(&self, command: &mut Command) -> Result<Output>;
+    fn output_with_input(&self, command: &mut Command, input: &[u8]) -> Result<Output>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -43,6 +46,14 @@ pub enum DiffSource {
 pub struct FileDiff {
     pub target: DiffTarget,
     pub raw: String,
+    #[serde(default)]
+    pub rendered: Option<RenderedDiff>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RenderedDiff {
+    pub text: String,
+    pub repository_root: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -445,6 +456,13 @@ impl Repository {
     }
 
     fn git(&self, args: &[&str], cancellation: &impl Execution) -> Result<std::process::Output> {
+        let mut command = self.git_command(args, cancellation)?;
+        cancellation
+            .output(&mut command)
+            .with_context(|| format!("run git {}", args.join(" ")))
+    }
+
+    fn git_command(&self, args: &[&str], cancellation: &impl Execution) -> Result<Command> {
         let mut filters = Command::new("git");
         filters
             .args([
@@ -503,9 +521,7 @@ impl Repository {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_OPTIONAL_LOCKS", "0");
 
-        cancellation
-            .output(&mut command)
-            .with_context(|| format!("run git {}", args.join(" ")))
+        Ok(command)
     }
 
     pub fn status(&self, cancellation: &impl Execution) -> Result<Vec<GitEntry>> {

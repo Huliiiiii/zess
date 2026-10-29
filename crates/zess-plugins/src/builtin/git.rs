@@ -8,8 +8,8 @@ use zess_filter::{Case, Filter};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use zess_git::{
-    Commit, CommitFile, DiffSide, DiffSource, DiffTarget, FileStatus, GitEntry, LineStats,
-    StagingStatus,
+    Commit, CommitFile, DiffRenderOptions, DiffSide, DiffSource, DiffTarget, FileStatus, GitEntry,
+    LineStats, StagingStatus,
 };
 use zess_plugin::{
     BufferId, HostRequest, Navigation, PluginInput, PluginOutput, PreviewContent, PreviewLayout,
@@ -1202,17 +1202,41 @@ impl BufferPlugin for Git {
                     TreeNodeKind::Directory { path, .. } => path.as_str(),
                     TreeNodeKind::File(file) => file.path(),
                 };
-                let mut panes = Vec::new();
-                for (browser, (side, id, header)) in view.diffs.iter_mut().zip([
+                let sides = [
                     (DiffSide::Unstaged, "unstaged", "Unstaged"),
                     (DiffSide::Staged, "staged", "Staged"),
-                ]) {
-                    let files = view.tree.file_targets(primary.unwrap(), Some(side));
+                ]
+                .map(|(side, id, header)| {
+                    (
+                        side,
+                        id,
+                        header,
+                        view.tree.file_targets(primary.unwrap(), Some(side)),
+                    )
+                });
+                let layout = PreviewLayout::Responsive { min_pane_width: 60 };
+                let count = sides
+                    .iter()
+                    .filter(|(_, _, _, files)| !files.is_empty())
+                    .count();
+                let mut areas = input
+                    .preview_area
+                    .map(|area| layout.rectangles(area, count))
+                    .unwrap_or_default()
+                    .into_iter();
+                let mut panes = Vec::new();
+                for (browser, (side, id, header, files)) in view.diffs.iter_mut().zip(sides) {
                     let visible = !files.is_empty();
                     let query = visible.then(|| PreviewQuery {
                         request: QueryRequest::DiffFiles {
                             source: DiffSource::Changes { side },
                             files,
+                            render: DiffRenderOptions {
+                                width: areas
+                                    .next()
+                                    .map(|area| area.width)
+                                    .filter(|width| *width > 0),
+                            },
                         },
                         path: path.into(),
                     });
@@ -1244,7 +1268,7 @@ impl BufferPlugin for Git {
                     }
                     output.requests.push(HostRequest::PreviewGroup {
                         panes,
-                        layout: PreviewLayout::Responsive { min_pane_width: 60 },
+                        layout,
                         focus,
                     });
                 } else {
@@ -1275,6 +1299,12 @@ impl BufferPlugin for Git {
                             commit: model.commit.clone(),
                         },
                         files: view.tree.file_targets(primary.unwrap(), None),
+                        render: DiffRenderOptions {
+                            width: input
+                                .preview_area
+                                .map(|area| area.width)
+                                .filter(|width| *width > 0),
+                        },
                     },
                     path: path.into(),
                 });

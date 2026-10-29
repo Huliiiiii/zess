@@ -1,5 +1,6 @@
 use super::*;
 
+mod diff_rendering;
 mod file_actions;
 mod grid;
 mod history;
@@ -130,6 +131,7 @@ fn directory_diffs_include_all_changed_descendants_of_collapsed_directories() {
             expected
         );
         let bodies = diff
+            .index
             .rows
             .iter()
             .enumerate()
@@ -888,8 +890,8 @@ fn initial_diff_position_preserves_patch_headers_and_later_user_navigation() {
             .unwrap()
             .location
             .diff_selection;
-        selection.toggle(diff);
-        selection.move_to(diff, 6);
+        selection.toggle(&diff.index);
+        selection.move_to(&diff.index, 6);
         let updated_patch = format!(
             "{}+later\n",
             patch.replace(

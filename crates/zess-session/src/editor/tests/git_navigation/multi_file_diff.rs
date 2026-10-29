@@ -7,6 +7,7 @@ fn select_file_line(session: &mut Session, path: &str, content: &str, extend: bo
         panic!("expected diff");
     };
     let row = diff
+        .index
         .rows
         .iter()
         .enumerate()
@@ -26,7 +27,7 @@ fn select_file_line(session: &mut Session, path: &str, content: &str, extend: bo
     if !extend {
         *selection = diff::Selection::Line { head: None };
     }
-    assert!(selection.select_at(diff, row, extend));
+    assert!(selection.select_at(&diff.index, row, extend));
 }
 
 fn matching_files() -> Fixture {

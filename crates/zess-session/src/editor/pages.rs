@@ -387,7 +387,9 @@ impl Session {
         } else if let Buffer::PreviewRows { display, .. } = &self.buffers[&buffer] {
             view.location.set_display(display.clone());
         } else if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&buffer] {
-            view.location.diff_selection = diff.initial_selection();
+            view.location.diff_selection = diff
+                .index(view.location.diff_presentation)
+                .initial_selection();
         }
         view
     }

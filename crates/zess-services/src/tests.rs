@@ -1514,6 +1514,56 @@ fn diff_files_keep_requested_order_and_include_untracked_contents() {
 }
 
 #[test]
+fn changing_diff_attributes_refreshes_the_configured_rendering() {
+    let fixture = Fixture::new();
+    git(&fixture.0, &["init", "--quiet"]);
+    fs::write(fixture.0.join("note.txt"), "raw-old\n").unwrap();
+    git(&fixture.0, &["add", "."]);
+    git(&fixture.0, &["commit", "--quiet", "-m", "baseline"]);
+    fs::write(fixture.0.join("note.txt"), "raw-new\n").unwrap();
+    git(&fixture.0, &["config", "diff.external", ""]);
+    git(&fixture.0, &["config", "pager.diff", "false"]);
+    git(
+        &fixture.0,
+        &["config", "diff.converted.textconv", "sed s/raw/converted/g"],
+    );
+    let argument = json!({
+        "source":{"kind":"changes", "side":"unstaged"},
+        "files":[{"path":"note.txt", "original_path":null}],
+    });
+    let mut services = fixture.services();
+    let mut observation = observe(&mut services, "git.diff-files", &argument);
+    let before = services.call("git.diff-files", argument.clone());
+    assert!(before["diff"]["files"][0]["rendered"].is_null());
+    fs::write(
+        fixture.0.join(".gitattributes"),
+        "note.txt diff=converted\n",
+    )
+    .unwrap();
+    wait_for_change(&mut services, &mut observation);
+    let after = services.call("git.diff-files", argument);
+    assert_eq!(
+        after["diff"]["files"][0]["raw"],
+        before["diff"]["files"][0]["raw"]
+    );
+    let rendered = after["diff"]["files"][0]["rendered"]["text"]
+        .as_str()
+        .unwrap();
+    let lines = zess_ui::AnsiText::parse(rendered)
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.spans
+                .into_iter()
+                .map(|span| span.text)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert!(lines.iter().any(|line| line == "-converted-old"));
+    assert!(lines.iter().any(|line| line == "+converted-new"));
+}
+
+#[test]
 fn commit_diff_files_preserve_rename_targets_without_filesystem_watches() {
     let fixture = Fixture::new();
     git(&fixture.0, &["init", "--quiet"]);
@@ -1597,6 +1647,7 @@ fn diff_files_observations_distinguish_source_order_and_rename_identity() {
     git(&fixture.0, &["init", "--quiet"]);
     let mut services = fixture.services();
     let request = QueryRequest::DiffFiles {
+        render: zess_git::DiffRenderOptions::default(),
         source: DiffSource::Changes {
             side: DiffSide::Unstaged,
         },
@@ -1616,7 +1667,7 @@ fn diff_files_observations_distinguish_source_order_and_rename_identity() {
         &original,
         &services.acquire_query(&request).unwrap()
     ));
-    let QueryRequest::DiffFiles { source, files } = request else {
+    let QueryRequest::DiffFiles { source, files, .. } = request else {
         unreachable!();
     };
     let mut reversed = files.clone();
@@ -1625,22 +1676,26 @@ fn diff_files_observations_distinguish_source_order_and_rename_identity() {
     renamed[0].original_path = Some("old.txt".into());
     for request in [
         QueryRequest::DiffFiles {
+            render: zess_git::DiffRenderOptions::default(),
             source: DiffSource::Changes {
                 side: DiffSide::Staged,
             },
             files: files.clone(),
         },
         QueryRequest::DiffFiles {
+            render: zess_git::DiffRenderOptions::default(),
             source: DiffSource::Commit {
                 commit: "a".repeat(40),
             },
             files,
         },
         QueryRequest::DiffFiles {
+            render: zess_git::DiffRenderOptions::default(),
             source: source.clone(),
             files: reversed,
         },
         QueryRequest::DiffFiles {
+            render: zess_git::DiffRenderOptions::default(),
             source,
             files: renamed,
         },
@@ -1650,6 +1705,89 @@ fn diff_files_observations_distinguish_source_order_and_rename_identity() {
             &services.acquire_query(&request).unwrap()
         ));
     }
+}
+
+#[test]
+fn diff_file_observations_share_filesystem_watches_across_display_widths() {
+    let fixture = Fixture::new();
+    git(&fixture.0, &["init", "--quiet"]);
+    let mut services = fixture.services();
+    let mut request = QueryRequest::DiffFiles {
+        source: zess_git::DiffSource::Changes {
+            side: zess_git::DiffSide::Unstaged,
+        },
+        files: vec![zess_git::DiffTarget {
+            path: "note.txt".into(),
+            original_path: None,
+        }],
+        render: zess_git::DiffRenderOptions { width: Some(44) },
+    };
+    let original = services.acquire_query(&request).unwrap();
+    let QueryRequest::DiffFiles { render, .. } = &mut request else {
+        unreachable!();
+    };
+    render.width = Some(120);
+    assert!(Arc::ptr_eq(
+        &original,
+        &services.acquire_query(&request).unwrap()
+    ));
+}
+
+#[test]
+fn asynchronous_diff_renderers_receive_the_requested_view_width() {
+    let fixture = Fixture::new();
+    git(&fixture.0, &["init", "--quiet"]);
+    fs::write(fixture.0.join("note.txt"), "old\n").unwrap();
+    git(&fixture.0, &["add", "."]);
+    git(&fixture.0, &["commit", "--quiet", "-m", "baseline"]);
+    fs::write(fixture.0.join("note.txt"), "new\n").unwrap();
+    fs::write(
+        fixture.0.join("renderer.sh"),
+        "printf 'external:%s:%s\\n' \"$COLUMNS\" \"$DFT_WIDTH\"\n",
+    )
+    .unwrap();
+    git(&fixture.0, &["config", "diff.external", "sh ./renderer.sh"]);
+    git(&fixture.0, &["config", "pager.diff", "false"]);
+    let mut services = fixture.services();
+    let request = |width| {
+        json!({
+            "source":{"kind":"changes", "side":"unstaged"},
+            "files":[{"path":"note.txt", "original_path":null}],
+            "render":{"width":width},
+        })
+    };
+    let narrow = start(&mut services, "git.diff-files", request(44));
+    let wide = start(&mut services, "git.diff-files", request(120));
+    let narrow = ready(&mut services, narrow);
+    let wide = ready(&mut services, wide);
+    for (result, expected) in [(&narrow, "external:44:44\n"), (&wide, "external:120:120\n")] {
+        assert_eq!(result["diff"]["files"][0]["rendered"]["text"], expected);
+    }
+    assert_eq!(
+        narrow["diff"]["files"][0]["raw"],
+        wide["diff"]["files"][0]["raw"]
+    );
+    assert!(
+        wide["diff"]["files"][0]["raw"]
+            .as_str()
+            .unwrap()
+            .contains("-old\n+new\n")
+    );
+}
+
+#[test]
+fn zero_diff_width_is_rejected() {
+    let fixture = Fixture::new();
+    let mut services = fixture.services();
+    let result = services.call(
+        "git.diff-files",
+        json!({
+            "source":{"kind":"changes", "side":"unstaged"},
+            "files":[],
+            "render":{"width":0},
+        }),
+    );
+    assert_eq!(result["error"], "diff width must be positive");
 }
 
 #[test]

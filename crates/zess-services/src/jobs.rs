@@ -1,4 +1,6 @@
-use std::io::Read;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -14,6 +16,9 @@ use crate::workspace::Workspace;
 
 const WORKERS: usize = 4;
 const QUEUED_JOBS: usize = 32;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Default)]
 pub(crate) struct Cancellation(Arc<AtomicBool>);
@@ -32,10 +37,24 @@ impl Cancellation {
     }
 
     pub(crate) fn output(&self, command: &mut Command) -> Result<Output> {
+        self.run(command, None)
+    }
+
+    fn output_with_input(&self, command: &mut Command, input: &[u8]) -> Result<Output> {
+        self.run(command, Some(input))
+    }
+
+    fn run(&self, command: &mut Command, input: Option<&[u8]>) -> Result<Output> {
         self.check()?;
 
+        #[cfg(unix)]
+        command.process_group(0);
         let child = command
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -49,6 +68,16 @@ impl Cancellation {
             };
             let mut stdout = child.child.stdout.take().context("missing git stdout")?;
             let mut stderr = child.child.stderr.take().context("missing git stderr")?;
+            let stdin = if let Some(input) = input {
+                let mut stdin = child.child.stdin.take().context("missing renderer stdin")?;
+                Some(
+                    thread::Builder::new()
+                        .name("zess-git-stdin".into())
+                        .spawn_scoped(scope, move || stdin.write_all(input))?,
+                )
+            } else {
+                None
+            };
             let stdout = thread::Builder::new()
                 .name("zess-git-stdout".into())
                 .spawn_scoped(scope, move || {
@@ -81,6 +110,14 @@ impl Cancellation {
             let stderr = stderr
                 .join()
                 .map_err(|_| anyhow::anyhow!("git stderr reader stopped"))??;
+            if let Some(stdin) = stdin
+                && let Err(error) = stdin
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("renderer stdin writer stopped"))?
+                && error.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                return Err(error).context("write configured Git diff pager input");
+            }
 
             self.check()?;
 
@@ -101,6 +138,12 @@ struct RunningChild {
 impl Drop for RunningChild {
     fn drop(&mut self) {
         if !self.reaped {
+            #[cfg(unix)]
+            // The child starts a new process group, which also owns helpers
+            // spawned by Git and configured shell renderers.
+            unsafe {
+                libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+            }
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
@@ -258,5 +301,8 @@ impl zess_git::Execution for Cancellation {
     }
     fn output(&self, command: &mut Command) -> Result<Output> {
         Cancellation::output(self, command)
+    }
+    fn output_with_input(&self, command: &mut Command, input: &[u8]) -> Result<Output> {
+        Cancellation::output_with_input(self, command, input)
     }
 }

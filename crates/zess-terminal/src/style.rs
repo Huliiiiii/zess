@@ -33,6 +33,12 @@ pub(super) fn apply(stdout: &mut impl Write, style: &TextStyle) -> Result<()> {
 }
 
 pub(super) fn resolve(role: &str) -> TextStyle {
+    if role == "diff.selection" {
+        return TextStyle {
+            attributes: vec![StyleAttribute::Underline],
+            ..TextStyle::default()
+        };
+    }
     let popup_background = Some(StyleColor::Rgb {
         red: 37,
         green: 40,

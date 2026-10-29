@@ -109,3 +109,33 @@ fn popup_secondary_text_and_selected_matches_keep_their_backgrounds() {
     assert_eq!(selected_match.background, selection.background);
     assert_ne!(selected_match.foreground, selection.foreground);
 }
+
+#[test]
+fn selected_rendered_diff_lines_keep_the_renderers_colors() {
+    use std::collections::HashMap;
+    use zess_ui::{FrameRow, Span};
+
+    crossterm::style::force_color_output(true);
+    let styles = HashMap::from([(
+        "ansi.diff".into(),
+        TextStyle {
+            foreground: Some(StyleColor::Indexed(2)),
+            background: Some(StyleColor::Indexed(52)),
+            attributes: vec![StyleAttribute::Bold],
+            ..TextStyle::default()
+        },
+    )]);
+    let row = FrameRow {
+        spans: vec![Span {
+            text: "change".into(),
+            style: "diff.selection".into(),
+            base_style: Some("ansi.diff".into()),
+        }],
+    };
+    let mut output = Vec::new();
+    super::super::render_row(&mut output, &row, 6, &styles).unwrap();
+    assert_eq!(
+        output,
+        b"\x1b[0m\x1b[38;5;2m\x1b[48;5;52m\x1b[1m\x1b[4mchange\x1b[0m\x1b[0m"
+    );
+}
