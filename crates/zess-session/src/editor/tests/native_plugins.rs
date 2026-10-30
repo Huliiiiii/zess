@@ -729,23 +729,39 @@ fn rapid_file_navigation_keeps_the_previous_preview_until_the_latest_selection_l
     session
         .execute_command("preview.move-down", serde_json::json!({}))
         .unwrap();
+    let before = session
+        .services
+        .borrow_mut()
+        .call("service.stats", Value::Null)["next_handle"]
+        .as_u64()
+        .unwrap();
+    session.input("j");
+    assert_eq!(selected_row(&session, source).id, "b.txt");
+    let leading = session
+        .services
+        .borrow_mut()
+        .call("service.stats", Value::Null);
+    // Stats itself consumes one handle; the other belongs to the leading preview.
+    assert_eq!(leading["next_handle"].as_u64().unwrap(), before + 2);
+    let previous = preview_text(&session, source);
+    assert!(previous == "old\n".repeat(60) || previous == "intermediate\n");
     let scroll = preview_surface(&session, source).viewport.scroll;
     let old_buffer = preview_buffer(&session, source);
     let old_observations = session.views[&source].observations.len();
-    for expected in ["b.txt", "c.txt"] {
-        session.input("j");
-        assert_eq!(selected_row(&session, source).id, expected);
-        assert_eq!(preview_text(&session, source), "old\n".repeat(60));
-        assert_eq!(preview_buffer(&session, source), old_buffer);
-        assert_eq!(session.views[&source].observations.len(), old_observations);
-        assert_eq!(
-            session
-                .services
-                .borrow_mut()
-                .call("service.stats", Value::Null)["jobs"],
-            0
-        );
-    }
+    session.input("j");
+    assert_eq!(selected_row(&session, source).id, "c.txt");
+    assert_eq!(preview_text(&session, source), previous);
+    assert_eq!(preview_buffer(&session, source), old_buffer);
+    assert_eq!(session.views[&source].observations.len(), old_observations);
+    let trailing = session
+        .services
+        .borrow_mut()
+        .call("service.stats", Value::Null);
+    assert_eq!(trailing["jobs"], 0);
+    assert_eq!(
+        trailing["next_handle"].as_u64().unwrap(),
+        leading["next_handle"].as_u64().unwrap() + 1
+    );
     assert_eq!(preview_surface(&session, source).viewport.scroll, scroll);
     settle(&mut session);
     assert_eq!(session.active_preview(source), Some(target));

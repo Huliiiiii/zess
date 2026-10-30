@@ -77,21 +77,37 @@ fn single_item_navigation_restarts_the_delay_at_the_boundary() {
     let fixture = Fixture::new();
     let mut session = delayed_file_browser(&fixture);
     let source = session.focus;
-    for key in ["j", "j", "j", "k", "k", "k"] {
-        let before = session.views[&source].wake_at.unwrap();
+    session.input("j");
+    wait_until(&mut session, |session| {
+        matches!(&session.buffers[&preview_buffer(session, source)],
+            Buffer::PreviewText { text, .. } if text.text() == "b")
+    });
+    let previous = preview_buffer(&session, source);
+    for (key, expected) in [("j", "c"), ("j", "c"), ("k", "b"), ("k", "a"), ("k", "a")] {
+        let before = session.views[&source].wake_at;
         session.input(key);
-        let after = session.views[&source].wake_at.unwrap();
-        assert!(after > before);
-        assert!(after > Instant::now() + Duration::from_secs(50));
-        assert!(!matches!(
-            &session.buffers[&preview_buffer(&session, source)],
-            Buffer::PreviewText { .. }
-        ));
+        assert_eq!(
+            session.views[&source].location.selection.primary.as_deref(),
+            Some(expected)
+        );
+        if expected != "b" {
+            let after = session.views[&source].wake_at.unwrap();
+            if let Some(before) = before {
+                assert!(after > before);
+            }
+            assert!(after > Instant::now() + Duration::from_secs(50));
+        }
+        assert_eq!(preview_buffer(&session, source), previous);
+        assert!(matches!(&session.buffers[&previous],
+            Buffer::PreviewText { text, .. } if text.text() == "b"));
+        assert_eq!(
+            session
+                .services
+                .borrow_mut()
+                .call("service.stats", Value::Null)["jobs"],
+            0
+        );
     }
-    assert_eq!(
-        session.views[&source].location.selection.primary.as_deref(),
-        Some("a")
-    );
 }
 
 #[test]

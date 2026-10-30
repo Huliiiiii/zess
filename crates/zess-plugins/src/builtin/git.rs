@@ -454,6 +454,7 @@ impl GitTree {
 #[derive(Default)]
 struct HistoryPreview {
     state: QueryState<String>,
+    navigation: super::schedule::NavigationDebounce,
     commit: Option<String>,
     info: Vec<DisplayRow>,
     summary: Vec<DisplayRow>,
@@ -484,26 +485,32 @@ impl HistoryPreview {
     ) -> Result<()> {
         if event == Event::ViewLeaving {
             self.state = QueryState::default();
+            self.navigation = super::schedule::NavigationDebounce::default();
             return Ok(());
         }
+        let ready_at = self.navigation.update(event, input, now)?;
         let selected = commit.map(|commit| commit.oid.as_str());
         let loading = output
             .display
             .as_ref()
             .is_some_and(|display| display.loading);
         let mut changed = self.state.query().map(String::as_str) != selected;
-        if changed
-            || event == Event::Refresh
-            || (super::schedule::navigation(event)
-                && matches!(self.state, QueryState::Running { .. }))
-        {
+        if changed || event == Event::Refresh {
             self.totals.start_loading();
             self.state = if let Some(commit) = selected {
                 QueryState::Waiting {
                     query: commit.to_owned(),
-                    ready_at: now
-                        .checked_add(input.preview_debounce)
-                        .context("preview debounce exceeds the supported time range")?,
+                    ready_at: if matches!(
+                        event,
+                        Event::Preview | Event::ViewEntered | Event::Refresh
+                    ) {
+                        now
+                    } else if let Some(ready_at) = ready_at {
+                        ready_at
+                    } else {
+                        now.checked_add(input.preview_debounce)
+                            .context("preview debounce exceeds the supported time range")?
+                    },
                 }
             } else {
                 QueryState::default()
@@ -517,19 +524,19 @@ impl HistoryPreview {
             }
             self.totals = ChangeTotals::from_files(std::iter::empty());
         }
-        if let QueryState::Waiting { ready_at, .. } = &mut self.state {
-            match event {
-                Event::Select
-                | Event::Left
-                | Event::Right
-                | Event::FilterChanged
-                | Event::MiniBufferChanged => {
-                    *ready_at = now
-                        .checked_add(input.preview_debounce)
-                        .context("preview debounce exceeds the supported time range")?;
-                }
-                Event::Preview | Event::ViewEntered | Event::Refresh => *ready_at = now,
-                _ => {}
+        if let Some(ready_at) = ready_at
+            && ready_at > now
+        {
+            self.state.defer(ready_at);
+        }
+        if let QueryState::Waiting {
+            ready_at: deadline, ..
+        } = &mut self.state
+        {
+            if matches!(event, Event::Preview | Event::ViewEntered | Event::Refresh) {
+                *deadline = now;
+            } else if let Some(ready_at) = ready_at {
+                *deadline = ready_at;
             }
         }
         changed |= self.source_loading != loading;

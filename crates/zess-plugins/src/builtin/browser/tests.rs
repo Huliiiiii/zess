@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
-use zess_plugin::{ItemSelection, PluginContext};
+use zess_plugin::{ItemNavigation, ItemSelection, PluginContext, SelectionChange};
 use zess_services::NativeServices;
 use zess_ui::Display;
 
@@ -219,7 +219,7 @@ fn invalidated_snapshots_are_refreshed_instead_of_republished_from_cache() {
     browser
         .update_surface(
             &services,
-            Event::Select,
+            Event::Preview,
             &input,
             &mut output(),
             Some(file_query("first")),
@@ -495,76 +495,115 @@ fn loaded_directories_publish_immediately_when_the_selection_changes() {
 }
 
 #[test]
-fn navigation_cancels_a_running_preview_even_at_the_same_selection() {
-    let services = services();
+fn repeated_steps_at_the_same_item_cancel_the_unpublished_preview() {
+    let fixture = Fixture::new();
+    let services = fixture.services();
     let input = input();
-    let task = Task::start(&services, query().request).unwrap();
-    let handle = task.handle.unwrap();
+    let task = Task::start(&services, file_query("first").request).unwrap();
+    let cancelled = task.handle.unwrap();
     let mut browser = Browser {
         state: QueryState::Running {
-            query: query(),
+            query: file_query("first"),
             task,
         },
         content: Some(PreviewContent::Text {
-            text: "previous preview".into(),
+            text: "previous".into(),
         }),
-        content_query: Some(query()),
         ..Browser::cloned()
     };
     let now = Instant::now();
-    let preview = browser
-        .advance(
-            &services,
-            Event::Select,
-            &input,
-            &mut output(),
-            Some(query()),
-            now,
-        )
+    browser
+        .navigation
+        .update(Event::Select, &input, now)
         .unwrap();
-
-    assert!(services.borrow_mut().poll_query(handle).is_err());
-    assert!(preview.is_none());
-    assert!(
-        matches!(browser.state, QueryState::Waiting { ready_at, .. } if ready_at == now + input.preview_debounce)
-    );
-    assert!(
-        matches!(&browser.content, Some(PreviewContent::Text { text }) if text == "previous preview")
-    );
+    let before = next_handle(&services);
+    for elapsed in [10, 20, 79] {
+        let publication = browser
+            .advance(
+                &services,
+                Event::Select,
+                &input,
+                &mut output(),
+                Some(file_query("first")),
+                now + Duration::from_secs(elapsed),
+            )
+            .unwrap();
+        assert!(publication.is_none());
+        assert!(matches!(browser.state, QueryState::Waiting { ready_at, .. }
+            if ready_at == now + Duration::from_secs(elapsed) + input.preview_debounce));
+        assert!(
+            matches!(&browser.content, Some(PreviewContent::Text { text }) if text == "previous")
+        );
+    }
+    assert!(services.borrow_mut().poll_query(cancelled).is_err());
+    assert_eq!(next_handle(&services), before + 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let publication = loop {
+        if let Some(publication) = browser
+            .advance(
+                &services,
+                Event::Unknown,
+                &input,
+                &mut output(),
+                Some(file_query("first")),
+                now + Duration::from_secs(139),
+            )
+            .unwrap()
+        {
+            break publication;
+        }
+        assert!(Instant::now() < deadline, "settled preview did not finish");
+        std::thread::yield_now();
+    };
+    assert_eq!(publication.path, "first");
+    assert!(matches!(publication.content, PreviewContent::Text { text } if text == "first"));
+    assert_eq!(next_handle(&services), before + 3);
 }
 
 #[test]
-fn selection_changes_schedule_preview_with_configured_delay() {
-    let services = services();
+fn a_single_step_starts_immediately_without_a_duplicate_after_the_quiet_period() {
+    let fixture = Fixture::new();
+    let services = fixture.services();
     let mut browser = Browser::cloned();
     let mut input = input();
     input.argument = serde_json::to_value(SelectionChange {
         navigation: Some(ItemNavigation::Step),
     })
     .unwrap();
-    let mut output = output();
     let now = Instant::now();
+    let before = next_handle(&services);
     browser
         .advance(
             &services,
             Event::Select,
             &input,
-            &mut output,
-            Some(query()),
+            &mut output(),
+            Some(file_query("first")),
             now,
         )
         .unwrap();
-
-    assert!(matches!(
-        browser.state,
-        QueryState::Waiting { ready_at, .. } if ready_at == now + input.preview_debounce
-    ));
-    assert!(
-        output
-            .requests
-            .iter()
-            .any(|request| matches!(request, HostRequest::Schedule { after_ms: 60_000 }))
-    );
+    assert!(!matches!(browser.state, QueryState::Waiting { .. }));
+    assert_eq!(next_handle(&services), before + 2);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        browser
+            .advance(
+                &services,
+                Event::Unknown,
+                &input,
+                &mut output(),
+                Some(file_query("first")),
+                now + input.preview_debounce,
+            )
+            .unwrap();
+        if matches!(browser.state, QueryState::Idle { .. }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "preview query did not finish");
+        std::thread::yield_now();
+    }
+    assert!(matches!(&browser.content, Some(PreviewContent::Text { text }) if text == "first"));
+    assert_eq!(next_handle(&services), before + 3);
 }
 
 #[test]
@@ -657,6 +696,10 @@ fn navigation_input_restarts_the_preview_delay_even_when_the_query_is_unchanged(
         Event::FilterChanged,
         Event::MiniBufferChanged,
     ] {
+        browser
+            .navigation
+            .update(Event::Select, &input, now)
+            .unwrap();
         browser.state = QueryState::Waiting {
             query: query(),
             ready_at: now,
@@ -861,6 +904,10 @@ fn changing_the_query_cancels_old_work_and_keeps_the_previous_content() {
         path: String::new(),
     };
     let now = Instant::now();
+    browser
+        .navigation
+        .update(Event::Select, &input, now)
+        .unwrap();
     let preview = browser
         .advance(
             &services,
@@ -943,13 +990,25 @@ fn separate_previews_keep_independent_navigation_delays() {
             )
             .unwrap();
     }
+    for browser in [&mut first, &mut second] {
+        browser
+            .advance(
+                &services,
+                Event::Select,
+                &input,
+                &mut output(),
+                Some(file_query("last")),
+                now + Duration::from_secs(1),
+            )
+            .unwrap();
+    }
     first
         .advance(
             &services,
             Event::Select,
             &input,
             &mut output(),
-            Some(query()),
+            Some(file_query("last")),
             now + Duration::from_secs(10),
         )
         .unwrap();
@@ -960,7 +1019,7 @@ fn separate_previews_keep_independent_navigation_delays() {
     ));
     assert!(matches!(
         second.state,
-        QueryState::Waiting { ready_at, .. } if ready_at == now + Duration::from_secs(60)
+        QueryState::Waiting { ready_at, .. } if ready_at == now + Duration::from_secs(61)
     ));
 }
 
@@ -1033,4 +1092,164 @@ fn batch_diff_notifications_match_the_complete_request() {
         )
         .unwrap();
     assert!(matches!(browser.state, QueryState::Waiting { ready_at, .. } if ready_at == deadline));
+}
+
+#[test]
+fn zero_delay_starts_each_selected_item_immediately() {
+    let fixture = Fixture::new();
+    let services = fixture.services();
+    let mut browser = Browser::cloned();
+    let mut input = input();
+    input.preview_debounce = Duration::ZERO;
+    let now = Instant::now();
+    let before = next_handle(&services);
+    for path in ["first", "last", "cold"] {
+        browser
+            .advance(
+                &services,
+                Event::Select,
+                &input,
+                &mut output(),
+                Some(file_query(path)),
+                now,
+            )
+            .unwrap();
+        assert!(!matches!(browser.state, QueryState::Waiting { .. }));
+        assert_eq!(browser.state.query(), Some(&file_query(path)));
+    }
+    assert_eq!(next_handle(&services), before + 4);
+}
+
+#[test]
+fn returning_to_a_view_starts_a_new_navigation_round() {
+    let fixture = Fixture::new();
+    let services = fixture.services();
+    let mut browser = Browser::cloned();
+    let input = input();
+    let now = Instant::now();
+    for (event, path) in [
+        (Event::Select, "first"),
+        (Event::Select, "last"),
+        (Event::ViewLeaving, "last"),
+        (Event::Select, "cold"),
+    ] {
+        browser
+            .advance(
+                &services,
+                event,
+                &input,
+                &mut output(),
+                Some(file_query(path)),
+                now,
+            )
+            .unwrap();
+    }
+    assert!(!matches!(browser.state, QueryState::Waiting { .. }));
+    assert_eq!(browser.state.query(), Some(&file_query("cold")));
+}
+
+#[test]
+fn filesystem_refreshes_of_the_leading_item_wait_for_navigation_to_settle() {
+    let fixture = Fixture::new();
+    let services = fixture.services();
+    let _observation = warm(&services, &file_query("first"));
+    let mut browser = Browser::cloned();
+    let input = input();
+    let now = Instant::now();
+    browser
+        .advance(
+            &services,
+            Event::Select,
+            &input,
+            &mut output(),
+            Some(file_query("first")),
+            now,
+        )
+        .unwrap();
+    assert!(matches!(browser.state, QueryState::Idle { .. }));
+    fs::write(fixture.0.join("first"), "updated").unwrap();
+    services.borrow_mut().invalidate_fs();
+    let before = next_handle(&services);
+    let update = browser
+        .advance(
+            &services,
+            Event::FsChanged,
+            &input,
+            &mut output(),
+            Some(file_query("first")),
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+    assert!(update.is_none());
+    assert!(matches!(browser.state, QueryState::Waiting { ready_at, .. }
+        if ready_at == now + input.preview_debounce));
+    assert_eq!(next_handle(&services), before + 1);
+    assert!(matches!(&browser.content, Some(PreviewContent::Text { text }) if text == "first"));
+}
+
+#[test]
+fn returning_to_a_cancelled_item_publishes_only_its_final_request() {
+    let fixture = Fixture::new();
+    let services = fixture.services();
+    let mut input = input();
+    input.preview_debounce = Duration::from_millis(150);
+    let task = Task::start(&services, file_query("first").request).unwrap();
+    let cancelled = task.handle.unwrap();
+    let mut browser = Browser {
+        state: QueryState::Running {
+            query: file_query("first"),
+            task,
+        },
+        content: Some(PreviewContent::Text {
+            text: "previous".into(),
+        }),
+        ..Browser::cloned()
+    };
+    let now = Instant::now();
+    browser
+        .navigation
+        .update(Event::Select, &input, now)
+        .unwrap();
+    let before = next_handle(&services);
+    for (path, elapsed) in [("last", 10), ("first", 20)] {
+        let publication = browser
+            .advance(
+                &services,
+                Event::Select,
+                &input,
+                &mut output(),
+                Some(file_query(path)),
+                now + Duration::from_millis(elapsed),
+            )
+            .unwrap();
+        assert!(publication.is_none());
+        assert!(
+            matches!(&browser.content, Some(PreviewContent::Text { text }) if text == "previous")
+        );
+    }
+    assert!(services.borrow_mut().poll_query(cancelled).is_err());
+    assert_eq!(next_handle(&services), before + 1);
+    assert!(matches!(browser.state, QueryState::Waiting { ready_at, .. }
+        if ready_at == now + Duration::from_millis(170)));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let publication = loop {
+        if let Some(publication) = browser
+            .advance(
+                &services,
+                Event::Unknown,
+                &input,
+                &mut output(),
+                Some(file_query("first")),
+                now + Duration::from_millis(170),
+            )
+            .unwrap()
+        {
+            break publication;
+        }
+        assert!(Instant::now() < deadline, "final preview did not finish");
+        std::thread::yield_now();
+    };
+    assert_eq!(publication.path, "first");
+    assert!(matches!(publication.content, PreviewContent::Text { text } if text == "first"));
+    assert_eq!(next_handle(&services), before + 3);
 }

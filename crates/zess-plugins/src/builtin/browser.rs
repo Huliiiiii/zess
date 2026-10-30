@@ -1,14 +1,14 @@
 use anyhow::{Context, Result, bail};
 use std::time::Instant;
 use zess_plugin::{
-    HostRequest, ItemNavigation, ItemSelection, PluginInput, PluginOutput, PreviewContent,
-    PreviewLayout, PreviewPane, QueryWatch, SelectionChange,
+    HostRequest, ItemSelection, PluginInput, PluginOutput, PreviewContent, PreviewLayout,
+    PreviewPane, QueryWatch,
 };
 use zess_ui::DisplayRow;
 
 use super::{
     Event, Services,
-    schedule::{self, QueryState},
+    schedule::{NavigationDebounce, QueryState},
 };
 use zess_plugin::PluginRegistrar;
 use zess_services::{DirectoryEntryKind, QueryPoll, QueryRequest, QueryResult};
@@ -123,6 +123,7 @@ struct PreviewUpdate {
 #[derive(Default)]
 pub(super) struct Browser {
     state: QueryState<PreviewQuery>,
+    navigation: NavigationDebounce,
     static_preview: Option<String>,
     content: Option<PreviewContent>,
     content_query: Option<PreviewQuery>,
@@ -140,6 +141,7 @@ impl Browser {
 
     pub(super) fn leave(&mut self) {
         self.state = QueryState::default();
+        self.navigation = NavigationDebounce::default();
         self.static_preview = None;
         self.focus_on_ready = false;
     }
@@ -307,21 +309,9 @@ impl Browser {
             output.watches = Some(Vec::new());
             return Ok(None);
         }
-        let selection_change = if event == Event::Select {
-            if input.argument.is_null() {
-                SelectionChange {
-                    navigation: Some(ItemNavigation::Step),
-                }
-            } else {
-                serde_json::from_value(input.argument.clone())?
-            }
-        } else {
-            SelectionChange { navigation: None }
-        };
-        let navigation = schedule::navigation(event)
-            && (event != Event::Select || selection_change.navigation.is_some());
-        let immediate = event == Event::Preview
-            || matches!(selection_change.navigation, Some(ItemNavigation::Jump));
+        let ready_at = self.navigation.update(event, input, now)?;
+        let navigation = ready_at.is_some() && event != Event::Preview;
+        let immediate = ready_at == Some(now);
         if navigation {
             self.focus_on_ready = false;
         }
@@ -350,8 +340,7 @@ impl Browser {
                         changed(event, input, query.request.operation(), Some(&query.path))
                     }
                 }));
-        let interrupted = navigation && matches!(self.state, QueryState::Running { .. });
-        if query.as_ref() != self.state.query() || invalidated || interrupted {
+        if query.as_ref() != self.state.query() || invalidated {
             let changed = query.as_ref() != self.state.query();
             if changed {
                 self.focus_on_ready = false;
@@ -359,11 +348,15 @@ impl Browser {
             self.state = if let Some(query) = query {
                 QueryState::Waiting {
                     query,
-                    ready_at: if (changed || interrupted) && !immediate {
+                    ready_at: if event == Event::Refresh || immediate {
+                        now
+                    } else if let Some(ready_at) = ready_at {
+                        ready_at
+                    } else if invalidated {
+                        self.navigation.quiet_until(now)
+                    } else {
                         now.checked_add(input.preview_debounce)
                             .context("preview debounce exceeds the supported time range")?
-                    } else {
-                        now
                     },
                 }
             } else {
@@ -386,14 +379,17 @@ impl Browser {
                 QueryState::default()
             };
         }
-        if let QueryState::Waiting { ready_at, .. } = &mut self.state {
-            if immediate {
-                *ready_at = now;
-            } else if navigation {
-                *ready_at = now
-                    .checked_add(input.preview_debounce)
-                    .context("preview debounce exceeds the supported time range")?;
-            }
+        if let Some(ready_at) = ready_at
+            && ready_at > now
+        {
+            self.state.defer(ready_at);
+        }
+        if let QueryState::Waiting {
+            ready_at: deadline, ..
+        } = &mut self.state
+            && let Some(ready_at) = ready_at
+        {
+            *deadline = ready_at;
         }
         let cached = if let QueryState::Waiting { query, .. } = &self.state {
             services.borrow().cached_query(&query.request)?

@@ -52,7 +52,7 @@ fn next_handle(services: &Services) -> u64 {
 }
 
 #[test]
-fn navigation_cancels_a_running_summary_even_at_the_same_commit() {
+fn repeated_steps_at_the_same_commit_cancel_the_unpublished_summary() {
     let services = services();
     let input = input();
     let selected = commit("1111111111111111111111111111111111111111");
@@ -68,11 +68,7 @@ fn navigation_cancels_a_running_summary_even_at_the_same_commit() {
             query: selected.oid.clone(),
             task,
         },
-        commit: Some("previous commit".into()),
-        info: vec![DisplayRow {
-            text: "previous info".into(),
-            ..DisplayRow::default()
-        }],
+        commit: Some("previous".into()),
         summary: vec![DisplayRow {
             text: "previous summary".into(),
             ..DisplayRow::default()
@@ -80,31 +76,32 @@ fn navigation_cancels_a_running_summary_even_at_the_same_commit() {
         ..HistoryPreview::default()
     };
     let now = Instant::now();
-    let before = next_handle(&services);
-
     preview
-        .advance(
-            &services,
-            Event::Select,
-            &input,
-            Some(&selected),
-            &mut output(),
-            now,
-        )
+        .navigation
+        .update(Event::Select, &input, now)
         .unwrap();
-
-    assert!(
-        matches!(preview.state, QueryState::Waiting { ready_at, .. } if ready_at == now + input.preview_debounce)
-    );
-    assert_eq!(preview.info[0].text, "previous info");
-    assert_eq!(preview.summary[0].text, "previous summary");
-    assert_eq!(
-        services
-            .borrow_mut()
-            .call("service.stats", serde_json::Value::Null)["jobs"],
-        0
-    );
-    assert_eq!(next_handle(&services), before + 2);
+    let before = next_handle(&services);
+    for elapsed in [10, 20, 79] {
+        preview
+            .advance(
+                &services,
+                Event::Select,
+                &input,
+                Some(&selected),
+                &mut output(),
+                now + Duration::from_secs(elapsed),
+            )
+            .unwrap();
+        assert!(matches!(preview.state, QueryState::Waiting { ready_at, .. }
+            if ready_at == now + Duration::from_secs(elapsed) + input.preview_debounce));
+        assert_eq!(preview.commit.as_deref(), Some("previous"));
+        assert_eq!(preview.summary[0].text, "previous summary");
+    }
+    let stats = services
+        .borrow_mut()
+        .call("service.stats", serde_json::Value::Null);
+    assert_eq!(stats["jobs"], 0);
+    assert_eq!(stats["next_handle"], before + 1);
 }
 
 #[test]
@@ -162,8 +159,8 @@ fn navigation_keeps_the_previous_commit_visible_until_the_last_selection_settles
         QueryState::Waiting { ready_at, .. } if ready_at == now + Duration::from_secs(90)
     ));
     assert_eq!(preview.state.query(), Some(&last.oid));
-    // The second stats request consumes one handle; no query was started.
-    assert_eq!(next_handle(&services), before + 1);
+    // The leading step starts one request; the final selection still waits.
+    assert_eq!(next_handle(&services), before + 2);
 }
 
 #[test]
@@ -320,4 +317,53 @@ fn an_empty_completed_source_clears_the_previous_commit() {
             "unknown_files": 0,
         }})
     );
+}
+
+#[test]
+fn jumping_to_a_commit_starts_its_summary_during_navigation() {
+    let services = services();
+    let mut input = input();
+    let first = commit("1111111111111111111111111111111111111111");
+    let last = commit("2222222222222222222222222222222222222222");
+    let now = Instant::now();
+    let mut preview = HistoryPreview::default();
+    preview
+        .advance(
+            &services,
+            Event::Select,
+            &input,
+            Some(&first),
+            &mut output(),
+            now,
+        )
+        .unwrap();
+    preview
+        .advance(
+            &services,
+            Event::Select,
+            &input,
+            Some(&last),
+            &mut output(),
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+    assert!(matches!(preview.state, QueryState::Waiting { .. }));
+    input.argument = serde_json::to_value(zess_plugin::SelectionChange {
+        navigation: Some(zess_plugin::ItemNavigation::Jump),
+    })
+    .unwrap();
+    let before = next_handle(&services);
+    preview
+        .advance(
+            &services,
+            Event::Select,
+            &input,
+            Some(&last),
+            &mut output(),
+            now + Duration::from_secs(2),
+        )
+        .unwrap();
+    assert!(!matches!(preview.state, QueryState::Waiting { .. }));
+    assert_eq!(preview.state.query(), Some(&last.oid));
+    assert_eq!(next_handle(&services), before + 2);
 }
