@@ -4,6 +4,7 @@ use std::{
     time::Instant,
 };
 use zess_filter::{Case, Filter};
+use zess_git::mutation::{FileMutation, FileMutationRequest};
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -28,6 +29,8 @@ use zess_plugin::BufferPlugin;
 
 #[cfg(test)]
 mod history_preview_tests;
+#[cfg(test)]
+mod mutation_tests;
 #[cfg(test)]
 mod scheduling_tests;
 #[cfg(test)]
@@ -804,6 +807,7 @@ struct Model {
     result: LoadResult,
     revision: u64,
     totals: ChangeTotals,
+    mutation: Option<zess_services::FileMutationTask>,
 }
 
 #[derive(Default)]
@@ -817,6 +821,20 @@ struct GitView {
     history: HistoryPreview,
     snapshot: Option<PendingSnapshot>,
     yanks: Yanks,
+    discard: Option<DiscardConfirmation>,
+    refresh_diffs: bool,
+    pending_open: Option<String>,
+    pending_mutation: Option<PendingFileMutation>,
+}
+
+struct PendingFileMutation {
+    operation: FileMutation,
+    paths: BTreeSet<String>,
+}
+
+struct DiscardConfirmation {
+    purpose: String,
+    request: FileMutationRequest,
 }
 
 pub(super) struct Git {
@@ -893,6 +911,44 @@ impl BufferPlugin for Git {
         let model = self.models.entry(input.buffer_id).or_default();
         let view = self.views.entry(key).or_default();
         let mut output = PluginOutput::default();
+        let mutation_completed = if let Some(result) = model
+            .mutation
+            .as_mut()
+            .and_then(|task| task.poll())
+            .cloned()
+        {
+            model.mutation = None;
+            self.services.borrow_mut().invalidate_fs();
+            if let Err(text) = result {
+                output.requests.push(HostRequest::Message { text });
+            }
+            view.task = None;
+            view.refresh_diffs = true;
+            output.changed = true;
+            true
+        } else {
+            false
+        };
+        if event == Event::LayerResult
+            && view
+                .discard
+                .as_ref()
+                .is_some_and(|pending| input.argument["purpose"] == pending.purpose)
+        {
+            let pending = view.discard.take().unwrap();
+            if input.argument["cancelled"] != true
+                && input.argument["text"]
+                    .as_str()
+                    .is_some_and(|text| text.trim() == "yes")
+                && model.mutation.is_none()
+            {
+                model.mutation = Some(
+                    self.services
+                        .borrow()
+                        .start_file_mutation(pending.request)?,
+                );
+            }
+        }
         if event == Event::ToggleView && self.page != Page::History {
             tree_mode = match tree_mode {
                 GitTreeMode::Tree => GitTreeMode::Flat,
@@ -925,6 +981,9 @@ impl BufferPlugin for Git {
             )?;
         }
         if event == Event::ViewLeaving {
+            view.pending_mutation = None;
+            view.pending_open = None;
+            view.discard = None;
             view.task = None;
             view.browser.leave();
             view.snapshot = None;
@@ -932,11 +991,13 @@ impl BufferPlugin for Git {
                 browser.leave();
             }
         } else {
-            if matches!(
-                event,
-                Event::Refresh | Event::Init | Event::ViewEntered | Event::ViewCloned
-            ) || (view.task.is_none()
-                && browser::changed(event, input, request.operation(), None))
+            if mutation_completed
+                || matches!(
+                    event,
+                    Event::Refresh | Event::Init | Event::ViewEntered | Event::ViewCloned
+                )
+                || (view.task.is_none()
+                    && browser::changed(event, input, request.operation(), None))
                 || (matches!(model.result, LoadResult::Unloaded) && view.task.is_none())
             {
                 match Task::start(&self.services, request.clone()) {
@@ -1142,6 +1203,120 @@ impl BufferPlugin for Git {
                 }
             }
         }
+        if self.page == Page::Changes
+            && matches!(event, Event::Stage | Event::Unstage | Event::Discard)
+        {
+            if model.mutation.is_some() || view.pending_mutation.is_some() {
+                output.requests.push(HostRequest::Message {
+                    text: "Git file operation is running".into(),
+                });
+            } else {
+                let operation = match event {
+                    Event::Stage => FileMutation::Stage,
+                    Event::Unstage => FileMutation::Unstage,
+                    Event::Discard => FileMutation::Discard,
+                    _ => unreachable!(),
+                };
+                let ids = if input.selection.selected.is_empty() {
+                    input.selection.primary.iter().collect::<Vec<_>>()
+                } else {
+                    input.selection.selected.iter().collect()
+                };
+                let mut paths = BTreeSet::new();
+                for id in ids {
+                    if view.tree.nodes.contains_key(id) {
+                        paths.extend(
+                            view.tree
+                                .file_targets(id, None)
+                                .into_iter()
+                                .map(|target| target.path),
+                        );
+                    }
+                }
+                view.pending_mutation = Some(PendingFileMutation { operation, paths });
+            }
+        }
+        if view.task.is_none()
+            && let Some(pending) = view.pending_mutation.take()
+        {
+            if !matches!(model.result, LoadResult::Ready) {
+                output.requests.push(HostRequest::Message {
+                    text: "Cannot change files while Git status is unavailable".into(),
+                });
+            } else {
+                let entries = model
+                    .entries
+                    .iter()
+                    .filter(|entry| pending.paths.contains(&entry.path))
+                    .collect::<Vec<_>>();
+                if entries
+                    .iter()
+                    .any(|entry| entry.staging_status() == StagingStatus::Conflict)
+                {
+                    output.requests.push(HostRequest::Message {
+                        text: "Cannot change a selection containing unresolved conflicts".into(),
+                    });
+                } else {
+                    let entries = entries
+                        .into_iter()
+                        .filter(|entry| match pending.operation {
+                            FileMutation::Stage | FileMutation::Discard => {
+                                entry.untracked || entry.worktree != " "
+                            }
+                            FileMutation::Unstage => !entry.untracked && entry.index != " ",
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if entries.is_empty() {
+                        output.requests.push(HostRequest::Message {
+                            text: "No changes on the selected side".into(),
+                        });
+                    } else {
+                        let request = FileMutationRequest {
+                            operation: pending.operation,
+                            entries,
+                        };
+                        if pending.operation == FileMutation::Discard {
+                            let tracked = request
+                                .entries
+                                .iter()
+                                .filter(|entry| !entry.untracked)
+                                .map(|entry| format!("{:?}", entry.path))
+                                .collect::<Vec<_>>();
+                            let untracked = request
+                                .entries
+                                .iter()
+                                .filter(|entry| entry.untracked)
+                                .map(|entry| format!("{:?}", entry.path))
+                                .collect::<Vec<_>>();
+                            let mut actions = Vec::new();
+                            if !tracked.is_empty() {
+                                actions.push(format!(
+                                    "Restore working tree from index: {}",
+                                    tracked.join(", ")
+                                ));
+                            }
+                            if !untracked.is_empty() {
+                                actions.push(format!(
+                                    "Delete untracked files: {}",
+                                    untracked.join(", ")
+                                ));
+                            }
+                            let purpose = format!("{}. Type yes to confirm", actions.join("; "));
+                            output.requests.push(HostRequest::MiniBuffer {
+                                purpose: purpose.clone(),
+                                text: String::new(),
+                                key_scope: None,
+                            });
+                            view.discard = Some(DiscardConfirmation { purpose, request });
+                        } else {
+                            model.mutation =
+                                Some(self.services.borrow().start_file_mutation(request)?);
+                        }
+                    }
+                }
+            }
+        }
         let primary_id = output
             .selection
             .as_ref()
@@ -1196,6 +1371,19 @@ impl BufferPlugin for Git {
         let selected = primary
             .and_then(|id| view.tree.nodes.get(id))
             .map(|node| &node.kind);
+        if view.refresh_diffs && matches!(event, Event::Open | Event::Preview) {
+            view.pending_open = primary.map(str::to_owned);
+        }
+        if view.pending_open.as_deref() != primary || event == Event::ViewLeaving {
+            view.pending_open = None;
+        }
+        let refresh_diffs = view.refresh_diffs
+            && event != Event::ViewLeaving
+            && view.task.is_none()
+            && matches!(model.result, LoadResult::Ready);
+        if refresh_diffs {
+            view.refresh_diffs = false;
+        }
         let preview_event = if event == Event::Open && selected.is_some() {
             Event::Preview
         } else {
@@ -1254,6 +1442,10 @@ impl BufferPlugin for Git {
                     .into_iter();
                 let mut panes = Vec::new();
                 for (browser, (side, id, header, files)) in view.diffs.iter_mut().zip(sides) {
+                    if view.refresh_diffs {
+                        browser.defer(preview_event, input)?;
+                        continue;
+                    }
                     let visible = !files.is_empty();
                     let query = visible.then(|| PreviewQuery {
                         request: QueryRequest::DiffFiles {
@@ -1270,6 +1462,9 @@ impl BufferPlugin for Git {
                         },
                         path: path.into(),
                     });
+                    if refresh_diffs {
+                        browser.invalidate(query.clone());
+                    }
                     if let Some(pane) = browser.pane(
                         &self.services,
                         preview_event,
@@ -1295,6 +1490,9 @@ impl BufferPlugin for Git {
                     let mut focus = false;
                     for browser in &mut view.diffs {
                         focus |= browser.take_focus_request();
+                    }
+                    if !view.refresh_diffs {
+                        focus |= view.pending_open.take().is_some();
                     }
                     output.requests.push(HostRequest::PreviewGroup {
                         panes,
@@ -1345,6 +1543,12 @@ impl BufferPlugin for Git {
                 if view.browser.pending() {
                     output.requests.push(HostRequest::PreviewPending);
                 }
+            }
+            (Page::Changes, None) if view.refresh_diffs => {
+                for browser in &mut view.diffs {
+                    browser.defer(preview_event, input)?;
+                }
+                output.requests.push(HostRequest::PreviewPending);
             }
             (Page::Changes | Page::CommitFiles, None) => {
                 for browser in &mut view.diffs {
@@ -1476,7 +1680,12 @@ impl BufferPlugin for Git {
             });
         }
         view.yanks.advance(&self.services, event, &mut output);
-        if view.task.is_some() {
+        if model.mutation.is_some() {
+            let display = output.display.as_mut().unwrap();
+            display.loading = true;
+            display.header = "Git file operation is running…".into();
+        }
+        if view.task.is_some() || model.mutation.is_some() {
             output.requests.push(HostRequest::Schedule { after_ms: 50 });
         }
         Ok(output)

@@ -146,6 +146,29 @@ impl Browser {
         self.focus_on_ready = false;
     }
 
+    pub(super) fn defer(&mut self, event: Event, input: &PluginInput) -> Result<()> {
+        if event == Event::ViewLeaving {
+            self.leave();
+            return Ok(());
+        }
+        let now = Instant::now();
+        if self.navigation.update(event, input, now)?.is_some() && event != Event::Preview {
+            self.focus_on_ready = false;
+        }
+        self.state.defer(self.navigation.quiet_until(now));
+        Ok(())
+    }
+
+    pub(super) fn invalidate(&mut self, query: Option<PreviewQuery>) {
+        self.state = match query {
+            Some(query) => QueryState::Waiting {
+                query,
+                ready_at: self.navigation.quiet_until(Instant::now()),
+            },
+            None => QueryState::default(),
+        };
+    }
+
     pub(super) fn pending(&self) -> bool {
         !matches!(self.state, QueryState::Idle { .. })
     }

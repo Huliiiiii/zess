@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+pub mod mutation;
 pub mod patch;
 mod renderer;
 pub use renderer::{DiffRenderOptions, DiffRenderer};
@@ -565,15 +566,7 @@ impl Repository {
         Ok(command)
     }
 
-    pub fn status(&self, cancellation: &impl Execution) -> Result<Vec<GitEntry>> {
-        self.status_with_progress(cancellation, |_| {})
-    }
-
-    pub fn status_with_progress(
-        &self,
-        cancellation: &impl Execution,
-        progress: impl FnOnce(&[GitEntry]),
-    ) -> Result<Vec<GitEntry>> {
+    fn worktree_changes(&self, cancellation: &impl Execution) -> Result<Vec<GitEntry>> {
         let top = self
             .git(&["rev-parse", "--show-toplevel"], cancellation)
             .context("locate Git working tree")?;
@@ -590,7 +583,19 @@ impl Repository {
                 .strip_suffix('\n')
                 .context("invalid git root output")?,
         );
-        let mut entries = self.status_entries(&top, cancellation)?;
+        self.status_entries(&top, cancellation)
+    }
+
+    pub fn status(&self, cancellation: &impl Execution) -> Result<Vec<GitEntry>> {
+        self.status_with_progress(cancellation, |_| {})
+    }
+
+    pub fn status_with_progress(
+        &self,
+        cancellation: &impl Execution,
+        progress: impl FnOnce(&[GitEntry]),
+    ) -> Result<Vec<GitEntry>> {
+        let mut entries = self.worktree_changes(cancellation)?;
         cancellation.check()?;
         progress(&entries);
         let mut counts = self

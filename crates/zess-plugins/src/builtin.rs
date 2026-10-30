@@ -47,6 +47,9 @@ enum Event {
     UndoPending,
     LayerResult,
     Save,
+    Stage,
+    Unstage,
+    Discard,
     Page,
     PageChanges,
     PageHistory,
@@ -89,6 +92,9 @@ impl Event {
             "undo_pending" => Self::UndoPending,
             "layer_result" => Self::LayerResult,
             "save" => Self::Save,
+            "stage" => Self::Stage,
+            "unstage" => Self::Unstage,
+            "discard" => Self::Discard,
             "page" => Self::Page,
             "page-changes" => Self::PageChanges,
             "page-history" => Self::PageHistory,
@@ -268,6 +274,13 @@ impl BuiltinPlugins {
                 }
             }
             browser::bind_event(registry, kind, "open", description, &["Enter"]);
+        }
+        for (event, description, key) in [
+            ("stage", "Stage selected files", "s"),
+            ("unstage", "Unstage selected files", "u"),
+            ("discard", "Discard selected working tree changes", "d"),
+        ] {
+            browser::bind_event(registry, "git", event, description, &[key]);
         }
         registry.buffer_command(
             "git-commit-files.back",

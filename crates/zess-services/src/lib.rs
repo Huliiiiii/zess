@@ -11,6 +11,8 @@ mod file_watch;
 mod filesystem;
 mod fs_cache;
 mod git_colors;
+mod mutations;
+pub use mutations::FileMutationTask;
 mod patches;
 pub use patches::PatchTask;
 mod query;
