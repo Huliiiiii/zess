@@ -71,6 +71,7 @@ zess-text.workspace = true
 
 [dev-dependencies]
 fnv.workspace = true
+serde.workspace = true
 tempfile.workspace = true
 
 [profile.dev]
