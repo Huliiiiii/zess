@@ -52,6 +52,8 @@ pub struct FileDiff {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RenderedDiff {
+    #[serde(default)]
+    pub file_header: bool,
     pub text: String,
     pub repository_root: PathBuf,
 }
@@ -202,6 +204,45 @@ pub struct Repository {
 }
 
 impl Repository {
+    pub fn diff_files(
+        &self,
+        source: &DiffSource,
+        files: &[DiffTarget],
+        options: &DiffRenderOptions,
+        cancellation: &impl Execution,
+    ) -> Result<GitDiff> {
+        let renderer = self.diff_renderer(options, cancellation)?;
+        let mut diffs = Vec::with_capacity(files.len());
+        for target in files {
+            cancellation.check()?;
+            let raw = match source {
+                DiffSource::Changes { side } => self.diff(
+                    &target.path,
+                    target.original_path.as_deref(),
+                    Some(*side),
+                    cancellation,
+                )?,
+                DiffSource::Commit { commit } => self.commit_diff(
+                    commit,
+                    &target.path,
+                    target.original_path.as_deref(),
+                    cancellation,
+                )?,
+            };
+            let rendered = renderer.render(self, source, target, &raw, cancellation)?;
+            diffs.push(FileDiff {
+                target: target.clone(),
+                raw,
+                rendered,
+            });
+        }
+        cancellation.check()?;
+        Ok(GitDiff {
+            source: source.clone(),
+            files: diffs,
+        })
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root
             .as_ref()

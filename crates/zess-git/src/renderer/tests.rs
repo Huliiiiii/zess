@@ -37,14 +37,16 @@ fn pagers_receive_the_requested_view_width() {
     fixture.commit("old\n");
     let repository = Repository::open(&fixture.0).unwrap();
     for (width, expected) in [(44, "44:44\npatch"), (120, "120:120\npatch")] {
-        let mut renderer = repository
+        let renderer = repository
             .diff_renderer(
-                &DiffRenderOptions { width: Some(width) },
+                &DiffRenderOptions {
+                    file_header: false,
+                    width: Some(width),
+                    pager: Some("printf '%s:%s\\n' \"$COLUMNS\" \"$DFT_WIDTH\"; cat".into()),
+                },
                 &crate::tests::Execute,
             )
             .unwrap();
-        renderer.external = false;
-        renderer.pager = Some("printf '%s:%s\\n' \"$COLUMNS\" \"$DFT_WIDTH\"; cat".into());
         let rendered = renderer
             .render(
                 &repository,

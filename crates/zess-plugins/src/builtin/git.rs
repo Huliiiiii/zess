@@ -840,6 +840,27 @@ impl Git {
 impl BufferPlugin for Git {
     fn update(&mut self, input: &PluginInput) -> Result<PluginOutput> {
         let event = Event::parse(&input.event);
+        let diff_pager = input
+            .options
+            .get("diff-pager")
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|pager| !pager.trim().is_empty())
+                    .context("diff-pager must be a non-empty shell command")
+                    .map(str::to_owned)
+            })
+            .transpose()?;
+        let diff_file_header = input
+            .options
+            .get("diff-file-header")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .context("diff-file-header must be a boolean")
+            })
+            .transpose()?
+            .unwrap_or(false);
         let mut tree_mode = if self.page == Page::History {
             GitTreeMode::Tree
         } else {
@@ -1239,10 +1260,12 @@ impl BufferPlugin for Git {
                             source: DiffSource::Changes { side },
                             files,
                             render: DiffRenderOptions {
+                                file_header: diff_file_header,
                                 width: areas
                                     .next()
                                     .map(|area| area.width)
                                     .filter(|width| *width > 0),
+                                pager: diff_pager.clone(),
                             },
                         },
                         path: path.into(),
@@ -1307,10 +1330,12 @@ impl BufferPlugin for Git {
                         },
                         files: view.tree.file_targets(primary.unwrap(), None),
                         render: DiffRenderOptions {
+                            file_header: diff_file_header,
                             width: input
                                 .preview_area
                                 .map(|area| area.width)
                                 .filter(|width| *width > 0),
+                            pager: diff_pager,
                         },
                     },
                     path: path.into(),

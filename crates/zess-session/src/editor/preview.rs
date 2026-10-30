@@ -44,6 +44,20 @@ impl Session {
         let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] else {
             return;
         };
+        if diff.mapped_rendering() {
+            if view.location.manual_viewport {
+                let visible = view.location.scroll
+                    ..view
+                        .location
+                        .scroll
+                        .saturating_add(view.viewport_height.max(1));
+                view.location
+                    .diff_selection
+                    .focus_visible(diff.index(diff::Presentation::Rendered), visible);
+                view.location.manual_viewport = false;
+            }
+            return;
+        }
         if view.location.manual_viewport {
             let selection = diff.raw_selection_at_rendered(view.location.scroll);
             let current = view.location.diff_selection.row();
@@ -54,14 +68,7 @@ impl Session {
                     .row()
                     .and_then(|row| diff.file_at(row))
                     .map(|file| &file.target);
-            let visible = view.location.scroll
-                ..view
-                    .location
-                    .scroll
-                    .saturating_add(view.viewport_height.max(1));
-            let visible_selection =
-                current.is_some_and(|row| visible.contains(&diff.rendered_row_at_raw(row)));
-            if !same_file || (diff.mapped_rendering() && !visible_selection) {
+            if !same_file {
                 view.location.diff_selection = selection;
             }
         }
@@ -79,13 +86,25 @@ impl Session {
             return;
         };
         if diff.rendered.is_some() {
-            view.location.scroll = diff.rendered_row_at_raw(
-                view.location
-                    .diff_selection
-                    .row()
-                    .unwrap_or(view.location.scroll),
-            );
-            view.location.horizontal_scroll = 0;
+            if view.location.diff_presentation == diff::Presentation::Raw {
+                if diff.mapped_rendering() {
+                    view.location.diff_selection.reconcile(
+                        diff,
+                        diff,
+                        diff::Presentation::Raw,
+                        diff::Presentation::Rendered,
+                    );
+                    view.location.scroll = view.location.diff_selection.row().unwrap_or(0);
+                } else {
+                    view.location.scroll = diff.rendered_row_at_raw(
+                        view.location
+                            .diff_selection
+                            .row()
+                            .unwrap_or(view.location.scroll),
+                    );
+                }
+                view.location.horizontal_scroll = 0;
+            }
             view.location.diff_presentation = diff::Presentation::Rendered;
             view.location.manual_viewport = true;
         }
@@ -521,7 +540,11 @@ impl Session {
                     return Ok(target);
                 }
                 if self.prompt.as_ref().is_some_and(|prompt| {
-                    prompt.view == target && matches!(prompt.kind, PromptKind::DiffSearch(_))
+                    matches!(prompt.kind, PromptKind::DiffSearch(_))
+                        && self
+                            .views
+                            .get(&prompt.view)
+                            .is_some_and(|view| view.location.buffer == buffer)
                 }) {
                     self.prompt_command(PromptCommand::Cancel)?;
                 }
@@ -545,7 +568,9 @@ impl Session {
                     .values_mut()
                     .filter(|view| view.location.buffer == buffer)
                 {
-                    let presentation = if diff.rendered.is_some() && view.id != self.focus {
+                    let presentation = if diff.rendered.is_some()
+                        && (view.id != self.focus || diff.mapped_rendering())
+                    {
                         diff::Presentation::Rendered
                     } else {
                         diff::Presentation::Raw
@@ -553,8 +578,8 @@ impl Session {
                     reselect |= view.location.diff_selection.reconcile(
                         old,
                         &diff,
-                        diff::Presentation::Raw,
-                        diff::Presentation::Raw,
+                        view.location.diff_presentation,
+                        presentation,
                     );
                     if view.location.diff_presentation != presentation {
                         view.location.scroll = view.location.diff_selection.row().unwrap_or(0);
@@ -569,8 +594,15 @@ impl Session {
             if reselect {
                 self.message = "Diff layout changed; reselect changes before staging".into();
             }
-            let selection = diff.index.initial_selection();
+            let selection = diff
+                .index(if diff.mapped_rendering() {
+                    diff::Presentation::Rendered
+                } else {
+                    diff::Presentation::Raw
+                })
+                .initial_selection();
             let external = diff.rendered.is_some();
+            let mapped = diff.mapped_rendering();
             let first = diff
                 .index
                 .rows
@@ -596,11 +628,12 @@ impl Session {
             {
                 if reused.is_none() {
                     view.location.diff_selection = selection.clone();
-                    view.location.diff_presentation = if external && view.id != self.focus {
-                        diff::Presentation::Rendered
-                    } else {
-                        diff::Presentation::Raw
-                    };
+                    view.location.diff_presentation =
+                        if external && (view.id != self.focus || mapped) {
+                            diff::Presentation::Rendered
+                        } else {
+                            diff::Presentation::Raw
+                        };
                     view.location.scroll =
                         if view.location.diff_presentation == diff::Presentation::Rendered {
                             0
@@ -866,7 +899,7 @@ impl Session {
             {
                 view.location
                     .diff_selection
-                    .focus_visible(&diff.index, visible);
+                    .focus_visible(diff.index(view.location.diff_presentation), visible);
                 view.location.manual_viewport = false;
             }
         }
@@ -916,7 +949,7 @@ impl Session {
             .filter(|pattern| !pattern.is_empty())
         {
             if let Some(row) = diff.search(
-                diff::Presentation::Raw,
+                view.location.diff_presentation,
                 &pattern,
                 view.location.diff_selection.row(),
                 forward,
@@ -931,9 +964,11 @@ impl Session {
     pub(super) fn move_diff(&mut self, forward: bool, block: bool) -> Result<()> {
         let view = self.views.get_mut(&self.focus).unwrap();
         if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
-            view.location
-                .diff_selection
-                .move_by(&diff.index, forward, block);
+            view.location.diff_selection.move_by(
+                diff.index(view.location.diff_presentation),
+                forward,
+                block,
+            );
             view.location.manual_viewport = false;
         }
         Ok(())
@@ -948,7 +983,7 @@ impl Session {
         match command {
             PreviewCommand::DiffGotoFirst | PreviewCommand::DiffGotoLast => {
                 view.location.diff_selection.move_to_edge(
-                    &diff.index,
+                    diff.index(view.location.diff_presentation),
                     command == PreviewCommand::DiffGotoLast,
                     count,
                 );
@@ -974,7 +1009,9 @@ impl Session {
                 } else {
                     row.saturating_sub(page.distance())
                 };
-                view.location.diff_selection.move_to(&diff.index, target);
+                view.location
+                    .diff_selection
+                    .move_to(diff.index(view.location.diff_presentation), target);
                 if let Some(row) = view.location.diff_selection.row() {
                     view.location.scroll = page.viewport_start(view.location.scroll, row, 5);
                 }
@@ -988,7 +1025,9 @@ impl Session {
     pub(super) fn select_diff_hunk(&mut self) -> Result<()> {
         let view = self.views.get_mut(&self.focus).unwrap();
         if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
-            view.location.diff_selection.select_block(&diff.index);
+            view.location
+                .diff_selection
+                .select_block(diff.index(view.location.diff_presentation));
         }
         Ok(())
     }
@@ -996,7 +1035,9 @@ impl Session {
     pub(super) fn toggle_diff_selection(&mut self) -> Result<()> {
         let view = self.views.get_mut(&self.focus).unwrap();
         if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
-            view.location.diff_selection.toggle(&diff.index);
+            view.location
+                .diff_selection
+                .toggle(diff.index(view.location.diff_presentation));
         }
         Ok(())
     }
@@ -1063,8 +1104,10 @@ impl Session {
             bail!("historical diffs cannot be staged");
         };
         let side = *side;
-        let (file, rows) =
-            diff.selected_patch_rows(diff::Presentation::Raw, &view.location.diff_selection)?;
+        let (file, rows) = diff.selected_patch_rows(
+            view.location.diff_presentation,
+            &view.location.diff_selection,
+        )?;
         let raw = file.raw.clone();
         // Validate before starting work so unsupported/binary patches and empty
         // selections fail immediately without an index operation.
@@ -1128,7 +1171,7 @@ impl Session {
             .row()
             .context("this diff has no selected source line")?;
         let row = diff
-            .raw_row(diff::Presentation::Raw, row)
+            .raw_row(view.location.diff_presentation, row)
             .context("this diff has no selected source line")?;
         let mut line = diff.index.rows[row]
             .source_line

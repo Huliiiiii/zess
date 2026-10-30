@@ -1720,7 +1720,11 @@ fn diff_file_observations_share_filesystem_watches_across_display_widths() {
             path: "note.txt".into(),
             original_path: None,
         }],
-        render: zess_git::DiffRenderOptions { width: Some(44) },
+        render: zess_git::DiffRenderOptions {
+            file_header: false,
+            width: Some(44),
+            pager: None,
+        },
     };
     let original = services.acquire_query(&request).unwrap();
     let QueryRequest::DiffFiles { render, .. } = &mut request else {
@@ -1788,6 +1792,64 @@ fn zero_diff_width_is_rejected() {
         }),
     );
     assert_eq!(result["error"], "diff width must be positive");
+}
+
+#[test]
+fn an_explicit_diff_pager_replaces_the_configured_external_renderer() {
+    let fixture = Fixture::new();
+    git(&fixture.0, &["init", "--quiet"]);
+    fs::write(fixture.0.join("note.txt"), "old\n").unwrap();
+    git(&fixture.0, &["add", "."]);
+    git(&fixture.0, &["commit", "--quiet", "-m", "baseline"]);
+    fs::write(fixture.0.join("note.txt"), "new\n").unwrap();
+    fs::write(
+        fixture.0.join("renderer.sh"),
+        "touch external-started\nprintf 'external\\n'\n",
+    )
+    .unwrap();
+    git(&fixture.0, &["config", "diff.external", "sh ./renderer.sh"]);
+    git(&fixture.0, &["config", "pager.diff", "false"]);
+    let mut services = fixture.services();
+    let mut request = json!({
+        "source":{"kind":"changes", "side":"unstaged"},
+        "files":[{"path":"note.txt", "original_path":null}],
+        "render":{"width":120, "pager":"printf 'override:%s\\n' \"$COLUMNS\"; cat"},
+    });
+    let rendered = services.call("git.diff-files", request.clone());
+    let file = &rendered["diff"]["files"][0];
+    let raw = file["raw"].as_str().unwrap();
+    assert_eq!(file["rendered"]["text"], format!("override:120\n{raw}"));
+    assert!(!fixture.0.join("external-started").exists());
+    request["render"]["pager"] = json!("cat");
+    let plain = services.call("git.diff-files", request.clone());
+    assert!(plain["diff"]["files"][0]["rendered"].is_null());
+    assert_eq!(plain["diff"]["files"][0]["raw"], raw);
+    assert!(!fixture.0.join("external-started").exists());
+    request["render"]["pager"] = serde_json::Value::Null;
+    let automatic = services.call("git.diff-files", request);
+    assert_eq!(
+        automatic["diff"]["files"][0]["rendered"]["text"],
+        "external\n"
+    );
+    assert_eq!(automatic["diff"]["files"][0]["raw"], raw);
+    assert!(fixture.0.join("external-started").exists());
+}
+
+#[test]
+fn empty_diff_pager_commands_are_rejected() {
+    let fixture = Fixture::new();
+    let mut services = fixture.services();
+    for pager in ["", " \n "] {
+        let result = services.call(
+            "git.diff-files",
+            json!({
+                "source":{"kind":"changes", "side":"unstaged"},
+                "files":[],
+                "render":{"pager":pager},
+            }),
+        );
+        assert_eq!(result["error"], "diff pager must not be empty");
+    }
 }
 
 #[test]

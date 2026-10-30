@@ -908,7 +908,10 @@ impl Session {
         {
             json!({"view_id":self.focus,"buffer_id":view.location.buffer,"cursors":text.selections(self.focus)})
         } else if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
-            let range = view.location.diff_selection.rows(&diff.index);
+            let range = view
+                .location
+                .diff_selection
+                .rows(diff.index(view.location.diff_presentation));
             json!({"view_id":self.focus,"buffer_id":view.location.buffer,"diff_selection":{"row": view.location.diff_selection.row(),"start_row":range.as_ref().map(|range| range.start()),"end_row":range.as_ref().map(|range| range.end())}})
         } else {
             json!({"view_id":self.focus,"buffer_id":view.location.buffer,"selection":view.location.selection})
@@ -1439,7 +1442,7 @@ impl Session {
                     bail!("search requires a diff")
                 };
                 if let Some(row) = diff.search(
-                    diff::Presentation::Raw,
+                    view.location.diff_presentation,
                     &prompt.text,
                     search.selection.row(),
                     search.forward,
@@ -1586,7 +1589,7 @@ impl Session {
                         };
                         if !prompt.text.is_empty() {
                             match diff.search(
-                                diff::Presentation::Raw,
+                                view.location.diff_presentation,
                                 &prompt.text,
                                 search.selection.row(),
                                 search.forward,

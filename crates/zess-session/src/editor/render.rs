@@ -367,6 +367,21 @@ impl Session {
                 diff::Presentation::Rendered
             ) && let Some(rendered) = &diff.rendered
             {
+                let index = diff.index(view.location.diff_presentation);
+                if diff.mapped_rendering()
+                    && !view.location.manual_viewport
+                    && let Some(selection) = view.location.diff_selection.rows(index)
+                {
+                    if *selection.start() < view.location.scroll {
+                        view.location.scroll = *selection.start();
+                    }
+                    if content_height > 0
+                        && let Some(row) = view.location.diff_selection.row()
+                        && row >= view.location.scroll + content_height
+                    {
+                        view.location.scroll = row + 1 - content_height;
+                    }
+                }
                 view.location.scroll = view
                     .location
                     .scroll
@@ -383,20 +398,51 @@ impl Session {
                 for row in rendered
                     .rows
                     .iter()
+                    .enumerate()
                     .skip(view.location.scroll)
                     .take(content_height)
                 {
+                    let (number, row) = row;
+                    let selected = active
+                        && diff.mapped_rendering()
+                        && view.location.diff_selection.contains(index, number);
                     let mut spans = row.spans.clone();
+                    if selected {
+                        for span in &mut spans {
+                            span.base_style = Some(std::mem::take(&mut span.style));
+                            span.style = "diff.selection".into();
+                        }
+                    }
                     skip_columns(&mut spans, view.location.horizontal_scroll);
                     rows.push(FrameRow {
-                        spans: align_row(spans, &[], "", &layout.layout(0, width)),
+                        spans: align_row(
+                            spans,
+                            &[],
+                            if selected { "diff.selection" } else { "" },
+                            &layout.layout(0, width),
+                        ),
                     });
                 }
-                context["mode"] = json!("browse");
-                context["selection_count"] = json!(0);
-                context["source_position"] = json!({"old_line": null, "new_line": null});
-                context["old_line"] = Value::Null;
-                context["new_line"] = Value::Null;
+                let position = diff
+                    .mapped_rendering()
+                    .then(|| view.location.diff_selection.row())
+                    .flatten()
+                    .and_then(|row| index.rows.get(row));
+                let old = position.and_then(|row| row.old_line);
+                let new = position.and_then(|row| row.new_line);
+                context["mode"] = json!(if diff.mapped_rendering() {
+                    match view.location.diff_selection {
+                        diff::Selection::Block { .. } => "hunk",
+                        diff::Selection::Line { .. } => "line",
+                        diff::Selection::Range { .. } => "range",
+                    }
+                } else {
+                    "browse"
+                });
+                context["selection_count"] = json!(usize::from(position.is_some()));
+                context["source_position"] = json!({"old_line": old, "new_line": new});
+                context["old_line"] = json!(old);
+                context["new_line"] = json!(new);
             } else {
                 let selection = view.location.diff_selection.rows(&diff.index);
                 if !view.location.manual_viewport {

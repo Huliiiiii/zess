@@ -11,9 +11,13 @@ mod tests;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DiffRenderOptions {
     pub width: Option<usize>,
+    pub pager: Option<String>,
+    #[serde(default)]
+    pub file_header: bool,
 }
 
 pub struct DiffRenderer {
+    file_header: bool,
     width: Option<usize>,
     pager: Option<String>,
     external: bool,
@@ -31,6 +35,18 @@ impl Repository {
             options.width.is_none_or(|width| width > 0),
             "diff width must be positive"
         );
+        cancellation.check()?;
+        if let Some(pager) = &options.pager {
+            anyhow::ensure!(!pager.trim().is_empty(), "diff pager must not be empty");
+            return Ok(DiffRenderer {
+                file_header: options.file_header,
+                width: options.width,
+                pager: (pager.trim() != "cat").then(|| pager.clone()),
+                external: false,
+                textconv_drivers: HashSet::new(),
+                external_drivers: HashSet::new(),
+            });
+        }
         let mut command = Command::new("git");
         command
             .args([
@@ -102,6 +118,7 @@ impl Repository {
             std::env::var("PAGER").ok(),
         );
         Ok(DiffRenderer {
+            file_header: options.file_header,
             width: options.width,
             pager: pager.filter(|pager| !pager.trim().is_empty() && pager.trim() != "cat"),
             external,
@@ -199,6 +216,7 @@ impl DiffRenderer {
         };
         let Some(pager) = &self.pager else {
             return Ok(Some(RenderedDiff {
+                file_header: self.file_header,
                 text,
                 repository_root,
             }));
@@ -229,6 +247,7 @@ impl DiffRenderer {
             );
         }
         Ok(Some(RenderedDiff {
+            file_header: self.file_header,
             text: String::from_utf8(output.stdout).context("Git diff pager output is not UTF-8")?,
             repository_root,
         }))

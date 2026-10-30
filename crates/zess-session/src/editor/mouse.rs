@@ -288,16 +288,17 @@ impl Session {
                         let view = self.views.get_mut(&id).unwrap();
                         let row = match presentation {
                             diff::Presentation::Raw => Some(row),
-                            diff::Presentation::Rendered => diff
-                                .raw_row(presentation, row)
-                                .filter(|_| diff.mapped_rendering())
-                                .or_else(|| diff.raw_selection_at_rendered(row).row()),
+                            diff::Presentation::Rendered if diff.mapped_rendering() => Some(row),
+                            diff::Presentation::Rendered => {
+                                diff.raw_selection_at_rendered(row).row()
+                            }
                         };
                         if let Some(row) = row
-                            && view
-                                .location
-                                .diff_selection
-                                .select_at(&diff.index, row, extend)
+                            && view.location.diff_selection.select_at(
+                                diff.index(view.location.diff_presentation),
+                                row,
+                                extend,
+                            )
                         {
                             view.location.manual_viewport = false;
                         }

@@ -96,46 +96,14 @@ impl Workspace {
                 source,
                 files,
                 render,
-            } => {
-                let repository = zess_git::Repository::open(&self.root)?;
-                let renderer = repository.diff_renderer(render, cancellation)?;
-                let mut diffs = Vec::with_capacity(files.len());
-                for target in files {
-                    cancellation.check()?;
-                    let raw = match source {
-                        zess_git::DiffSource::Changes { side } => repository.diff(
-                            &target.path,
-                            target.original_path.as_deref(),
-                            Some(*side),
-                            cancellation,
-                        )?,
-                        zess_git::DiffSource::Commit { commit } => repository.commit_diff(
-                            commit,
-                            &target.path,
-                            target.original_path.as_deref(),
-                            cancellation,
-                        )?,
-                    };
-                    diffs.push(zess_git::FileDiff {
-                        target: target.clone(),
-                        rendered: renderer.render(
-                            &repository,
-                            source,
-                            target,
-                            &raw,
-                            cancellation,
-                        )?,
-                        raw,
-                    });
-                }
-                cancellation.check()?;
-                Ok(QueryResult::GitDiff {
-                    diff: zess_git::GitDiff {
-                        source: source.clone(),
-                        files: diffs,
-                    },
-                })
-            }
+            } => Ok(QueryResult::GitDiff {
+                diff: zess_git::Repository::open(&self.root)?.diff_files(
+                    source,
+                    files,
+                    render,
+                    cancellation,
+                )?,
+            }),
             QueryRequest::Log {} => Ok(QueryResult::Log {
                 commits: zess_git::Repository::open(&self.root)?.log(cancellation)?,
             }),

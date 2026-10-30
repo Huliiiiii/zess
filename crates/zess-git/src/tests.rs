@@ -171,6 +171,81 @@ impl Execution for Execute {
 }
 
 #[test]
+fn explicit_pager_renders_the_same_patch_as_the_operation_after_worktree_changes() {
+    use std::cell::Cell;
+
+    struct ChangeAfterDiff<'a> {
+        path: &'a std::path::Path,
+        changed: Cell<bool>,
+    }
+
+    impl Execution for ChangeAfterDiff<'_> {
+        fn check(&self) -> anyhow::Result<()> {
+            Execute.check()
+        }
+
+        fn output(&self, command: &mut Command) -> anyhow::Result<std::process::Output> {
+            let raw_diff = command.get_args().any(|arg| arg == "--no-ext-diff");
+            let output = Execute.output(command)?;
+            if raw_diff && !self.changed.replace(true) {
+                fs::write(self.path, "worktree B\n")?;
+            }
+            Ok(output)
+        }
+
+        fn output_with_input(
+            &self,
+            command: &mut Command,
+            input: &[u8],
+        ) -> anyhow::Result<std::process::Output> {
+            Execute.output_with_input(command, input)
+        }
+    }
+
+    let repo = Repository::new();
+    repo.commit("baseline\n");
+    fs::write(repo.0.join("file"), "worktree A\n").unwrap();
+    repo.git(&["config", "diff.external", "false"]);
+    let expected = repo.git(&[
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--no-renames",
+        "--",
+        "file",
+    ]);
+    let file = repo.0.join("file");
+    let execution = ChangeAfterDiff {
+        path: &file,
+        changed: Cell::new(false),
+    };
+    let diff = crate::Repository::open(&repo.0)
+        .unwrap()
+        .diff_files(
+            &crate::DiffSource::Changes {
+                side: DiffSide::Unstaged,
+            },
+            &[crate::DiffTarget {
+                path: "file".into(),
+                original_path: None,
+            }],
+            &crate::DiffRenderOptions {
+                pager: Some("sed -n p".into()),
+                ..Default::default()
+            },
+            &execution,
+        )
+        .unwrap();
+
+    assert!(execution.changed.get());
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].raw, expected);
+    assert_eq!(diff.files[0].rendered.as_ref().unwrap().text, expected);
+    assert_eq!(fs::read_to_string(file).unwrap(), "worktree B\n");
+}
+
+#[test]
 fn configured_external_renderers_do_not_change_the_patch_used_for_staging() {
     let repo = Repository::new();
     repo.commit("old\n");

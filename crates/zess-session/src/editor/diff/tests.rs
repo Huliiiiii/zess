@@ -16,6 +16,7 @@ fn delta_side_by_side_output_maps_both_change_blocks_to_the_original_patch() {
                 },
                 raw: include_str!("tests/fixtures/delta-0.20.1-side-by-side.diff").into(),
                 rendered: Some(zess_git::RenderedDiff {
+                    file_header: false,
                     text: include_str!("tests/fixtures/delta-0.20.1-side-by-side.ansi").into(),
                     repository_root: "/workspace".into(),
                 }),
@@ -54,6 +55,7 @@ fn rendered_diff(raw: &str, rendered: &str) -> Diff {
                 },
                 raw: raw.into(),
                 rendered: Some(zess_git::RenderedDiff {
+                    file_header: false,
                     text: rendered.into(),
                     repository_root: "/workspace".into(),
                 }),
@@ -126,28 +128,271 @@ fn rendered_changes_select_all_their_patch_lines_and_wrapped_rows_share_a_block(
 }
 
 #[test]
-fn incomplete_or_inconsistent_metadata_keeps_the_raw_diff_for_actions() {
+fn hidden_context_and_partial_blocks_still_select_the_complete_original_block() {
+    let raw = "diff --git a/file;name b/file;name\n--- a/file;name\n+++ b/file;name\n@@ -1,3 +1,3 @@\n first\n-old\n+new\n last\n";
+    let diff = rendered_diff(raw, "\x1b]1717;1;d;2;2;file;name\x07old\n");
+    assert!(diff.mapped_rendering());
+    let index = diff.index(Presentation::Rendered);
+    let (file, rows) = diff
+        .selected_patch_rows(Presentation::Rendered, &index.initial_selection())
+        .unwrap();
+    assert_eq!(
+        RawPatch::parse(&file.raw)
+            .unwrap()
+            .selection(zess_git::DiffSide::Unstaged, &rows)
+            .unwrap(),
+        "--- a/file;name\n+++ b/file;name\n@@ -1,3 +1,3 @@\n first\n-old\n+new\n last\n"
+    );
+}
+
+#[test]
+fn malformed_metadata_keeps_the_raw_diff_for_actions() {
     let raw = "@@ -1 +1 @@\n-old\n+new\n";
-    for rendered in [
-        "\x1b]1717;1;d;1;1;file;name\x07old\nnew without identity\n",
-        "\x1b]1717;1;d;1;1;another-file\x07old\n\x1b]1717;1;a;1;;file;name\x07new\n",
-        "\x1b]1717;1;d;0;1;file;name\x07old\n\x1b]1717;1;a;1;;file;name\x07new\n",
-        "\x1b]1717;1;f;;;file;name\x07\x1b]1717;1;h;1;;file;name\x07header only\n",
+    let diff = rendered_diff(
+        raw,
         "\x1b]1717;1;d;1;;file;name\x07old\n\x1b]1717;1;a;1;;file;name\x07new\n",
+    );
+    assert!(!diff.mapped_rendering());
+    assert_eq!(diff.index(Presentation::Raw).rows.len(), 3);
+    assert!(
+        diff.selected_patch_rows(Presentation::Rendered, &diff.index.initial_selection())
+            .is_err()
+    );
+}
+
+#[test]
+fn unresolved_or_ambiguous_change_identities_reject_the_selected_patch() {
+    for (raw, rendered) in [
+        (
+            "@@ -1 +1 @@\n-old\n+new\n",
+            "\x1b]1717;1;d;1;1;another-file\x07old\n\x1b]1717;1;a;1;;file;name\x07new\n",
+        ),
+        (
+            "@@ -1 +1 @@\n-old\n+new\n",
+            "\x1b]1717;1;d;0;1;file;name\x07old\n\x1b]1717;1;a;1;;file;name\x07new\n",
+        ),
+        (
+            "@@ -1 +1 @@\n-old\n+new\n@@ -1 +1 @@\n-old\n+new\n",
+            "\x1b]1717;1;d;1;1;file;name\x07old\n\x1b]1717;1;a;1;;file;name\x07new\n",
+        ),
     ] {
         let diff = rendered_diff(raw, rendered);
-        assert!(!diff.mapped_rendering(), "{rendered:?}");
-        assert_eq!(diff.index(Presentation::Raw).rows.len(), 3);
+        assert!(diff.mapped_rendering(), "{rendered:?}");
         assert!(
-            diff.selected_patch_rows(Presentation::Rendered, &diff.index.initial_selection())
-                .is_err()
+            diff.selected_patch_rows(
+                Presentation::Rendered,
+                &diff.index(Presentation::Rendered).initial_selection()
+            )
+            .is_err(),
+            "{rendered:?}"
         );
     }
-    let ambiguous = rendered_diff(
-        "@@ -1 +1 @@\n-old\n+new\n@@ -1 +1 @@\n-old\n+new\n",
-        "\x1b]1717;1;d;1;1;file;name\x07old\n\x1b]1717;1;a;1;;file;name\x07new\n",
+}
+
+#[test]
+fn metadata_titles_and_unknown_records_never_become_selectable() {
+    let diff = rendered_diff(
+        "@@ -1 +1 @@\n-old\n+new\n",
+        concat!(
+            "\x1b]1717;1;f;;;file;name\x07\x1b]1717;1;h;1;;file;name\x07header only\n",
+            "\x1b]1717;1;x;future;;unrelated\x07unknown only\n",
+        ),
     );
-    assert!(!ambiguous.mapped_rendering());
+    assert!(diff.mapped_rendering());
+    let index = diff.index(Presentation::Rendered);
+    let mut selection = index.initial_selection();
+    assert!(!selection.select_at(index, 0, false));
+    assert!(!selection.select_at(index, 1, false));
+    assert!(
+        diff.selected_patch_rows(Presentation::Rendered, &selection)
+            .is_err()
+    );
+}
+
+#[test]
+fn a_split_display_block_excludes_interleaved_changes_from_highlighting_and_staging() {
+    let diff = rendered_diff(
+        "diff --git a/file;name b/file;name\n--- a/file;name\n+++ b/file;name\n@@ -1,3 +1,3 @@\n-old\n+new\n middle\n-last\n+next\n",
+        concat!(
+            "\x1b]1717;1;d;1;1;file;name\x07old\n",
+            "\x1b]1717;1;d;3;3;file;name\x07\x1b]1717;1;a;3;;file;name\x07last -> next\n",
+            "\x1b]1717;1;a;1;;file;name\x07new\n",
+        ),
+    );
+    let index = diff.index(Presentation::Rendered);
+    let selection = index.initial_selection();
+    assert_eq!(
+        (0..3)
+            .map(|row| selection.contains(index, row))
+            .collect::<Vec<_>>(),
+        [true, false, true]
+    );
+    let (file, rows) = diff
+        .selected_patch_rows(Presentation::Rendered, &selection)
+        .unwrap();
+    assert_eq!(
+        RawPatch::parse(&file.raw)
+            .unwrap()
+            .selection(zess_git::DiffSide::Unstaged, &rows)
+            .unwrap(),
+        "--- a/file;name\n+++ b/file;name\n@@ -1,3 +1,3 @@\n-old\n+new\n middle\n last\n"
+    );
+}
+
+#[test]
+fn hunk_navigation_keeps_change_order_from_a_later_display_fragment() {
+    let diff = rendered_diff(
+        "@@ -1,3 +1,3 @@\n-old\n+new\n middle\n-last\n+next\n",
+        concat!(
+            "\x1b]1717;1;d;1;1;file;name\x07old\n",
+            "\x1b]1717;1;d;3;3;file;name\x07\x1b]1717;1;a;3;;file;name\x07last -> next\n",
+            "\x1b]1717;1;a;1;;file;name\x07new\n",
+        ),
+    );
+    let index = diff.index(Presentation::Rendered);
+    let mut selection = index.initial_selection();
+    assert!(selection.select_at(index, 2, false));
+    selection.move_by(index, false, false);
+    assert_eq!(selection.row(), Some(2));
+    selection.move_by(index, true, false);
+    assert_eq!(selection.row(), Some(1));
+    selection.move_by(index, false, false);
+    assert_eq!(selection.rows(index), Some(0..=2));
+    assert!(!selection.contains(index, 1));
+    selection.move_to(index, 2);
+    assert_eq!(selection.row(), Some(2));
+    selection.move_by(index, true, false);
+    assert_eq!(selection.row(), Some(1));
+}
+
+#[test]
+fn one_display_line_selects_every_complete_change_block_it_represents() {
+    let diff = rendered_diff(
+        "diff --git a/file;name b/file;name\n--- a/file;name\n+++ b/file;name\n@@ -1,3 +1,3 @@\n-old\n+new\n middle\n-last\n+next\n",
+        concat!(
+            "\x1b]1717;1;d;1;1;file;name\x07old\n",
+            "\x1b]1717;1;a;1;;file;name\x07\x1b]1717;1;d;3;3;file;name\x07new / last\n",
+            "\x1b]1717;1;a;3;;file;name\x07next\n",
+        ),
+    );
+    let index = diff.index(Presentation::Rendered);
+    let selection = index.initial_selection();
+    assert_eq!(
+        (0..3)
+            .map(|row| selection.contains(index, row))
+            .collect::<Vec<_>>(),
+        [true, true, true]
+    );
+    let (file, rows) = diff
+        .selected_patch_rows(Presentation::Rendered, &selection)
+        .unwrap();
+    assert_eq!(
+        RawPatch::parse(&file.raw)
+            .unwrap()
+            .selection(zess_git::DiffSide::Unstaged, &rows)
+            .unwrap(),
+        "--- a/file;name\n+++ b/file;name\n@@ -1,3 +1,3 @@\n-old\n+new\n middle\n-last\n+next\n"
+    );
+}
+
+#[test]
+fn resizing_preserves_the_original_block_when_its_display_rows_are_interleaved() {
+    let raw = "diff --git a/file;name b/file;name\n--- a/file;name\n+++ b/file;name\n@@ -1,3 +1,3 @@\n-old\n+new\n middle\n-last\n+next\n";
+    let old = rendered_diff(
+        raw,
+        concat!(
+            "\x1b]1717;1;d;1;1;file;name\x07\x1b]1717;1;a;1;;file;name\x07old -> new\n",
+            "\x1b]1717;1;d;3;3;file;name\x07\x1b]1717;1;a;3;;file;name\x07last -> next\n",
+        ),
+    );
+    let new = rendered_diff(
+        raw,
+        concat!(
+            "\x1b]1717;1;d;1;1;file;name\x07old\n",
+            "\x1b]1717;1;d;3;3;file;name\x07\x1b]1717;1;a;3;;file;name\x07last -> next\n",
+            "\x1b]1717;1;a;1;;file;name\x07new\n",
+        ),
+    );
+    let mut selection = old.index(Presentation::Rendered).initial_selection();
+    assert!(!selection.reconcile(&old, &new, Presentation::Rendered, Presentation::Rendered));
+    let index = new.index(Presentation::Rendered);
+    assert_eq!(
+        (0..3)
+            .map(|row| selection.contains(index, row))
+            .collect::<Vec<_>>(),
+        [true, false, true]
+    );
+    let (file, rows) = new
+        .selected_patch_rows(Presentation::Rendered, &selection)
+        .unwrap();
+    assert_eq!(
+        RawPatch::parse(&file.raw)
+            .unwrap()
+            .selection(zess_git::DiffSide::Unstaged, &rows)
+            .unwrap(),
+        "--- a/file;name\n+++ b/file;name\n@@ -1,3 +1,3 @@\n-old\n+new\n middle\n last\n"
+    );
+}
+
+#[test]
+fn refreshing_after_staging_moves_the_selection_to_a_remaining_change_block() {
+    let old = rendered_diff(
+        "@@ -1,3 +1,3 @@\n-old\n+new\n middle\n-last\n+next\n",
+        "unsupported renderer\n",
+    );
+    let new = rendered_diff(
+        "@@ -1,3 +1,3 @@\n new\n middle\n-last\n+next\n",
+        "unsupported renderer\n",
+    );
+    let mut selection = old.index.initial_selection();
+    assert!(!selection.reconcile(&old, &new, Presentation::Raw, Presentation::Raw));
+    assert!(matches!(selection, Selection::Block { .. }));
+    assert_eq!(selection.rows(&new.index), Some(3..=4));
+    let (_, rows) = new
+        .selected_patch_rows(Presentation::Raw, &selection)
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|rows| (rows.start().0, rows.end().0))
+            .collect::<Vec<_>>(),
+        [(3, 4)]
+    );
+}
+
+#[test]
+fn a_valid_identity_cannot_hide_an_unresolved_identity_on_the_same_line() {
+    let diff = rendered_diff(
+        "@@ -1 +1 @@\n-old\n+new\n",
+        "\x1b]1717;1;d;1;1;file;name\x07\x1b]1717;1;a;99;;file;name\x07old -> unknown\n",
+    );
+    let index = diff.index(Presentation::Rendered);
+    let mut selection = Selection::Line { head: None };
+    assert!(selection.select_at(index, 0, false));
+    assert!(
+        diff.selected_patch_rows(Presentation::Rendered, &selection)
+            .is_err()
+    );
+}
+
+#[test]
+fn an_unresolved_identity_between_valid_range_endpoints_rejects_the_entire_selection() {
+    let diff = rendered_diff(
+        "@@ -1 +1 @@\n-old\n+new\n",
+        concat!(
+            "\x1b]1717;1;d;1;1;file;name\x07old\n",
+            "\x1b]1717;1;a;99;;file;name\x07unknown\n",
+            "\x1b]1717;1;a;1;;file;name\x07new\n",
+        ),
+    );
+    let index = diff.index(Presentation::Rendered);
+    let mut selection = Selection::Line { head: None };
+    assert!(selection.select_at(index, 0, false));
+    assert!(selection.select_at(index, 2, true));
+    assert!(selection.contains(index, 1));
+    assert!(
+        diff.selected_patch_rows(Presentation::Rendered, &selection)
+            .is_err()
+    );
 }
 
 #[test]
@@ -161,7 +406,14 @@ fn absolute_metadata_paths_resolve_against_the_renderer_working_directory() {
         "@@ -0,0 +1 @@\n+new\n",
         "\x1b]1717;1;a;1;;/another/file;name\x07new\n",
     );
-    assert!(!diff.mapped_rendering());
+    assert!(diff.mapped_rendering());
+    assert!(
+        diff.selected_patch_rows(
+            Presentation::Rendered,
+            &diff.index(Presentation::Rendered).initial_selection()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -179,6 +431,7 @@ fn repository_relative_metadata_resolves_in_a_subdirectory_workspace() {
                     },
                     raw: "@@ -0,0 +1 @@\n+new\n".into(),
                     rendered: Some(zess_git::RenderedDiff {
+                        file_header: false,
                         text: format!(
                             "\x1b]1717;1;x;future;;unrelated\x07\x1b]1717;1;a;1;;{path}\x07new\n"
                         ),
@@ -263,6 +516,52 @@ fn a_layout_change_requires_reselection_when_the_same_lines_cannot_be_selected_e
 }
 
 #[test]
+fn unrelated_hunk_updates_still_require_reselection_when_the_layout_cannot_preserve_selected_lines()
+{
+    let raw = "diff --git a/file;name b/file;name\n--- a/file;name\n+++ b/file;name\n@@ -1,2 +1,2 @@\n-old one\n-old two\n+new one\n+new two\n";
+    let rendered = rendered_diff(
+        &format!("{raw}@@ -20 +20 @@\n-before\n+after\n"),
+        concat!(
+            "\x1b]1717;1;d;1;1;file;name\x07\x1b]1717;1;a;1;;file;name\x07first pair\n",
+            "\x1b]1717;1;d;1;2;file;name\x07\x1b]1717;1;a;2;;file;name\x07second pair\n",
+        ),
+    );
+    let plain = rendered_diff(
+        &format!("{raw}@@ -20 +20 @@\n-before\n+updated\n"),
+        "unsupported renderer\n",
+    );
+    let mut selection = Selection::Line { head: None };
+    assert!(selection.select_at(rendered.index(Presentation::Rendered), 0, false));
+    assert!(selection.reconcile(&rendered, &plain, Presentation::Rendered, Presentation::Raw));
+    assert!(selection.row().is_none());
+    assert!(
+        plain
+            .selected_patch_rows(Presentation::Raw, &selection)
+            .is_err()
+    );
+}
+
+#[test]
+fn refreshing_an_unresolved_selection_requires_reselection_instead_of_preserving_its_valid_half() {
+    let old = rendered_diff(
+        "@@ -1 +1 @@\n-old\n+new\n",
+        "\x1b]1717;1;d;1;1;file;name\x07\x1b]1717;1;a;99;;file;name\x07old -> unknown\n",
+    );
+    let new = rendered_diff(
+        "@@ -1 +1 @@\n-old\n+new\n@@ -20 +20 @@\n-before\n+after\n",
+        "unsupported renderer\n",
+    );
+    let mut selection = Selection::Line { head: None };
+    assert!(selection.select_at(old.index(Presentation::Rendered), 0, false));
+    assert!(selection.reconcile(&old, &new, Presentation::Rendered, Presentation::Raw));
+    assert!(selection.row().is_none());
+    assert!(
+        new.selected_patch_rows(Presentation::Raw, &selection)
+            .is_err()
+    );
+}
+
+#[test]
 fn rendered_selections_cannot_stage_changes_from_multiple_files() {
     let diff = Diff::from_git(
         zess_git::GitDiff {
@@ -278,6 +577,7 @@ fn rendered_selections_cannot_stage_changes_from_multiple_files() {
                     },
                     raw: "@@ -0,0 +1 @@\n+new\n".into(),
                     rendered: Some(zess_git::RenderedDiff {
+                        file_header: false,
                         text: format!("\x1b]1717;1;a;1;;{path}\x07new\n"),
                         repository_root: "/workspace".into(),
                     }),
@@ -701,6 +1001,7 @@ fn refreshing_external_output_keeps_the_browsed_file_after_reordering() {
                         },
                         raw: "@@ -1 +1 @@\n-before\n+after\n".into(),
                         rendered: Some(zess_git::RenderedDiff {
+                            file_header: false,
                             text: (*rendered).into(),
                             repository_root: "/workspace".into(),
                         }),

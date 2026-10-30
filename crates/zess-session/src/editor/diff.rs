@@ -47,6 +47,7 @@ pub(super) struct DiffIndex {
     pub rows: Vec<Row>,
     selectable: Vec<SelectableRow>,
     pub blocks: Vec<RangeInclusive<usize>>,
+    block_raw_rows: Vec<Vec<usize>>,
 }
 
 impl Diff {
@@ -93,60 +94,89 @@ impl Diff {
             rows: Vec::new(),
             selectable: Vec::new(),
             blocks: Vec::new(),
+            block_raw_rows: Vec::new(),
         };
         let mut raw_rows = Vec::new();
-        let mut covered = vec![false; self.index.rows.len()];
-        let mut blocks: Vec<Option<RangeInclusive<usize>>> = vec![None; self.index.blocks.len()];
+        let mut row_blocks = Vec::new();
+        let mut groups: Vec<usize> = (0..self.index.blocks.len()).collect();
         let mut offset = 0;
         for (display_row, line) in rendered.text.split_inclusive('\n').enumerate() {
             let file = *rendered.files.get(display_row)?;
             let mut mapped = Vec::new();
+            let mut kind = None;
+            let mut mapping_failed = false;
             for metadata in &rendered.metadata[display_row] {
-                let path = Path::new(&metadata.path);
-                let path = if path.is_absolute() {
-                    path.to_owned()
-                } else {
-                    self.files[file.0]
-                        .rendered
-                        .as_ref()?
-                        .repository_root
-                        .join(path)
+                let line_kind = match metadata.kind {
+                    DiffLineKind::File | DiffLineKind::Hunk => continue,
+                    DiffLineKind::Context => LineKind::Context,
+                    DiffLineKind::Addition => LineKind::Addition,
+                    DiffLineKind::Deletion => LineKind::Deletion,
                 };
-                let mut normalized = std::path::PathBuf::new();
-                for component in path.components() {
-                    match component {
-                        Component::Normal(part) => normalized.push(part),
-                        Component::RootDir => normalized.push(component.as_os_str()),
-                        Component::CurDir => {}
-                        _ => return None,
+                kind.get_or_insert(line_kind);
+                let raw_row = (|| {
+                    let path = Path::new(&metadata.path);
+                    let path = if path.is_absolute() {
+                        path.to_owned()
+                    } else {
+                        self.files[file.0]
+                            .rendered
+                            .as_ref()?
+                            .repository_root
+                            .join(path)
+                    };
+                    let mut normalized = std::path::PathBuf::new();
+                    for component in path.components() {
+                        match component {
+                            Component::Normal(part) => normalized.push(part),
+                            Component::RootDir => normalized.push(component.as_os_str()),
+                            Component::CurDir => {}
+                            _ => return None,
+                        }
+                    }
+                    if normalized != workspace.join(&self.files[file.0].target.path) {
+                        return None;
+                    }
+                    *identities.get(&(
+                        file.0,
+                        metadata.kind.clone(),
+                        metadata.new_line?,
+                        metadata.old_line,
+                    ))?
+                })();
+                if let Some(raw_row) = raw_row {
+                    if !mapped.contains(&raw_row) {
+                        mapped.push(raw_row);
+                    }
+                } else {
+                    mapping_failed = true;
+                }
+            }
+            let mut blocks = mapped
+                .iter()
+                .filter_map(|row| self.index.rows[*row].block)
+                .collect::<Vec<_>>();
+            blocks.sort_unstable();
+            blocks.dedup();
+            // A display line is indivisible. Its hunk includes every complete
+            // raw block represented on that line, including shared wrapped rows.
+            if let Some((first, remaining)) = blocks.split_first() {
+                let group = groups[*first];
+                for block in remaining {
+                    let previous = groups[*block];
+                    if previous == group {
+                        continue;
+                    }
+                    for candidate in &mut groups {
+                        if *candidate == previous {
+                            *candidate = group;
+                        }
                     }
                 }
-                if normalized != workspace.join(&self.files[file.0].target.path) {
-                    return None;
-                }
-                match metadata.kind {
-                    DiffLineKind::File | DiffLineKind::Hunk => continue,
-                    DiffLineKind::Context | DiffLineKind::Addition | DiffLineKind::Deletion => {}
-                }
-                let raw_row = (*identities.get(&(
-                    file.0,
-                    metadata.kind.clone(),
-                    metadata.new_line?,
-                    metadata.old_line,
-                ))?)?;
-                if !mapped.contains(&raw_row) {
-                    mapped.push(raw_row);
-                }
-                covered[raw_row] = true;
+            } else if mapping_failed {
+                blocks.push(groups.len());
+                groups.push(groups.len());
             }
             let first = mapped.first().map(|row| &self.index.rows[*row]);
-            let block = first.and_then(|row| row.block);
-            if mapped
-                .iter()
-                .any(|row| self.index.rows[*row].block != block)
-            {
-                return None;
-            }
             let row = Row {
                 bytes: offset..offset + line.len(),
                 file: Some(file),
@@ -158,45 +188,41 @@ impl Diff {
                     .iter()
                     .rev()
                     .find_map(|row| self.index.rows[*row].source_line),
-                kind: first.and_then(|row| row.kind),
+                kind,
                 hunk: first.and_then(|row| row.hunk),
-                block,
+                block: None,
+                mapping_failed,
             };
             if row.is_selectable() {
                 index.selectable.push(SelectableRow(display_row));
             }
-            if let Some(block) = block {
-                let start = blocks[block]
-                    .as_ref()
-                    .map_or(display_row, |range| *range.start());
-                blocks[block] = Some(start..=display_row);
-            }
             index.rows.push(row);
             raw_rows.push(mapped);
+            row_blocks.push(blocks);
             offset += line.len();
         }
-        if self
-            .index
-            .rows
-            .iter()
-            .enumerate()
-            .any(|(row, metadata)| metadata.is_selectable() && !covered[row])
-        {
-            return None;
+        let mut group_raw_rows = vec![Vec::new(); groups.len()];
+        for (block, rows) in self.index.blocks.iter().enumerate() {
+            group_raw_rows[groups[block]].extend(
+                rows.clone()
+                    .filter(|row| self.index.rows[*row].is_selectable()),
+            );
         }
-        for (raw_block, block) in blocks.into_iter().enumerate() {
-            let block = block?;
-            if index
-                .blocks
-                .last()
-                .is_some_and(|previous| previous.end() >= block.start())
-                || index.rows[block.clone()]
-                    .iter()
-                    .any(|row| row.block.is_some_and(|block| block != raw_block))
-            {
-                return None;
-            }
-            index.blocks.push(block);
+        let mut display_groups = std::collections::HashMap::new();
+        for (display_row, blocks) in row_blocks.iter().enumerate() {
+            let Some(raw_block) = blocks.first() else {
+                continue;
+            };
+            let group = groups[*raw_block];
+            let block = *display_groups.entry(group).or_insert_with(|| {
+                index.blocks.push(display_row..=display_row);
+                index
+                    .block_raw_rows
+                    .push(std::mem::take(&mut group_raw_rows[group]));
+                index.blocks.len() - 1
+            });
+            index.rows[display_row].block = Some(block);
+            index.blocks[block] = *index.blocks[block].start()..=display_row;
         }
         Some((index, raw_rows))
     }
@@ -218,8 +244,11 @@ impl Diff {
         let index = self.index(presentation);
         let mut rows = Vec::new();
         for row in selection.rows(index)? {
-            if !index.rows[row].is_selectable() {
+            if !selection.contains(index, row) {
                 continue;
+            }
+            if index.rows[row].mapping_failed {
+                return None;
             }
             if presentation == Presentation::Rendered && self.mapped_rendering() {
                 rows.extend_from_slice(self.rendered.as_ref()?.raw_rows.get(row)?);
@@ -227,16 +256,15 @@ impl Diff {
                 rows.push(row);
             }
         }
+        if matches!(selection, Selection::Block { .. })
+            && presentation == Presentation::Rendered
+            && self.mapped_rendering()
+            && let Some(block) = selection.row().and_then(|row| index.rows[row].block)
+        {
+            rows = index.block_raw_rows[block].clone();
+        }
         rows.sort_unstable();
         rows.dedup();
-        if matches!(selection, Selection::Block { .. })
-            && let Some(block) = rows.first().and_then(|row| self.index.rows[*row].block)
-        {
-            rows = self.index.blocks[block]
-                .clone()
-                .filter(|row| self.index.rows[*row].is_selectable())
-                .collect();
-        }
         Some(rows)
     }
 
@@ -246,53 +274,15 @@ impl Diff {
         selection: &Selection,
     ) -> anyhow::Result<(&zess_git::FileDiff, Vec<RangeInclusive<PatchRow>>)> {
         use anyhow::{Context, ensure};
-        let index = self.index(presentation);
-        let range = selection
-            .rows(index)
-            .context("this diff has no selected text lines")?;
-        let mut raw_rows = Vec::new();
         if presentation == Presentation::Rendered {
-            let rendered = self
-                .rendered
-                .as_ref()
-                .context("diff has no rendered mapping")?;
             ensure!(
-                rendered.index.is_some(),
+                self.mapped_rendering(),
                 "diff has no reliable rendered mapping"
             );
-            for row in range {
-                if !index.rows[row].is_selectable() {
-                    continue;
-                }
-                let mapped = rendered
-                    .raw_rows
-                    .get(row)
-                    .context("selected row has no original patch mapping")?;
-                ensure!(
-                    !mapped.is_empty(),
-                    "selected row has no original patch mapping"
-                );
-                raw_rows.extend_from_slice(mapped);
-            }
-            if matches!(selection, Selection::Block { .. }) {
-                let raw = *raw_rows
-                    .first()
-                    .context("this diff has no selected text lines")?;
-                if let Some(block) = self.index.rows[raw].block {
-                    ensure!(
-                        raw_rows
-                            .iter()
-                            .all(|row| self.index.rows[*row].block == Some(block)),
-                        "selection spans unrelated change blocks"
-                    );
-                    raw_rows = self.index.blocks[block].clone().collect();
-                }
-            }
-        } else {
-            raw_rows.extend(range);
         }
-        raw_rows.sort_unstable();
-        raw_rows.dedup();
+        let raw_rows = self
+            .selection_raw_rows(presentation, selection)
+            .context("selected row has no reliable original patch mapping")?;
         let file = self
             .file_at(
                 *raw_rows
@@ -345,6 +335,7 @@ impl Diff {
                     kind: None,
                     hunk: None,
                     block: None,
+                    mapping_failed: false,
                 }
             })
             .collect::<Vec<_>>();
@@ -429,6 +420,7 @@ impl Diff {
                 rows,
                 selectable,
                 blocks,
+                block_raw_rows: Vec::new(),
             },
             hunks,
             width,
@@ -463,6 +455,29 @@ impl Diff {
                         .map(|rendered| rendered.text.as_str())
                         .unwrap_or(&patch.raw),
                 );
+                if patch
+                    .rendered
+                    .as_ref()
+                    .is_some_and(|rendered| rendered.file_header)
+                {
+                    let title = match &patch.target.original_path {
+                        Some(original) => format!("{original} → {}", patch.target.path),
+                        None => patch.target.path.clone(),
+                    };
+                    let title = display_line(&title);
+                    rendered.width = rendered.width.max(UnicodeWidthStr::width(title.as_str()));
+                    rendered.text.push_str(&title);
+                    rendered.text.push('\n');
+                    rendered.rows.push(FrameRow {
+                        spans: vec![zess_ui::Span {
+                            text: title,
+                            style: "ui.heading".into(),
+                            base_style: None,
+                        }],
+                    });
+                    rendered.files.push(FileIndex(file));
+                    rendered.metadata.push(Vec::new());
+                }
                 valid_metadata &= !text.invalid_diff_metadata;
                 for row in &text.rows {
                     for span in &row.spans {
@@ -808,6 +823,7 @@ pub(super) struct Row {
     pub kind: Option<LineKind>,
     pub hunk: Option<usize>,
     pub block: Option<usize>,
+    mapping_failed: bool,
 }
 
 impl Row {
@@ -865,6 +881,7 @@ impl Selection {
         };
     }
 
+    /// Display bounds for scrolling; use `contains` for exact membership.
     pub fn rows(&self, diff: &DiffIndex) -> Option<RangeInclusive<usize>> {
         let row = self.row()?;
         Some(match *self {
@@ -878,8 +895,15 @@ impl Selection {
     }
 
     pub fn contains(&self, diff: &DiffIndex, row: usize) -> bool {
-        diff.selectable_at(row).is_some()
-            && self.rows(diff).is_some_and(|range| range.contains(&row))
+        if diff.selectable_at(row).is_none() {
+            return false;
+        }
+        if matches!(self, Self::Block { .. })
+            && let Some(block) = self.row().and_then(|head| diff.rows[head].block)
+        {
+            return diff.rows[row].block == Some(block);
+        }
+        self.rows(diff).is_some_and(|range| range.contains(&row))
     }
 
     pub fn patch_rows(&self, diff: &DiffIndex) -> Option<RangeInclusive<PatchRow>> {
@@ -914,20 +938,20 @@ impl Selection {
             return;
         };
         if matches!(self, Self::Block { .. }) || force_block {
-            let current = diff.rows[row].block;
-            let target = if forward {
-                diff.blocks
-                    .iter()
-                    .enumerate()
-                    .find(|(i, block)| Some(*i) != current && *block.start() > row)
+            let target = if let Some(current) = diff.rows[row].block {
+                if forward {
+                    diff.blocks.get(current + 1)
+                } else {
+                    current
+                        .checked_sub(1)
+                        .and_then(|block| diff.blocks.get(block))
+                }
+            } else if forward {
+                diff.blocks.iter().find(|block| *block.start() > row)
             } else {
-                diff.blocks
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(i, block)| Some(*i) != current && *block.start() < row)
+                diff.blocks.iter().rev().find(|block| *block.start() < row)
             };
-            if let Some((_, block)) = target {
+            if let Some(block) = target {
                 self.set_head(diff.selectable_at(*block.start()));
             }
         } else {
@@ -954,12 +978,16 @@ impl Selection {
 
     pub fn move_to(&mut self, diff: &DiffIndex, row: usize) {
         self.set_head(if matches!(self, Self::Block { .. }) {
-            diff.blocks
-                .iter()
-                .find(|block| *block.end() >= row)
-                .or_else(|| diff.blocks.last())
-                .and_then(|block| diff.selectable_at(*block.start()))
-                .or_else(|| diff.nearest(row))
+            diff.selectable_at(row)
+                .filter(|head| diff.rows[head.0].block.is_some())
+                .or_else(|| {
+                    diff.blocks
+                        .iter()
+                        .find(|block| *block.end() >= row)
+                        .or_else(|| diff.blocks.last())
+                        .and_then(|block| diff.selectable_at(*block.start()))
+                        .or_else(|| diff.nearest(row))
+                })
         } else {
             diff.nearest(row)
         });
@@ -1036,6 +1064,11 @@ impl Selection {
         if matches!(self, Self::Line { head: None }) && !old_index.selectable.is_empty() {
             return false;
         }
+        let previous = old.selection_raw_rows(old_presentation, self);
+        if previous.is_none() && self.row().is_some() {
+            *self = Self::Line { head: None };
+            return true;
+        }
         let mut identities = std::collections::HashMap::new();
         for head in &new.index.selectable {
             let row = &new.index.rows[head.0];
@@ -1061,21 +1094,7 @@ impl Selection {
                 .copied()
                 .flatten()
         };
-        let project = |raw: usize, previous: usize| {
-            if new_presentation == Presentation::Rendered && new.mapped_rendering() {
-                new.rendered
-                    .as_ref()?
-                    .raw_rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, rows)| rows.contains(&raw))
-                    .min_by_key(|(row, _)| row.abs_diff(previous))
-                    .and_then(|(row, _)| new_index.selectable_at(row))
-            } else {
-                new_index.selectable_at(raw)
-            }
-        };
-        if let Some(previous) = old.selection_raw_rows(old_presentation, self)
+        if let Some(previous) = previous
             && !previous.is_empty()
             && let Some(mut raw_rows) = previous
                 .into_iter()
@@ -1147,6 +1166,24 @@ impl Selection {
             *self = Self::Line { head: None };
             return true;
         }
+        if old.raw == new.raw && self.row().is_some() {
+            *self = Self::Line { head: None };
+            return true;
+        }
+        let project = |raw: usize, previous: usize| {
+            if new_presentation == Presentation::Rendered && new.mapped_rendering() {
+                new.rendered
+                    .as_ref()?
+                    .raw_rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, rows)| rows.contains(&raw))
+                    .min_by_key(|(row, _)| row.abs_diff(previous))
+                    .and_then(|(row, _)| new_index.selectable_at(row))
+            } else {
+                new_index.selectable_at(raw)
+            }
+        };
         let map = |head: SelectableRow| {
             let raw = old.raw_row(old_presentation, head.0)?;
             let previous = &old.index.rows[raw];
