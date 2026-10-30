@@ -2,6 +2,7 @@ use super::*;
 
 mod diff_rendering;
 mod file_actions;
+mod file_mutations;
 mod grid;
 mod history;
 mod multi_file_diff;

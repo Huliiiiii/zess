@@ -3,7 +3,7 @@ use std::{cell::RefCell, rc::Rc, time::Duration};
 use zess_plugin::{ItemSelection, PluginContext};
 use zess_services::NativeServices;
 
-fn input() -> PluginInput {
+pub(super) fn input() -> PluginInput {
     PluginInput {
         buffer_id: 1,
         view_id: 1,

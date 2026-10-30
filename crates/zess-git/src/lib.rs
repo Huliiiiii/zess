@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+pub mod mutation;
 pub mod patch;
 mod renderer;
 pub use renderer::{DiffRenderOptions, DiffRenderer};
