@@ -65,6 +65,50 @@ fn file_previews_keep_keyboard_focus_in_the_browser() {
 }
 
 #[test]
+fn file_preview_wrap_is_enabled_by_default_and_can_be_disabled() {
+    let fixture = Fixture::new();
+    let content = "abcdefghijklmnopqrstuvwxyz".repeat(30);
+    fs::write(fixture.0.join("note.txt"), &content).unwrap();
+    let config = fixture.0.join("config.w");
+    fs::write(
+        &config,
+        "set-view-options! \"files\" : obj 'preview-wrap #f\n",
+    )
+    .unwrap();
+    for (config, wrap) in [(None, true), (Some(config.clone()), false)] {
+        let mut session = Session::new(fixture.0.clone(), &[], config).unwrap();
+        session.resize(80, 10);
+        session.command("files").unwrap();
+        settle(&mut session);
+        let source = session.focus;
+        session
+            .dispatch(source, "navigate", json!({"path":"note.txt"}))
+            .unwrap();
+        settle(&mut session);
+        let rows = preview_rows(&mut session, source);
+        let width = preview_surface(&session, source).viewport.width;
+        let text = |row: &FrameRow| {
+            row.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        };
+        assert_eq!(text(&rows[0]), content[..width]);
+        if wrap {
+            assert_eq!(text(&rows[1]), content[width..width * 2]);
+            session.input("J");
+            assert_eq!(preview_surface(&session, source).viewport.scroll, 1);
+            let rows = preview_rows(&mut session, source);
+            assert_eq!(text(&rows[0]), content[width..width * 2]);
+        } else {
+            assert!(rows[1].spans.is_empty());
+            session.input("J");
+            assert_eq!(preview_surface(&session, source).viewport.scroll, 0);
+        }
+    }
+}
+
+#[test]
 fn surface_mouse_events_belong_to_their_page_and_leave_file_selection_unchanged() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join("a.txt"), "first\n".repeat(60)).unwrap();
@@ -214,7 +258,7 @@ register-command "mixed" "Show a surface and an interactive preview"
 }
 
 #[test]
-fn replacement_contents_preserve_the_surface_viewport_until_the_content_limits_shrink() {
+fn unwrapped_previews_preserve_their_viewport_until_replacement_contents_shrink() {
     let fixture = Fixture::new();
     let content = |label| {
         (0..70)
@@ -223,7 +267,13 @@ fn replacement_contents_preserve_the_surface_viewport_until_the_content_limits_s
     };
     fs::write(fixture.0.join("a.txt"), content("a")).unwrap();
     fs::write(fixture.0.join("b.txt"), content("b")).unwrap();
-    let mut session = fixture.session(&[]);
+    let config = fixture.0.join("config.w");
+    fs::write(
+        &config,
+        "set-view-options! \"files\" : obj 'preview-wrap #f\n",
+    )
+    .unwrap();
+    let mut session = Session::new(fixture.0.clone(), &[], Some(config)).unwrap();
     session.command("files").unwrap();
     settle(&mut session);
     let source = session.focus;

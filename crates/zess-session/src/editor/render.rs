@@ -41,6 +41,15 @@ impl Session {
         if rect.width == 0 || rect.height == 0 {
             return Vec::new();
         }
+        let source = self.views.main(page);
+        let soft_wrap = matches!(
+            &self.buffers[&self.views[&source].location.buffer],
+            Buffer::Data { kind, .. } if kind == "files"
+        ) && self
+            .effective_view_options(source, "files")
+            .get("preview-wrap")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let Some(surface) = self.views.surface_mut(page, slot) else {
             return Vec::new();
         };
@@ -66,7 +75,12 @@ impl Session {
         }
         match self.buffers.get_mut(&buffer).unwrap() {
             Buffer::PreviewText { text, .. } => {
-                rows.extend(text.render_preview(&mut surface.viewport, rect.width, content_height));
+                rows.extend(text.render_preview(
+                    &mut surface.viewport,
+                    rect.width,
+                    content_height,
+                    soft_wrap,
+                ));
             }
             Buffer::PreviewRows { display, .. } => {
                 let viewport = &mut surface.viewport;

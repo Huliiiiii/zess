@@ -133,6 +133,7 @@ impl BuiltinPlugins {
                     serde_json::json!("files.toggle"),
                 ),
                 ("git-status".into(), serde_json::json!(true)),
+                ("preview-wrap".into(), serde_json::json!(true)),
                 ("default-yank-register".into(), serde_json::json!("+")),
             ]
             .into_iter()

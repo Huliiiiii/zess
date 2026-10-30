@@ -40,13 +40,13 @@ fn preview_painting_uses_only_the_viewport_and_leaves_editing_views_unallocated(
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        text(buffer.render_preview(&mut viewport, 10, 2)),
+        text(buffer.render_preview(&mut viewport, 10, 2, false)),
         ["    界a\u{301}🙂Z", "second"]
     );
     assert!(buffer.views.is_empty());
     viewport.scroll = 20;
     viewport.horizontal_scroll = 20;
-    let rows = buffer.render_preview(&mut viewport, 10, 2);
+    let rows = buffer.render_preview(&mut viewport, 10, 2, false);
     assert_eq!(viewport.scroll, 1);
     assert_eq!(viewport.horizontal_scroll, 10);
     assert!(
@@ -56,18 +56,196 @@ fn preview_painting_uses_only_the_viewport_and_leaves_editing_views_unallocated(
     );
     assert!(buffer.views.is_empty());
     buffer.replace_readonly("short").unwrap();
-    assert_eq!(text(buffer.render_preview(&mut viewport, 10, 2)), ["short"]);
+    assert_eq!(
+        text(buffer.render_preview(&mut viewport, 10, 2, false)),
+        ["short"]
+    );
     assert_eq!(viewport.scroll, 0);
     assert_eq!(viewport.horizontal_scroll, 0);
     assert!(buffer.views.is_empty());
     viewport.horizontal_scroll = 20;
     let mut replacement = TextBuffer::new("tiny");
     assert_eq!(
-        text(replacement.render_preview(&mut viewport, 10, 2)),
+        text(replacement.render_preview(&mut viewport, 10, 2, false)),
         ["tiny"]
     );
     assert_eq!(viewport.horizontal_scroll, 0);
     assert!(replacement.views.is_empty());
+}
+
+#[test]
+fn wrapped_previews_scroll_through_visual_lines_and_reflow_after_resize() {
+    let mut buffer = TextBuffer::new("abcdefghijklmnopqrstuvwx\ntail");
+    buffer.set_readonly(true);
+    let mut viewport = PreviewViewport::default();
+    let text = |rows: Vec<FrameRow>| {
+        rows.into_iter()
+            .map(|row| {
+                row.spans
+                    .into_iter()
+                    .map(|span| span.text)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        text(buffer.render_preview(&mut viewport, 8, 2, true)),
+        ["abcdefgh", "ijklmnop"]
+    );
+    let layout = buffer.preview_wrap.as_ref().unwrap();
+    assert_eq!(layout.rows.len(), 3);
+    assert!(!layout.complete);
+    viewport.scroll = 99;
+    viewport.horizontal_scroll = 99;
+    assert_eq!(
+        text(buffer.render_preview(&mut viewport, 8, 2, true)),
+        ["qrstuvwx", "tail"]
+    );
+    assert_eq!(viewport.scroll, 2);
+    assert_eq!(viewport.horizontal_scroll, 0);
+    assert_eq!(
+        text(buffer.render_preview(&mut viewport, 24, 2, true)),
+        ["abcdefghijklmnopqrstuvwx", "tail"]
+    );
+    assert_eq!(viewport.scroll, 0);
+    buffer.replace_readonly("short").unwrap();
+    assert_eq!(
+        text(buffer.render_preview(&mut viewport, 8, 2, true)),
+        ["short"]
+    );
+    assert!(buffer.views.is_empty());
+}
+
+#[test]
+fn wrapped_previews_preserve_graphemes_and_expand_tabs() {
+    let mut buffer = TextBuffer::new("\t界a\u{301}🙂z0123456789");
+    let mut viewport = PreviewViewport::default();
+    let rows = buffer.render_preview(&mut viewport, 8, 8, true);
+    let text = rows
+        .iter()
+        .map(|row| {
+            row.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        text.iter()
+            .all(|row| UnicodeWidthStr::width(row.as_str()) <= 8),
+        "{text:?}"
+    );
+    assert_eq!(text.concat(), "    界a\u{301}🙂z0123456789");
+    viewport.scroll = 0;
+    let rows = buffer.render_preview(&mut viewport, 8, 1, false);
+    assert_eq!(
+        rows[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>(),
+        "    界a\u{301} "
+    );
+}
+
+#[test]
+fn wrapped_previews_align_tabs_with_their_visual_line() {
+    let mut buffer = TextBuffer::new("aaaaaaa🙂\tZ");
+    let mut viewport = PreviewViewport::default();
+    let rows = buffer.render_preview(&mut viewport, 8, 3, true);
+    let text = rows
+        .iter()
+        .map(|row| {
+            row.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(text, ["aaaaaaa", "🙂  Z"]);
+}
+
+#[test]
+fn wrapped_previews_keep_text_after_tabs_and_wide_characters_in_narrow_viewports() {
+    let mut buffer = TextBuffer::new("\t界Z");
+    for width in [1, 2, 3] {
+        let mut viewport = PreviewViewport::default();
+        let rows = buffer.render_preview(&mut viewport, width, 12, true);
+        let text = rows
+            .iter()
+            .map(|row| {
+                row.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            text.iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= width)
+        );
+        assert!(text.concat().ends_with('Z'), "{width}: {text:?}");
+    }
+}
+
+#[test]
+fn wrapped_previews_preserve_empty_lines_and_the_final_line() {
+    let mut buffer = TextBuffer::new("abcd\n\n界e\u{301}🙂\n");
+    let mut viewport = PreviewViewport::default();
+    let text = |rows: Vec<FrameRow>| {
+        rows.into_iter()
+            .map(|row| {
+                row.spans
+                    .into_iter()
+                    .map(|span| span.text)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        text(buffer.render_preview(&mut viewport, 4, 2, true)),
+        ["abcd", ""]
+    );
+    viewport.scroll = 2;
+    assert_eq!(
+        text(buffer.render_preview(&mut viewport, 4, 2, true)),
+        ["界e\u{301}", "🙂"]
+    );
+    viewport.scroll = 99;
+    assert_eq!(
+        text(buffer.render_preview(&mut viewport, 4, 2, true)),
+        ["🙂", ""]
+    );
+    assert_eq!(viewport.scroll, 3);
+    viewport.scroll = 1;
+    assert_eq!(
+        text(buffer.render_preview(&mut viewport, 4, 3, true)),
+        ["", "界e\u{301}", "🙂"]
+    );
+}
+
+#[test]
+fn wrapped_previews_page_through_a_long_single_line_in_both_directions() {
+    let lines = (0..10_000)
+        .map(|index| format!("{index:05}界🙂e\u{301}|"))
+        .collect::<Vec<_>>();
+    let mut buffer = TextBuffer::new(&lines.concat());
+    let mut viewport = PreviewViewport::default();
+    for start in [0, 5000, 5001, 9997, 5000] {
+        viewport.scroll = start;
+        let rows = buffer.render_preview(&mut viewport, 11, 3, true);
+        let text = rows
+            .iter()
+            .map(|row| {
+                row.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text, lines[start..start + 3]);
+        assert_eq!(viewport.scroll, start);
+    }
 }
 
 #[test]

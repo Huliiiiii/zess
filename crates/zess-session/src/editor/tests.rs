@@ -833,7 +833,14 @@ fn preview_row(session: &mut Session) -> String {
 fn preview_horizontal_scroll_stops_at_the_content_edges() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join("note.txt"), "short\n").unwrap();
-    let mut session = fixture.session(&[]);
+    let configuration = Fixture::new();
+    let config = configuration.0.join("config.w");
+    fs::write(
+        &config,
+        "set-view-options! \"files\" : obj 'preview-wrap #f\n",
+    )
+    .unwrap();
+    let mut session = Session::new(fixture.0.clone(), &[], Some(config)).unwrap();
     session.command("files").unwrap();
     settle(&mut session);
     let initial = preview_row(&mut session);

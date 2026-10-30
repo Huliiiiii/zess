@@ -14,8 +14,8 @@ use helix_core::{
     Assoc, Range, Rope, Selection, SmallVec, Transaction, char_idx_at_visual_offset,
     chars::char_is_word,
     comment,
-    doc_formatter::TextFormat,
-    graphemes::{next_grapheme_boundary, prev_grapheme_boundary},
+    doc_formatter::{DocumentFormatter, FormattedGrapheme, TextFormat},
+    graphemes::{Grapheme, next_grapheme_boundary, prev_grapheme_boundary},
     history::{History, State},
     movement::{self, Direction, Movement},
     surround,
@@ -490,6 +490,7 @@ enum LanguageDetection {
 pub struct TextBuffer {
     rope: Rope,
     line_width: Option<(u64, usize, usize)>,
+    preview_wrap: Option<PreviewWrap>,
     path: Option<PathBuf>,
     version: u64,
     history: History,
@@ -510,6 +511,7 @@ impl TextBuffer {
         Self {
             rope: Rope::from_str(text),
             line_width: None,
+            preview_wrap: None,
             path: None,
             version: 0,
             history: History::default(),
@@ -3117,7 +3119,11 @@ impl TextBuffer {
         viewport: &mut PreviewViewport,
         width: usize,
         height: usize,
+        soft_wrap: bool,
     ) -> Vec<FrameRow> {
+        if soft_wrap && width > 0 {
+            return self.render_wrapped_preview(viewport, width, height);
+        }
         if viewport.horizontal_scroll > 0 {
             viewport.horizontal_scroll = viewport
                 .horizontal_scroll
@@ -3147,6 +3153,162 @@ impl TextBuffer {
             },
         )
         .0
+    }
+
+    fn render_wrapped_preview(
+        &mut self,
+        viewport: &mut PreviewViewport,
+        width: usize,
+        height: usize,
+    ) -> Vec<FrameRow> {
+        let tab_width = self.indentation().1;
+        let format = TextFormat {
+            tab_width: tab_width as u16,
+            ..TextFormat::default()
+        };
+        let slice = self.rope.slice(..);
+        let annotations = TextAnnotations::default();
+        if self.preview_wrap.as_ref().is_none_or(|layout| {
+            layout.version != self.version || layout.width != width || layout.tabs != tab_width
+        }) {
+            self.preview_wrap = Some(PreviewWrap {
+                version: self.version,
+                width,
+                tabs: tab_width,
+                rows: Vec::new(),
+                complete: false,
+            });
+        }
+        let layout = self.preview_wrap.as_mut().unwrap();
+        let requested = viewport
+            .scroll
+            .saturating_add(height.max(1))
+            .saturating_add(1);
+        if !layout.complete && layout.rows.len() < requested {
+            let start = layout.rows.last().copied().unwrap_or(0);
+            let base = layout.rows.len().saturating_sub(1);
+            let mut formatter = wrap_preview_graphemes(
+                DocumentFormatter::new_at_prev_checkpoint(
+                    slice.slice(start..),
+                    &format,
+                    &annotations,
+                    0,
+                ),
+                width,
+                format.tab_width,
+            );
+            loop {
+                let Some(grapheme) = formatter.next() else {
+                    layout.complete = true;
+                    break;
+                };
+                if base + grapheme.visual_pos.row == layout.rows.len() {
+                    layout.rows.push(start + grapheme.char_idx);
+                }
+                if grapheme.source.is_eof() {
+                    layout.complete = true;
+                    break;
+                }
+                if layout.rows.len() >= requested {
+                    break;
+                }
+            }
+        }
+        viewport.width = width;
+        viewport.height = height;
+        viewport.horizontal_scroll = 0;
+        if layout.complete {
+            viewport.scroll = viewport
+                .scroll
+                .min(layout.rows.len().saturating_sub(height.max(1)));
+        }
+        let Some(&start_char) = layout.rows.get(viewport.scroll) else {
+            return Vec::new();
+        };
+        let end_char = layout
+            .rows
+            .get(viewport.scroll.saturating_add(height))
+            .copied()
+            .unwrap_or(slice.len_chars());
+        let start_byte = slice.char_to_byte(start_char);
+        let end_byte = slice.char_to_byte(end_char);
+        let highlights = self.language.as_mut().map_or_else(Vec::new, |language| {
+            language.highlights(&self.rope, start_byte..end_byte)
+        });
+        let scopes = self.language.as_ref().map(|_| language::loader().scopes());
+        let mut highlight_index = 0;
+        let mut rows = Vec::<FrameRow>::new();
+        for grapheme in wrap_preview_graphemes(
+            DocumentFormatter::new_at_prev_checkpoint(
+                slice.slice(start_char..),
+                &format,
+                &annotations,
+                0,
+            ),
+            width,
+            format.tab_width,
+        ) {
+            let row = grapheme.visual_pos.row;
+            if row >= height {
+                break;
+            }
+            rows.resize_with(row + 1, FrameRow::default);
+            if grapheme.source.is_eof() || matches!(grapheme.raw, Grapheme::Newline) {
+                continue;
+            }
+            let position = slice.char_to_byte(start_char + grapheme.char_idx);
+            while highlights
+                .get(highlight_index)
+                .is_some_and(|(range, _)| range.end <= position)
+            {
+                highlight_index += 1;
+            }
+            let style = highlights
+                .get(highlight_index)
+                .filter(|(range, _)| range.contains(&position))
+                .and_then(|(_, index)| scopes.as_ref().and_then(|scopes| scopes.get(*index)))
+                .map_or("", String::as_str);
+            let used = rows[row]
+                .spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                .sum::<usize>();
+            if grapheme.visual_pos.col > used {
+                rows[row].spans.push(Span {
+                    base_style: None,
+                    text: " ".repeat(grapheme.visual_pos.col - used),
+                    style: String::new(),
+                });
+            }
+            let value = if grapheme.width() > width {
+                " ".repeat(width)
+            } else {
+                grapheme.raw.to_string()
+            };
+            let text = value
+                .chars()
+                .map(|ch| match ch {
+                    '\0'..='\u{1f}' => char::from_u32(0x2400 + ch as u32).unwrap(),
+                    '\u{7f}' => '\u{2421}',
+                    ch if ch.is_control() => '\u{fffd}',
+                    ch => ch,
+                })
+                .collect::<String>();
+            if let Some(last) = rows[row]
+                .spans
+                .last_mut()
+                .filter(|span| span.style == style)
+            {
+                last.text.push_str(&text);
+            } else {
+                rows[row].spans.push(Span {
+                    base_style: None,
+                    text,
+                    style: style.into(),
+                });
+            }
+        }
+        rows
     }
 
     pub fn render(&mut self, id: u64, width: usize, height: usize, focused: bool) -> RenderResult {
@@ -3266,6 +3428,42 @@ pub struct PreviewViewport {
     pub horizontal_scroll: usize,
     pub width: usize,
     pub height: usize,
+}
+
+struct PreviewWrap {
+    version: u64,
+    width: usize,
+    tabs: usize,
+    rows: Vec<usize>,
+    complete: bool,
+}
+
+fn wrap_preview_graphemes<'a>(
+    formatter: DocumentFormatter<'a>,
+    width: usize,
+    tab_width: u16,
+) -> impl Iterator<Item = FormattedGrapheme<'a>> {
+    formatter.scan((0, 0), move |(row, column), mut grapheme| {
+        grapheme.raw.change_position(*column, tab_width);
+        let newline = matches!(grapheme.raw, Grapheme::Newline);
+        if !newline
+            && !grapheme.source.is_eof()
+            && *column > 0
+            && *column + grapheme.width() > width
+        {
+            *row += 1;
+            *column = 0;
+            grapheme.raw.change_position(0, tab_width);
+        }
+        grapheme.visual_pos = helix_core::Position::new(*row, *column);
+        if newline {
+            *row += 1;
+            *column = 0;
+        } else if !grapheme.source.is_eof() {
+            *column += grapheme.width();
+        }
+        Some(grapheme)
+    })
 }
 
 struct TextPaint<'a> {

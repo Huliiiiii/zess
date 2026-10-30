@@ -141,6 +141,13 @@ impl BufferPlugin for Files {
     fn update(&mut self, input: &PluginInput) -> Result<PluginOutput> {
         let event = Event::parse(&input.event);
         let git_status = git_status::enabled(&input.options)?;
+        if input
+            .options
+            .get("preview-wrap")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            bail!("preview-wrap must be a boolean");
+        }
         let key = (input.buffer_id, input.view_id);
         if event == Event::ViewCloned
             && let Some(source) = input.argument["source_view"].as_u64()
