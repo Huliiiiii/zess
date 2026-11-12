@@ -1,15 +1,12 @@
-use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use crate::query::{QueryRequest, QueryResult};
 use anyhow::{Context, Result, bail};
+use zess_platform::{ProcessRunner, ProcessSpec, SystemProcessRunner};
 
 use crate::filesystem::Snapshot;
 use crate::workspace::Workspace;
@@ -17,136 +14,52 @@ use crate::workspace::Workspace;
 const WORKERS: usize = 4;
 const QUEUED_JOBS: usize = 32;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 
-#[derive(Clone, Default)]
-pub(crate) struct Cancellation(Arc<AtomicBool>);
+#[derive(Clone)]
+pub(crate) struct Cancellation {
+    cancelled: Arc<AtomicBool>,
+    processes: Arc<dyn ProcessRunner>,
+}
+
+impl Default for Cancellation {
+    fn default() -> Self {
+        Self::new(Arc::new(SystemProcessRunner))
+    }
+}
 
 impl Cancellation {
+    pub(crate) fn new(processes: Arc<dyn ProcessRunner>) -> Self {
+        Self {
+            cancelled: Arc::default(),
+            processes,
+        }
+    }
+
     pub(crate) fn check(&self) -> Result<()> {
-        if self.0.load(Ordering::Acquire) {
+        if self.cancelled.load(Ordering::Acquire) {
             bail!("background job was cancelled");
         }
-
         Ok(())
     }
 
     fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
     }
 
-    pub(crate) fn output(&self, command: &mut Command) -> Result<Output> {
-        self.run(command, None)
+    pub(crate) fn output(&self, spec: &ProcessSpec) -> Result<Output> {
+        self.processes.output(spec, None, self)
     }
 
-    fn output_with_input(&self, command: &mut Command, input: &[u8]) -> Result<Output> {
-        self.run(command, Some(input))
-    }
-
-    fn run(&self, command: &mut Command, input: Option<&[u8]>) -> Result<Output> {
-        self.check()?;
-
-        #[cfg(unix)]
-        command.process_group(0);
-        let child = command
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        thread::scope(|scope| {
-            // This guard is dropped before the scope waits for pipe readers, including
-            // when a reader cannot be spawned or cancellation interrupts the process.
-            let mut child = RunningChild {
-                child,
-                reaped: false,
-            };
-            let mut stdout = child.child.stdout.take().context("missing git stdout")?;
-            let mut stderr = child.child.stderr.take().context("missing git stderr")?;
-            let stdin = if let Some(input) = input {
-                let mut stdin = child.child.stdin.take().context("missing renderer stdin")?;
-                Some(
-                    thread::Builder::new()
-                        .name("zess-git-stdin".into())
-                        .spawn_scoped(scope, move || stdin.write_all(input))?,
-                )
-            } else {
-                None
-            };
-            let stdout = thread::Builder::new()
-                .name("zess-git-stdout".into())
-                .spawn_scoped(scope, move || {
-                    let mut bytes = Vec::new();
-                    stdout.read_to_end(&mut bytes)?;
-
-                    Ok::<_, std::io::Error>(bytes)
-                })?;
-            let stderr = thread::Builder::new()
-                .name("zess-git-stderr".into())
-                .spawn_scoped(scope, move || {
-                    let mut bytes = Vec::new();
-                    stderr.read_to_end(&mut bytes)?;
-
-                    Ok::<_, std::io::Error>(bytes)
-                })?;
-            let status = loop {
-                self.check()?;
-
-                if let Some(status) = child.child.try_wait()? {
-                    child.reaped = true;
-                    break status;
-                }
-
-                thread::sleep(Duration::from_millis(10));
-            };
-            let stdout = stdout
-                .join()
-                .map_err(|_| anyhow::anyhow!("git stdout reader stopped"))??;
-            let stderr = stderr
-                .join()
-                .map_err(|_| anyhow::anyhow!("git stderr reader stopped"))??;
-            if let Some(stdin) = stdin
-                && let Err(error) = stdin
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("renderer stdin writer stopped"))?
-                && error.kind() != std::io::ErrorKind::BrokenPipe
-            {
-                return Err(error).context("write configured Git diff pager input");
-            }
-
-            self.check()?;
-
-            Ok(Output {
-                status,
-                stdout,
-                stderr,
-            })
-        })
+    fn output_with_input(&self, spec: &ProcessSpec, input: &[u8]) -> Result<Output> {
+        self.processes.output(spec, Some(input), self)
     }
 }
 
-struct RunningChild {
-    child: Child,
-    reaped: bool,
-}
-
-impl Drop for RunningChild {
-    fn drop(&mut self) {
-        if !self.reaped {
-            #[cfg(unix)]
-            // The child starts a new process group, which also owns helpers
-            // spawned by Git and configured shell renderers.
-            unsafe {
-                libc::kill(-(self.child.id() as i32), libc::SIGKILL);
-            }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
+impl zess_platform::Cancellation for Cancellation {
+    fn check(&self) -> Result<()> {
+        Cancellation::check(self)
     }
 }
 
@@ -184,6 +97,7 @@ enum TaskKind {
 
 pub(crate) struct JobScheduler {
     tasks: SyncSender<Task>,
+    processes: Arc<dyn ProcessRunner>,
 }
 
 impl JobScheduler {
@@ -248,7 +162,10 @@ impl JobScheduler {
                 .context("cannot start background worker")?;
         }
 
-        Ok(Self { tasks: sender })
+        Ok(Self {
+            tasks: sender,
+            processes: workspace.processes.clone(),
+        })
     }
 
     pub(crate) fn start_watch(
@@ -278,7 +195,7 @@ impl JobScheduler {
     }
 
     fn enqueue<T>(&self, kind: impl FnOnce(mpsc::Sender<T>) -> TaskKind) -> Result<Option<Job<T>>> {
-        let cancellation = Cancellation::default();
+        let cancellation = Cancellation::new(self.processes.clone());
         let (sender, receiver) = mpsc::channel();
         let task = Task {
             cancellation: cancellation.clone(),
@@ -296,13 +213,17 @@ impl JobScheduler {
 }
 
 impl zess_git::Execution for Cancellation {
+    fn environment(&self, name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+        self.processes.environment(name)
+    }
+
     fn check(&self) -> Result<()> {
         Cancellation::check(self)
     }
-    fn output(&self, command: &mut Command) -> Result<Output> {
-        Cancellation::output(self, command)
+    fn output(&self, spec: &ProcessSpec) -> Result<Output> {
+        Cancellation::output(self, spec)
     }
-    fn output_with_input(&self, command: &mut Command, input: &[u8]) -> Result<Output> {
-        Cancellation::output_with_input(self, command, input)
+    fn output_with_input(&self, spec: &ProcessSpec, input: &[u8]) -> Result<Output> {
+        Cancellation::output_with_input(self, spec, input)
     }
 }

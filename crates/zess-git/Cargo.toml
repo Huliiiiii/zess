@@ -8,3 +8,4 @@ anyhow.workspace = true
 git2.workspace = true
 gix.workspace = true
 serde.workspace = true
+zess-platform.workspace = true

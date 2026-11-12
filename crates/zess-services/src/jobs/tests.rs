@@ -1,5 +1,7 @@
 use super::*;
+use std::time::Duration;
 
+#[cfg(unix)]
 #[test]
 fn renderer_input_and_output_can_both_exceed_pipe_capacity() {
     let input = (0..1024 * 1024)
@@ -7,7 +9,7 @@ fn renderer_input_and_output_can_both_exceed_pipe_capacity() {
         .collect::<Vec<_>>();
     let output = Cancellation::default()
         .output_with_input(
-            Command::new("sh").args(["-c", "cat; printf diagnostic >&2"]),
+            ProcessSpec::new("sh").args(["-c", "cat; printf diagnostic >&2"]),
             &input,
         )
         .unwrap();
@@ -27,7 +29,7 @@ fn cancelling_a_renderer_also_stops_children_that_hold_its_output_pipes() {
     let worker_path = path.clone();
     let worker = std::thread::spawn(move || {
         let result = worker_cancellation.output(
-            Command::new("sh")
+            ProcessSpec::new("sh")
                 .args([
                     "-c",
                     "sleep 30 & printf ready > \"$1\"; wait",

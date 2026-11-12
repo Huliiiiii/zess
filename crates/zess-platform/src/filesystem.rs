@@ -1,7 +1,9 @@
 use std::ffi::OsString;
 use std::fs::{self, Metadata};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Context, bail};
 
 pub enum FileType {
     File,
@@ -28,11 +30,18 @@ pub struct DirectoryEntry {
     pub file_type: FileType,
 }
 
+pub struct WalkExcludes {
+    pub root: Option<PathBuf>,
+    pub global: Option<PathBuf>,
+    pub local: Option<PathBuf>,
+}
+
 pub struct WalkOptions {
     pub max_depth: Option<usize>,
     pub hidden: bool,
     pub ignore: bool,
     pub require_git: bool,
+    pub excludes: Option<WalkExcludes>,
 }
 
 impl DirectoryEntry {
@@ -71,6 +80,20 @@ pub trait FileSystem: Send + Sync {
     ) -> io::Result<PathBuf>;
     fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
     fn metadata(&self, path: &Path) -> io::Result<Metadata>;
+    /// Returns the filesystem device for discovery on platforms that expose it.
+    fn device_id(&self, path: &Path) -> io::Result<Option<u64>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            Ok(Some(self.metadata(path)?.dev()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(None)
+        }
+    }
     fn symlink_metadata(&self, path: &Path) -> io::Result<Metadata>;
     fn read_dir(&self, path: &Path) -> io::Result<Vec<DirectoryEntry>>;
     fn walk_directory(&self, path: &Path, options: WalkOptions) -> anyhow::Result<Vec<PathBuf>>;
@@ -89,6 +112,33 @@ pub trait FileSystem: Send + Sync {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
+    }
+
+    /// Joins a relative path to the canonical workspace root. Resolves the
+    /// nearest existing ancestor to check containment and returns the joined path.
+    fn workspace_path(&self, root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+        if relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+        {
+            bail!("path must remain relative to the workspace");
+        }
+
+        let path = root.join(relative);
+        let mut ancestor = path.as_path();
+        while !self.try_exists(ancestor)? {
+            if self.symlink_metadata(ancestor).is_ok() {
+                bail!("broken symbolic link in workspace path");
+            }
+
+            ancestor = ancestor.parent().context("invalid workspace path")?;
+        }
+
+        if !self.canonicalize(ancestor)?.starts_with(root) {
+            bail!("symbolic link leaves the workspace");
+        }
+
+        Ok(path)
     }
 }
 
@@ -219,13 +269,32 @@ impl FileSystem for NativeFileSystem {
 
     fn walk_directory(&self, path: &Path, options: WalkOptions) -> anyhow::Result<Vec<PathBuf>> {
         let mut paths = Vec::new();
-        for entry in ignore::WalkBuilder::new(path)
+        let mut walker = ignore::WalkBuilder::new(path);
+        walker
             .max_depth(options.max_depth)
             .hidden(options.hidden)
             .ignore(options.ignore)
-            .require_git(options.require_git)
-            .build()
-        {
+            .require_git(options.require_git);
+        if let Some(excludes) = options.excludes {
+            walker.git_global(false).git_exclude(false);
+            if let Some(root) = excludes.root {
+                walker.current_dir(root);
+            }
+            // The builder gives later files precedence and keeps valid patterns
+            // from a global ignore file with parse errors.
+            if let Some(file) = excludes.global
+                && file.is_file()
+            {
+                let _ = walker.add_ignore(file);
+            }
+            if let Some(file) = excludes.local
+                && file.is_file()
+                && let Some(error) = walker.add_ignore(file)
+            {
+                return Err(error.into());
+            }
+        }
+        for entry in walker.build() {
             let entry = entry?;
             if let Some(error) = entry.error() {
                 return Err(error.clone().into());

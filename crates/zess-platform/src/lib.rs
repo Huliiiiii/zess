@@ -3,7 +3,9 @@ mod host;
 mod process;
 mod watch;
 
-pub use filesystem::{DirectoryEntry, FileSystem, FileType, NativeFileSystem, WalkOptions};
+pub use filesystem::{
+    DirectoryEntry, FileSystem, FileType, NativeFileSystem, WalkExcludes, WalkOptions,
+};
 pub use host::{HostInfo, NativePlatform, Platform, UserDirs};
 pub use process::{
     Cancellation, CancellationToken, ConsoleMode, OutputMode, OwnedProcess, ProcessJob,

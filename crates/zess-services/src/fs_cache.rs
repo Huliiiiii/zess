@@ -43,16 +43,24 @@ struct Subscription {
     path: PathBuf,
     relative: String,
     request: Request,
-    outcome: Option<Outcome>,
+    state: SubscriptionState,
     query: Arc<Query>,
     registration: Arc<Registration>,
+}
+
+enum SubscriptionState {
+    Waiting,
+    Reading,
+    Ready(Outcome),
+    Failed(String),
 }
 
 impl Subscription {
     fn ready(&mut self) -> Result<bool, String> {
         self.registration.ready()?;
         self.registration = self.query.registration();
-        self.registration.ready()
+        self.registration.ready()?;
+        Ok(self.query.cache_is_current(&self.registration))
     }
 }
 
@@ -63,9 +71,40 @@ struct Flight {
 }
 
 #[derive(Default)]
+struct Entry {
+    snapshot: Option<CachedSnapshot>,
+    flight: Option<Flight>,
+}
+
+impl Entry {
+    fn current_snapshot(&self) -> Option<&CachedSnapshot> {
+        self.snapshot
+            .as_ref()
+            .filter(|cached| cached.binding.is_current())
+    }
+
+    fn retain_live_data(&mut self) -> bool {
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|cached| cached.binding.query.strong_count() == 0)
+        {
+            self.snapshot = None;
+        }
+        self.snapshot.is_some() || self.flight.is_some()
+    }
+
+    fn invalidate(&mut self) {
+        self.snapshot = None;
+        if let Some(flight) = self.flight.take() {
+            flight.job.cancel();
+        }
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct FsCache {
-    ready: HashMap<PathBuf, CachedSnapshot>,
-    flights: HashMap<PathBuf, Flight>,
+    entries: HashMap<PathBuf, Entry>,
     subscriptions: HashMap<u64, Subscription>,
     revision: u64,
 }
@@ -76,11 +115,26 @@ impl FsCache {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.ready.len()
+        self.entries
+            .values()
+            .filter(|entry| entry.snapshot.is_some())
+            .count()
     }
 
     pub(crate) fn jobs(&self) -> usize {
         self.subscriptions.len()
+    }
+
+    pub(crate) fn remove_unused_entry(&mut self, path: &Path) {
+        if let Some(entry) = self.entries.get_mut(path)
+            && !entry.retain_live_data()
+        {
+            self.entries.remove(path);
+        }
+    }
+
+    pub(crate) fn remove_unused_entries(&mut self) {
+        self.entries.retain(|_, entry| entry.retain_live_data());
     }
 
     pub(crate) fn cached_query(&self, query_request: &QueryRequest) -> Result<Option<QueryResult>> {
@@ -92,61 +146,74 @@ impl FsCache {
         }
         let (relative, request) = Request::from_query(query_request)?;
         let path = key(relative)?;
-        let Some(cached) = self
-            .ready
-            .get(&path)
-            .filter(|cached| cached.binding.is_current())
-        else {
+        let Some(cached) = self.entries.get(&path).and_then(Entry::current_snapshot) else {
             return Ok(None);
         };
         cached.snapshot.response(relative, request).map(Some)
     }
 
     pub(crate) fn invalidate(&mut self) {
-        self.ready.clear();
-        // Dropping each receiver prevents its worker from publishing into a newer flight.
-        for (_, flight) in self.flights.drain() {
-            flight.job.cancel();
+        // Dropping each receiver prevents its worker from publishing into a newer read.
+        for (_, mut entry) in self.entries.drain() {
+            entry.invalidate();
         }
         for subscription in self.subscriptions.values_mut() {
-            subscription.outcome = None;
+            subscription.state = SubscriptionState::Waiting;
         }
         self.revision += 1;
     }
 
     pub(crate) fn invalidate_path(&mut self, path: &Path) {
-        self.ready.remove(path);
-        if let Some(flight) = self.flights.remove(path) {
-            flight.job.cancel();
+        if let Some(mut entry) = self.entries.remove(path) {
+            entry.invalidate();
         }
         for subscription in self.subscriptions.values_mut() {
             if subscription.path == path {
-                subscription.outcome = None;
+                subscription.state = SubscriptionState::Waiting;
             }
         }
     }
 
     pub(crate) fn cancel_all(&mut self) {
-        for (_, flight) in self.flights.drain() {
-            flight.job.cancel();
+        for entry in self.entries.values_mut() {
+            if let Some(flight) = entry.flight.take() {
+                flight.job.cancel();
+            }
         }
         self.subscriptions.clear();
+        self.remove_unused_entries();
+    }
+
+    fn detach(&mut self, handle: u64) -> Option<(String, Request, SubscriptionState)> {
+        let Subscription {
+            path,
+            relative,
+            request,
+            state,
+            query,
+            ..
+        } = self.subscriptions.remove(&handle)?;
+        if let Some(entry) = self.entries.get_mut(&path)
+            && let Some(flight) = &mut entry.flight
+        {
+            flight.subscribers.remove(&handle);
+            if flight.subscribers.is_empty() {
+                entry.flight.take().unwrap().job.cancel();
+            }
+        }
+        drop(query);
+        self.remove_unused_entry(&path);
+        Some((relative, request, state))
     }
 
     pub(crate) fn cancel(&mut self, handle: u64) {
-        let Some(subscription) = self.subscriptions.remove(&handle) else {
-            return;
-        };
-        if let Some(flight) = self.flights.get_mut(&subscription.path) {
-            flight.subscribers.remove(&handle);
-            if flight.subscribers.is_empty() {
-                self.flights
-                    .remove(&subscription.path)
-                    .unwrap()
-                    .job
-                    .cancel();
-            }
-        }
+        self.detach(handle);
+    }
+
+    pub(crate) fn query(&self, handle: u64) -> Option<Arc<Query>> {
+        self.subscriptions
+            .get(&handle)
+            .map(|subscription| subscription.query.clone())
     }
 
     pub(crate) fn start(
@@ -160,20 +227,13 @@ impl FsCache {
         let path = key(relative)?;
         self.pump(scheduler);
         let registration = query.registration();
-        let outcome = if registration.ready() == Ok(true) {
-            self.ready
-                .get(&path)
-                .map(|cached| Ok(cached.snapshot.clone()))
-        } else {
-            None
-        };
         self.subscriptions.insert(
             handle,
             Subscription {
                 path,
                 relative: relative.to_owned(),
                 request,
-                outcome,
+                state: SubscriptionState::Waiting,
                 query,
                 registration,
             },
@@ -184,144 +244,176 @@ impl FsCache {
 
     fn attach(&mut self, handle: u64, scheduler: &JobScheduler) {
         let subscription = self.subscriptions.get_mut(&handle).unwrap();
-        if subscription.outcome.is_some() {
+        if !matches!(subscription.state, SubscriptionState::Waiting) {
             return;
         }
         match subscription.ready() {
             Ok(true) => {}
             Ok(false) => return,
             Err(error) => {
-                subscription.outcome = Some(Err(error));
+                subscription.state = SubscriptionState::Failed(error);
                 return;
             }
         }
-        if let Some(flight) = self.flights.get_mut(&subscription.path) {
-            flight.subscribers.insert(handle);
+        let entry = self.entries.entry(subscription.path.clone()).or_default();
+        if let Some(cached) = entry.current_snapshot() {
+            subscription.state = SubscriptionState::Ready(Ok(cached.snapshot.clone()));
+            return;
+        }
+        if let Some(flight) = &mut entry.flight {
+            if flight.binding.is_current() {
+                flight.subscribers.insert(handle);
+                subscription.state = SubscriptionState::Reading;
+            }
             return;
         }
         match scheduler.start_fs(subscription.path.to_string_lossy().into_owned()) {
             Ok(Some(job)) => {
-                self.flights.insert(
-                    subscription.path.clone(),
-                    Flight {
-                        job,
-                        subscribers: HashSet::from([handle]),
-                        binding: CacheBinding::new(&subscription.query),
-                    },
-                );
+                entry.flight = Some(Flight {
+                    job,
+                    subscribers: HashSet::from([handle]),
+                    binding: CacheBinding::new(&subscription.query),
+                });
+                subscription.state = SubscriptionState::Reading;
             }
             // A full queue leaves a live subscription to retry on the next poll.
             Ok(None) => {}
             Err(error) => {
-                self.subscriptions.get_mut(&handle).unwrap().outcome =
-                    Some(Err(format!("{error:#}")));
+                subscription.state = SubscriptionState::Failed(format!("{error:#}"));
             }
         }
     }
 
-    fn publish(&mut self, path: &Path, outcome: Outcome, binding: CacheBinding) {
+    fn publish(&mut self, path: &Path, outcome: Outcome, binding: CacheBinding) -> bool {
+        if !binding.is_current() {
+            self.invalidate_path(path);
+            return false;
+        }
         if let Ok(snapshot) = &outcome {
-            self.ready.insert(
-                path.to_owned(),
-                CachedSnapshot {
-                    snapshot: snapshot.clone(),
-                    binding,
-                },
-            );
+            self.entries.entry(path.to_owned()).or_default().snapshot = Some(CachedSnapshot {
+                snapshot: snapshot.clone(),
+                binding,
+            });
         }
         for subscription in self.subscriptions.values_mut() {
-            if subscription.path == path && subscription.outcome.is_none() {
-                subscription.outcome = match subscription.ready() {
-                    Ok(true) => Some(outcome.clone()),
-                    Ok(false) => None,
-                    Err(error) => Some(Err(error)),
+            if subscription.path == path
+                && matches!(
+                    subscription.state,
+                    SubscriptionState::Waiting | SubscriptionState::Reading
+                )
+            {
+                subscription.state = match subscription.ready() {
+                    Ok(true) => SubscriptionState::Ready(outcome.clone()),
+                    Ok(false) => SubscriptionState::Waiting,
+                    Err(error) => SubscriptionState::Failed(error),
                 };
             }
         }
+        true
     }
 
     fn pump(&mut self, scheduler: &JobScheduler) {
         let completed = self
-            .flights
+            .entries
             .iter()
-            .filter_map(|(path, flight)| match flight.job.result.try_recv() {
-                Ok(outcome) => Some((path.clone(), outcome)),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some((
-                    path.clone(),
-                    Err("background service stopped without a result".into()),
-                )),
+            .filter_map(|(path, entry)| {
+                let flight = entry.flight.as_ref()?;
+                let outcome = match flight.job.result.try_recv() {
+                    Ok(outcome) => outcome,
+                    Err(TryRecvError::Empty) => return None,
+                    Err(TryRecvError::Disconnected) => {
+                        Err("background service stopped without a result".into())
+                    }
+                };
+                Some((path.clone(), outcome))
             })
             .collect::<Vec<_>>();
         for (path, outcome) in completed {
-            let flight = self.flights.remove(&path).unwrap();
+            let flight = self.entries.get_mut(&path).unwrap().flight.take().unwrap();
             self.publish(&path, outcome, flight.binding);
         }
-        let mut pending = Vec::new();
-        for (handle, subscription) in &self.subscriptions {
-            if subscription.outcome.is_some() {
-                continue;
-            }
-            if self.flights.contains_key(&subscription.path) {
-                continue;
-            }
-            pending.push(*handle);
-        }
+        let pending = self
+            .subscriptions
+            .iter()
+            .filter_map(|(handle, subscription)| {
+                matches!(subscription.state, SubscriptionState::Waiting).then_some(*handle)
+            })
+            .collect::<Vec<_>>();
         for handle in pending {
             self.attach(handle, scheduler);
         }
+        self.remove_unused_entries();
     }
 
-    pub(crate) fn poll(&mut self, handle: u64, scheduler: &JobScheduler) -> Option<QueryPoll> {
-        if !self.subscriptions.contains_key(&handle) {
-            return None;
-        }
+    pub(crate) fn poll(&mut self, handle: u64, scheduler: &JobScheduler) -> QueryPoll {
         self.pump(scheduler);
-        if self.subscriptions[&handle].outcome.is_none() {
-            return Some(QueryPoll::Pending);
+        let subscription = &self.subscriptions[&handle];
+        match subscription.state {
+            SubscriptionState::Waiting | SubscriptionState::Reading => return QueryPoll::Pending,
+            SubscriptionState::Ready(_)
+                if !subscription
+                    .query
+                    .cache_is_current(&subscription.registration) =>
+            {
+                return QueryPoll::Pending;
+            }
+            SubscriptionState::Ready(_) | SubscriptionState::Failed(_) => {}
         }
-        let subscription = self.subscriptions.remove(&handle).unwrap();
-        let result = subscription.outcome.unwrap().and_then(|snapshot| {
+        let (relative, request, state) = self.detach(handle).unwrap();
+        let outcome = match state {
+            SubscriptionState::Ready(outcome) => outcome,
+            SubscriptionState::Failed(error) => Err(error),
+            SubscriptionState::Waiting | SubscriptionState::Reading => unreachable!(),
+        };
+        let result = outcome.and_then(|snapshot| {
             snapshot
-                .response(&subscription.relative, subscription.request)
+                .response(&relative, request)
                 .map_err(|error| format!("{error:#}"))
         });
-        Some(QueryPoll::Ready(result))
+        QueryPoll::Ready(result)
     }
 
     pub(crate) fn read(
         &mut self,
         workspace: &Workspace,
         query_request: &QueryRequest,
-        refresh: bool,
         query: &Arc<Query>,
-    ) -> Result<QueryResult> {
+    ) -> Result<Option<QueryResult>> {
         let (relative, request) = Request::from_query(query_request)?;
         let path = key(relative)?;
-        if refresh {
-            self.invalidate();
+        let (outcome, binding) =
+            if let Some(cached) = self.entries.get(&path).and_then(Entry::current_snapshot) {
+                (Ok(cached.snapshot.clone()), cached.binding.clone())
+            } else if let Some(flight) = self
+                .entries
+                .get_mut(&path)
+                .and_then(|entry| entry.flight.take())
+            {
+                if !flight.binding.is_current() {
+                    flight.job.cancel();
+                    self.invalidate_path(&path);
+                    return Ok(None);
+                }
+                let outcome =
+                    flight.job.result.recv().unwrap_or_else(|_| {
+                        Err("background service stopped without a result".into())
+                    });
+                (outcome, flight.binding)
+            } else {
+                let binding = CacheBinding::new(query);
+                let outcome = workspace
+                    .read_fs(&path.to_string_lossy(), &Cancellation::default())
+                    .map(Arc::new)
+                    .map_err(|error| format!("{error:#}"));
+                (outcome, binding)
+            };
+        if !self.publish(&path, outcome.clone(), binding) {
+            return Ok(None);
         }
-        let (outcome, binding) = if let Some(cached) = self.ready.get(&path) {
-            (Ok(cached.snapshot.clone()), cached.binding.clone())
-        } else if let Some(flight) = self.flights.remove(&path) {
-            let outcome = flight
-                .job
-                .result
-                .recv()
-                .unwrap_or_else(|_| Err("background service stopped without a result".into()));
-            (outcome, flight.binding)
-        } else {
-            let binding = CacheBinding::new(query);
-            let outcome = workspace
-                .read_fs(&path.to_string_lossy(), &Cancellation::default())
-                .map(Arc::new)
-                .map_err(|error| format!("{error:#}"));
-            (outcome, binding)
-        };
-        self.publish(&path, outcome.clone(), binding);
         outcome
             .map_err(anyhow::Error::msg)?
             .response(relative, request)
+            .map(Some)
     }
 }
 

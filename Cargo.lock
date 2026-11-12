@@ -3660,6 +3660,7 @@ dependencies = [
  "git2",
  "gix",
  "serde",
+ "zess-platform",
 ]
 
 [[package]]
@@ -3747,12 +3748,10 @@ name = "zess-services"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "ignore",
- "libc",
- "notify",
  "serde",
  "serde_json",
  "zess-git",
+ "zess-platform",
  "zess-plugin",
  "zess-ui",
 ]

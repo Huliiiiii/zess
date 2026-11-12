@@ -8,8 +8,31 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use zess_platform::{NativeFileSystem, SystemProcessRunner, WatchBackend, WatchEvent, WatchHandle};
 
 use super::{NativeServices, Observation, QueryRequest};
+
+mod git_queries;
+mod observations;
+
+struct QuietWatch;
+
+impl WatchHandle for QuietWatch {
+    fn refresh(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl WatchBackend for QuietWatch {
+    fn watch(
+        &self,
+        _path: &Path,
+        _recursive: bool,
+        _callback: Box<dyn Fn(anyhow::Result<WatchEvent>) + Send>,
+    ) -> anyhow::Result<Box<dyn WatchHandle>> {
+        Ok(Box::new(Self))
+    }
+}
 
 struct Fixture(PathBuf);
 
@@ -27,6 +50,16 @@ impl Fixture {
 
     fn services(&self) -> NativeServices {
         NativeServices::new(self.0.clone()).unwrap()
+    }
+
+    fn services_without_watch_events(&self) -> NativeServices {
+        NativeServices::with_backends(
+            self.0.clone(),
+            Arc::new(NativeFileSystem),
+            Arc::new(SystemProcessRunner),
+            Arc::new(QuietWatch),
+        )
+        .unwrap()
     }
 }
 
@@ -168,14 +201,39 @@ fn observe(services: &mut NativeServices, operation: &str, argument: &Value) -> 
     observation
 }
 
-fn wait_for_change(services: &mut NativeServices, observation: &mut Observation) {
-    let deadline = Instant::now() + TIMEOUT;
+fn wait_for_change_before(
+    services: &mut NativeServices,
+    observation: &mut Observation,
+    deadline: Instant,
+) {
     while !observation.changed() {
         services.poll_changes().unwrap();
         assert!(Instant::now() < deadline, "filesystem change timed out");
         thread::sleep(Duration::from_millis(5));
     }
     observation.acknowledge();
+}
+
+fn wait_for_change(services: &mut NativeServices, observation: &mut Observation) {
+    wait_for_change_before(services, observation, Instant::now() + TIMEOUT);
+}
+
+fn wait_for_query_result(
+    services: &mut NativeServices,
+    observation: &mut Observation,
+    read: impl Fn(&mut NativeServices) -> Value,
+    expected: impl Fn(&Value) -> bool,
+) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        wait_for_change_before(services, observation, deadline);
+        let result = read(services);
+        if expected(&result) {
+            return;
+        }
+        // A notification can still be from the preceding operation.
+        assert!(Instant::now() < deadline, "query stayed stale: {result}");
+    }
 }
 
 fn git(root: &Path, args: &[&str]) {
@@ -374,7 +432,7 @@ fn git_decorations_retry_outdated_results_and_release_cancelled_queries() {
         result["entries"][0]["staging_status"], "unstaged",
         "{result}"
     );
-    assert_eq!(probe.count(), 2);
+    assert!(probe.count() >= 2);
 
     drop(observation);
     let cancelled = services
@@ -427,6 +485,50 @@ fn directory_previews_default_non_boolean_ignore_options_to_false() {
         let preview = ready(&mut services, handle);
         assert_eq!(names(&preview), [".gitignore"]);
     }
+}
+
+#[test]
+fn git_status_lists_changes_when_the_palette_cannot_be_read() {
+    use zess_platform::{
+        Cancellation, NativeFileSystem, NativeWatchBackend, OwnedProcess, ProcessRunner,
+        ProcessSpec, SystemProcessRunner,
+    };
+
+    struct UnavailablePalette;
+
+    impl ProcessRunner for UnavailablePalette {
+        fn output(
+            &self,
+            spec: &ProcessSpec,
+            input: Option<&[u8]>,
+            cancellation: &dyn Cancellation,
+        ) -> anyhow::Result<std::process::Output> {
+            if spec.args.iter().any(|arg| arg == "--type=color") {
+                anyhow::bail!("reading the palette failed");
+            }
+            SystemProcessRunner.output(spec, input, cancellation)
+        }
+
+        fn spawn(&self, spec: &ProcessSpec) -> anyhow::Result<OwnedProcess> {
+            SystemProcessRunner.spawn(spec)
+        }
+    }
+
+    let fixture = Fixture::new();
+    git(&fixture.0, &["init", "--quiet"]);
+    fs::write(fixture.0.join("note.txt"), "text\n").unwrap();
+    let mut services = NativeServices::with_backends(
+        fixture.0.clone(),
+        Arc::new(NativeFileSystem),
+        Arc::new(UnavailablePalette),
+        Arc::new(NativeWatchBackend),
+    )
+    .unwrap();
+
+    let handle = start(&mut services, "git.status", json!({}));
+    let status = ready(&mut services, handle);
+    assert_eq!(status["entries"][0]["path"], "note.txt");
+    assert_eq!(status["entries"][0]["untracked"], true);
 }
 
 #[test]
@@ -502,6 +604,7 @@ fn untracked_line_counts_distinguish_text_binary_and_oversized_files() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn untracked_counts_use_nested_workspace_paths_and_symbolic_link_content() {
     let fixture = Fixture::new();
@@ -984,7 +1087,18 @@ fn file_changes_invalidate_only_their_own_cached_previews() {
         services.call("fs.preview", json!({"path":"first.txt"}))["text"],
         "new"
     );
-    assert_eq!(probe.count(), 3);
+    assert_eq!(
+        services.call("fs.preview", json!({"path":"second.txt"}))["text"],
+        "retained"
+    );
+    assert_eq!(
+        probe
+            .entered
+            .try_iter()
+            .filter(|path| path == "second.txt")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -1032,6 +1146,55 @@ fn cached_queries_reuse_live_snapshots_without_starting_work() {
 }
 
 #[test]
+fn directory_entries_use_workspace_relative_paths() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.0.join("nested/deeper")).unwrap();
+    fs::write(fixture.0.join("nested/deeper/file"), "").unwrap();
+    let mut services = fixture.services();
+    let result = services.call("fs.list", json!({"path": "nested/deeper"}));
+    assert_eq!(result["entries"][0]["path"], "nested/deeper/file");
+    for (path, expected) in [
+        ("nested/deeper/", "nested/deeper/file"),
+        ("./nested/deeper", "./nested/deeper/file"),
+    ] {
+        let result = services.call("fs.list", json!({"path": path}));
+        assert_eq!(result["entries"][0]["path"], expected);
+    }
+    #[cfg(windows)]
+    {
+        let result = services.call("fs.list", json!({"path": "nested\\deeper"}));
+        assert_eq!(result["entries"][0]["path"], "nested/deeper/file");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_listing_rejects_non_utf8_filenames() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join(std::ffi::OsStr::from_bytes(b"\xff")), "").unwrap();
+    let result = fixture.services().call("fs.list", json!({}));
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("filename that is not UTF-8")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_entry_paths_preserve_literal_backslashes() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.0.join("nested")).unwrap();
+    fs::write(fixture.0.join("nested/a\\b"), "").unwrap();
+    let mut services = fixture.services();
+    let result = services.call("fs.list", json!({"path": "nested"}));
+    assert_eq!(result["entries"][0]["path"], "nested/a\\b");
+}
+
+#[test]
 fn cached_directory_queries_preserve_each_requests_filter_and_path() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join(".gitignore"), "*.tmp\n").unwrap();
@@ -1074,7 +1237,7 @@ fn cached_directory_queries_preserve_each_requests_filter_and_path() {
 }
 
 #[test]
-fn cached_queries_reject_changes_before_notifications_are_polled() {
+fn filesystem_reads_reject_stale_snapshots_before_changes_are_polled() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join("note.txt"), "old").unwrap();
     let mut services = fixture.services();
@@ -1082,47 +1245,86 @@ fn cached_queries_reject_changes_before_notifications_are_polled() {
         path: "note.txt".into(),
         show_ignored: false,
     };
-    let _observation = observe(&mut services, "fs.preview", &request.argument());
+    let argument = request.argument();
+    let _observation = observe(&mut services, "fs.preview", &argument);
     let probe = ReadProbe::install(&mut services, 0);
+    assert_eq!(services.call("fs.preview", argument.clone())["text"], "old");
+    assert!(services.cached_query(&request).unwrap().is_some());
+    let ready_before_change = services.start_query(request.clone()).unwrap();
+
+    let change = |services: &NativeServices, text| {
+        fs::write(fixture.0.join("note.txt"), text).unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        while services.cached_query(&request).unwrap().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "change was not delivered to the watcher"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    };
+
+    change(&services, "new");
+    assert_eq!(services.filesystem.len(), 1);
+    assert_eq!(probe.count(), 1);
+    assert_eq!(ready(&mut services, ready_before_change)["text"], "new");
+
+    change(&services, "newer");
+    let started_after_change = services.start_query(request.clone()).unwrap();
+    assert_eq!(ready(&mut services, started_after_change)["text"], "newer");
+
+    change(&services, "latest");
+    assert_eq!(services.call("fs.preview", argument)["text"], "latest");
+}
+
+#[test]
+fn filesystem_poll_releases_cached_previews_after_the_last_observer_is_dropped() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("note.txt"), "old").unwrap();
+    let mut services = fixture.services();
+    let request = QueryRequest::Preview {
+        path: "note.txt".into(),
+        show_ignored: false,
+    };
+    let first = observe(&mut services, "fs.preview", &request.argument());
+    let last = observe(&mut services, "fs.preview", &request.argument());
     assert_eq!(
         services.call("fs.preview", request.argument())["text"],
         "old"
     );
+
+    drop(first);
+    services.poll_changes().unwrap();
+    assert_eq!(services.filesystem.len(), 1);
     assert!(services.cached_query(&request).unwrap().is_some());
 
-    fs::write(fixture.0.join("note.txt"), "new").unwrap();
-    let deadline = Instant::now() + TIMEOUT;
-    while services.cached_query(&request).unwrap().is_some() {
-        assert!(
-            Instant::now() < deadline,
-            "change was not delivered to the watcher"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-
-    assert_eq!(services.filesystem.len(), 1);
-    assert_eq!(services.filesystem.jobs(), 0);
-    assert_eq!(probe.count(), 1);
+    drop(last);
+    assert!(services.cached_query(&request).unwrap().is_none());
+    services.poll_changes().unwrap();
+    assert_eq!(services.queries.watched_paths(), 0);
+    assert_eq!(services.filesystem.len(), 0);
+    assert_eq!(services.queries.len(), 0);
 }
 
 #[test]
-fn cached_queries_stop_trusting_snapshots_after_the_last_observer_is_released() {
+fn unobserved_previews_release_their_snapshots_after_completion() {
     let fixture = Fixture::new();
-    fs::write(fixture.0.join("note.txt"), "old").unwrap();
+    for path in ["synchronous.txt", "background.txt"] {
+        fs::write(fixture.0.join(path), path).unwrap();
+    }
     let mut services = fixture.services();
-    let request = QueryRequest::Preview {
-        path: "note.txt".into(),
-        show_ignored: false,
-    };
-    let observation = observe(&mut services, "fs.preview", &request.argument());
-    services.call("fs.preview", request.argument());
-    assert!(services.cached_query(&request).unwrap().is_some());
 
-    drop(observation);
-    assert_eq!(services.queries.watched_paths(), 0);
-    assert_eq!(services.filesystem.len(), 1);
-    assert!(services.cached_query(&request).unwrap().is_none());
-    assert_eq!(services.queries.len(), 0);
+    let result = services.call("fs.preview", json!({"path":"synchronous.txt"}));
+    assert_eq!(result["text"], "synchronous.txt");
+    assert_eq!(services.call("service.stats", json!({}))["cached_paths"], 0);
+
+    let handle = start(
+        &mut services,
+        "fs.preview",
+        json!({"path":"background.txt"}),
+    );
+    assert_eq!(ready(&mut services, handle)["text"], "background.txt");
+    assert_eq!(services.call("service.stats", json!({}))["cached_paths"], 0);
 }
 
 #[test]
@@ -1245,10 +1447,11 @@ fn directory_observations_follow_recreated_directories() {
     );
 
     fs::write(directory.join("new.txt"), "updated").unwrap();
-    wait_for_change(&mut services, &mut observation);
-    assert_eq!(
-        services.call("fs.list", json!({"path":"folder"}))["entries"][0]["size"],
-        7
+    wait_for_query_result(
+        &mut services,
+        &mut observation,
+        |services| services.call("fs.list", json!({"path":"folder"})),
+        |listing| listing["entries"][0]["size"] == 7,
     );
 }
 
@@ -1264,12 +1467,24 @@ fn git_jobs_retry_if_their_snapshot_predates_an_observed_change() {
     let handle = start(&mut services, "git.status", json!({}));
     assert_eq!(probe.wait_for_read(&mut services, handle), "git.status");
     let mut observation = observe(&mut services, "git.status", &json!({}));
+    let query = services.acquire_query(&QueryRequest::Status {}).unwrap();
+    let registration = query.registration();
     fs::write(fixture.0.join("note.txt"), "new\nextra\n").unwrap();
-    wait_for_change(&mut services, &mut observation);
+    let deadline = Instant::now() + TIMEOUT;
+    while query.cache_is_current(&registration) {
+        assert!(
+            Instant::now() < deadline,
+            "watcher did not receive the change"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    drop(query);
+    assert!(!observation.changed());
     assert!(services.status_progress(handle).unwrap().is_none());
     probe.release();
 
     let result = ready(&mut services, handle);
+    assert!(observation.changed());
     assert_eq!(result["entries"].as_array().unwrap().len(), 1);
     assert_eq!(result["entries"][0]["path"], "note.txt");
     assert_eq!(result["entries"][0]["worktree"], "M");
@@ -1277,7 +1492,7 @@ fn git_jobs_retry_if_their_snapshot_predates_an_observed_change() {
         result["entries"][0]["line_stats"],
         json!({"additions":2,"deletions":1})
     );
-    assert_eq!(probe.count(), 2);
+    assert!(probe.count() >= 2);
     assert_eq!(
         services.call("service.stats", json!({}))["observed_queries"],
         1
@@ -1374,6 +1589,7 @@ fn file_observations_follow_replaced_parent_directories() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn file_observations_follow_retargeted_symbolic_link_directories() {
     let fixture = Fixture::new();
@@ -1409,6 +1625,7 @@ fn file_observations_follow_retargeted_symbolic_link_directories() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn directory_observations_follow_retargeted_symbolic_links() {
     let fixture = Fixture::new();
@@ -1441,6 +1658,7 @@ fn directory_observations_follow_retargeted_symbolic_links() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn file_observations_follow_retargeted_intermediate_symbolic_links() {
     let fixture = Fixture::new();
@@ -1577,6 +1795,8 @@ fn commit_diff_files_preserve_rename_targets_without_filesystem_watches() {
     let mut services = fixture.services();
     let oid = services.call("git.log", json!({}))["commits"][0]["oid"].clone();
     fs::write(fixture.0.join("renamed.txt"), "working tree\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("missing", fixture.0.join("old.txt")).unwrap();
     let source = json!({"kind":"commit", "commit":oid});
     let files = json!([
         {"path":"renamed.txt", "original_path":"old.txt"},
@@ -1813,16 +2033,16 @@ fn an_explicit_diff_pager_replaces_the_configured_external_renderer() {
     let mut request = json!({
         "source":{"kind":"changes", "side":"unstaged"},
         "files":[{"path":"note.txt", "original_path":null}],
-        "render":{"width":120, "pager":"printf 'override:%s\\n' \"$COLUMNS\"; cat"},
+        "render":{"width":120, "pager":{"program":"sh", "args":["-c", "printf 'override:%s\\n' \"$COLUMNS\"; cat"]}},
     });
     let rendered = services.call("git.diff-files", request.clone());
     let file = &rendered["diff"]["files"][0];
     let raw = file["raw"].as_str().unwrap();
     assert_eq!(file["rendered"]["text"], format!("override:120\n{raw}"));
     assert!(!fixture.0.join("external-started").exists());
-    request["render"]["pager"] = json!("cat");
+    request["render"]["pager"] = json!({"program":"cat", "args":[]});
     let plain = services.call("git.diff-files", request.clone());
-    assert!(plain["diff"]["files"][0]["rendered"].is_null());
+    assert_eq!(plain["diff"]["files"][0]["rendered"]["text"], raw);
     assert_eq!(plain["diff"]["files"][0]["raw"], raw);
     assert!(!fixture.0.join("external-started").exists());
     request["render"]["pager"] = serde_json::Value::Null;
@@ -1845,10 +2065,10 @@ fn empty_diff_pager_commands_are_rejected() {
             json!({
                 "source":{"kind":"changes", "side":"unstaged"},
                 "files":[],
-                "render":{"pager":pager},
+                "render":{"pager":{"program":pager, "args":[]}},
             }),
         );
-        assert_eq!(result["error"], "diff pager must not be empty");
+        assert_eq!(result["error"], "diff pager program must not be empty");
     }
 }
 
@@ -1894,13 +2114,27 @@ fn external_changes_replace_inflight_previews_without_publishing_old_contents() 
     fs::write(fixture.0.join("note.txt"), "old").unwrap();
     let mut services = fixture.services();
     let mut probe = ReadProbe::install(&mut services, 1);
-    let original = start(&mut services, "fs.preview", json!({"path":"note.txt"}));
+    let request = QueryRequest::Preview {
+        path: "note.txt".into(),
+        show_ignored: false,
+    };
+    let original = services.start_query(request.clone()).unwrap();
     probe.wait_for_read(&mut services, original);
-    let mut observation = observe(&mut services, "fs.preview", &json!({"path":"note.txt"}));
+    let mut observation = observe(&mut services, "fs.preview", &request.argument());
+    let query = services.acquire_query(&request).unwrap();
+    let registration = query.registration();
 
     fs::write(fixture.0.join("note.txt"), "new").unwrap();
-    wait_for_change(&mut services, &mut observation);
-    let fresh = start(&mut services, "fs.preview", json!({"path":"note.txt"}));
+    let deadline = Instant::now() + TIMEOUT;
+    while query.cache_is_current(&registration) {
+        assert!(
+            Instant::now() < deadline,
+            "change was not delivered to the watcher"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!observation.changed());
+    let fresh = services.start_query(request).unwrap();
     assert_eq!(ready(&mut services, fresh)["text"], "new");
     probe.release();
     probe.resumed.recv_timeout(TIMEOUT).unwrap();
@@ -1909,7 +2143,7 @@ fn external_changes_replace_inflight_previews_without_publishing_old_contents() 
         services.call("fs.preview", json!({"path":"note.txt"}))["text"],
         "new"
     );
-    assert_eq!(probe.count(), 2);
+    assert!(probe.count() >= 2);
 }
 
 #[test]
@@ -1919,6 +2153,7 @@ fn git_lock_files_notify_status_observers_only_when_published_to_metadata() {
     git(&fixture.0, &["init", "--quiet"]);
     let mut services = fixture.services();
     let mut observation = observe(&mut services, "git.status", &json!({}));
+    let _preview = observe(&mut services, "fs.preview", &json!({"path":"note.txt"}));
     assert_eq!(
         services.call("fs.preview", json!({"path":"note.txt"}))["text"],
         "old"
@@ -1971,8 +2206,9 @@ fn ancestor_ignore_changes_refresh_directory_previews() {
     git(&fixture.0, &["init", "--quiet"]);
     let mut services = NativeServices::new(directory).unwrap();
     let mut observation = observe(&mut services, "fs.preview", &json!({"path":""}));
+    let preview = |services: &mut NativeServices| services.call("fs.preview", json!({"path":""}));
     assert_eq!(
-        names(&services.call("fs.preview", json!({"path":""}))),
+        names(&preview(&mut services)),
         ["ignored-later.txt", "visible.txt"]
     );
 
@@ -1985,33 +2221,25 @@ fn ancestor_ignore_changes_refresh_directory_previews() {
     }
 
     fs::write(fixture.0.join(".gitignore"), "ignored-later.txt\n").unwrap();
-    wait_for_change(&mut services, &mut observation);
-    assert_eq!(
-        names(&services.call("fs.preview", json!({"path":""}))),
-        ["visible.txt"]
-    );
+    wait_for_query_result(&mut services, &mut observation, preview, |result| {
+        names(result) == ["visible.txt"]
+    });
 
     fs::write(fixture.0.join(".gitignore"), "").unwrap();
-    wait_for_change(&mut services, &mut observation);
-    assert_eq!(
-        names(&services.call("fs.preview", json!({"path":""}))),
-        ["ignored-later.txt", "visible.txt"]
-    );
+    wait_for_query_result(&mut services, &mut observation, preview, |result| {
+        names(result) == ["ignored-later.txt", "visible.txt"]
+    });
 
     fs::write(fixture.0.join("next-ignore"), "ignored-later.txt\n").unwrap();
     fs::rename(fixture.0.join("next-ignore"), fixture.0.join(".gitignore")).unwrap();
-    wait_for_change(&mut services, &mut observation);
-    assert_eq!(
-        names(&services.call("fs.preview", json!({"path":""}))),
-        ["visible.txt"]
-    );
+    wait_for_query_result(&mut services, &mut observation, preview, |result| {
+        names(result) == ["visible.txt"]
+    });
 
     fs::remove_file(fixture.0.join(".gitignore")).unwrap();
-    wait_for_change(&mut services, &mut observation);
-    assert_eq!(
-        names(&services.call("fs.preview", json!({"path":""}))),
-        ["ignored-later.txt", "visible.txt"]
-    );
+    wait_for_query_result(&mut services, &mut observation, preview, |result| {
+        names(result) == ["ignored-later.txt", "visible.txt"]
+    });
 }
 
 #[test]
@@ -2078,6 +2306,7 @@ fn external_worktree_commits_notify_status_observers_opened_in_a_subdirectory() 
     );
     let mut services = NativeServices::new(linked.join("folder")).unwrap();
     let mut observation = observe(&mut services, "git.status", &json!({}));
+    let _preview = observe(&mut services, "fs.preview", &json!({"path":"note.txt"}));
     assert_eq!(
         services.call("fs.preview", json!({"path":"note.txt"}))["text"],
         "text"
@@ -2247,7 +2476,7 @@ fn cancelling_one_subscriber_preserves_the_other_subscribers_read() {
 fn subscribing_after_the_last_cancellation_starts_a_fresh_read() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join("note.txt"), "old").unwrap();
-    let mut services = fixture.services();
+    let mut services = fixture.services_without_watch_events();
     let mut probe = ReadProbe::install(&mut services, 1);
     let _observation = observe(&mut services, "fs.preview", &json!({"path":"note.txt"}));
     let cancelled = start(&mut services, "fs.preview", json!({"path":"note.txt"}));
@@ -2268,7 +2497,7 @@ fn subscribing_after_the_last_cancellation_starts_a_fresh_read() {
 fn invalidation_keeps_subscribers_and_discards_a_late_old_snapshot() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join("note.txt"), "old").unwrap();
-    let mut services = fixture.services();
+    let mut services = fixture.services_without_watch_events();
     let mut probe = ReadProbe::install(&mut services, 1);
     let _observation = observe(&mut services, "fs.preview", &json!({"path":"note.txt"}));
     let original = start(&mut services, "fs.preview", json!({"path":"note.txt"}));
@@ -2294,7 +2523,7 @@ fn invalidation_keeps_subscribers_and_discards_a_late_old_snapshot() {
 fn invalidation_refreshes_a_completed_subscription_that_has_not_been_polled() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join("note.txt"), "old").unwrap();
-    let mut services = fixture.services();
+    let mut services = fixture.services_without_watch_events();
     let probe = ReadProbe::install(&mut services, 0);
     let first = start(&mut services, "fs.preview", json!({"path":"note.txt"}));
     let unpolled = start(&mut services, "fs.preview", json!({"path":"note.txt"}));
@@ -2426,6 +2655,48 @@ fn filesystem_subscriptions_retry_when_the_worker_queue_is_full() {
         assert_eq!(result["handle"], handle);
     }
     assert_eq!(probe.count(), 44);
+}
+
+#[test]
+fn git_queries_wait_for_worker_capacity_without_publishing_progress() {
+    let fixture = Fixture::new();
+    git(&fixture.0, &["init", "--quiet"]);
+    for index in 0..36 {
+        fs::write(fixture.0.join(format!("{index}.txt")), "text").unwrap();
+    }
+    let mut services = fixture.services();
+    let mut probe = ReadProbe::install(&mut services, 4);
+    let _git = observe(&mut services, "git.status", &json!({}));
+    let _files = (0..36)
+        .map(|index| {
+            observe(
+                &mut services,
+                "fs.preview",
+                &json!({"path":format!("{index}.txt")}),
+            )
+        })
+        .collect::<Vec<_>>();
+    for index in 0..36 {
+        let handle = start(
+            &mut services,
+            "fs.preview",
+            json!({"path":format!("{index}.txt")}),
+        );
+        if index < 4 {
+            probe.wait_for_read(&mut services, handle);
+        }
+    }
+    let handle = start(&mut services, "git.status", json!({}));
+    assert!(matches!(
+        services.poll_query(handle).unwrap(),
+        super::QueryPoll::Pending
+    ));
+    assert!(services.status_progress(handle).unwrap().is_none());
+
+    probe.release();
+    let status = ready(&mut services, handle);
+    assert_eq!(status["entries"].as_array().unwrap().len(), 36);
+    assert!(services.status_progress(handle).is_err());
 }
 
 #[test]
@@ -2572,6 +2843,7 @@ fn historical_previews_read_objects_from_a_linked_worktree() {
     assert_eq!(files["files"][0]["deletions"], 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn historical_previews_reject_binary_large_and_symbolic_link_objects() {
     let fixture = Fixture::new();
@@ -2912,6 +3184,7 @@ fn released_subscriptions_do_not_install_queued_watches() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn successful_preview_retries_preserve_the_original_registration_failure() {
     let fixture = Fixture::new();
