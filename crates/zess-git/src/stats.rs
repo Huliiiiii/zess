@@ -8,18 +8,20 @@ use git2::{
 };
 
 use super::LineStats;
-use crate::{Execution, Repository};
+use crate::{Execution, NativeGitQueries};
+use zess_platform::FileSystem;
 
 const UNTRACKED_SIZE_LIMIT: u64 = 1024 * 1024;
 
-impl Repository {
+impl NativeGitQueries {
     pub(crate) fn git_worktree_counts(
         &self,
-        cancellation: &impl Execution,
+        root: &Path,
+        cancellation: &dyn Execution,
     ) -> Result<HashMap<String, Option<LineStats>>> {
         cancellation.check()?;
-        let repository = GitRepository::discover(&self.root)
-            .with_context(|| format!("open Git repository at {}", self.root.display()))?;
+        let repository = GitRepository::discover(root)
+            .with_context(|| format!("open Git repository at {}", root.display()))?;
         let tree = match repository.head() {
             Ok(head) => Some(head.peel_to_tree().context("read HEAD tree")?),
             Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
@@ -27,7 +29,7 @@ impl Repository {
             }
             Err(error) => return Err(error).context("resolve HEAD"),
         };
-        let prefix = self.git_workspace_prefix(&repository)?;
+        let prefix = self.git_workspace_prefix(root, &repository)?;
         let mut options = diff_options(&prefix);
         options
             .show_untracked_content(true)
@@ -40,17 +42,24 @@ impl Repository {
         cancellation.check()?;
         diff.find_similar(Some(DiffFindOptions::new().renames(true)))
             .context("detect renamed files")?;
-        diff_counts(&diff, &prefix, &self.root, cancellation)
+        diff_counts(
+            &diff,
+            &prefix,
+            root,
+            self.file_system.as_ref(),
+            cancellation,
+        )
     }
 
     pub(super) fn git_commit_counts(
         &self,
+        root: &Path,
         oid: &str,
-        cancellation: &impl Execution,
+        cancellation: &dyn Execution,
     ) -> Result<HashMap<String, Option<LineStats>>> {
         cancellation.check()?;
-        let repository = GitRepository::discover(&self.root)
-            .with_context(|| format!("open Git repository at {}", self.root.display()))?;
+        let repository = GitRepository::discover(root)
+            .with_context(|| format!("open Git repository at {}", root.display()))?;
         let commit = repository
             .revparse_single(oid)?
             .peel_to_commit()
@@ -61,7 +70,7 @@ impl Repository {
         } else {
             Some(commit.parent(0)?.tree()?)
         };
-        let prefix = self.git_workspace_prefix(&repository)?;
+        let prefix = self.git_workspace_prefix(root, &repository)?;
         let mut options = diff_options(&prefix);
         let mut diff = repository
             .diff_tree_to_tree(parent.as_ref(), Some(&tree), Some(&mut options))
@@ -70,18 +79,26 @@ impl Repository {
         diff.find_similar(Some(DiffFindOptions::new().renames(true)))
             .context("detect renamed files")?;
         // Commit name-status paths are repository-relative.
-        diff_counts(&diff, Path::new(""), &self.root, cancellation)
+        diff_counts(
+            &diff,
+            Path::new(""),
+            root,
+            self.file_system.as_ref(),
+            cancellation,
+        )
     }
 
     pub(super) fn git_workspace_prefix(
         &self,
+        workspace: &Path,
         repository: &GitRepository,
     ) -> Result<std::path::PathBuf> {
-        let root = repository
-            .workdir()
-            .context("Git repository has no working directory")?
-            .canonicalize()?;
-        Ok(self.root.strip_prefix(root)?.to_owned())
+        let root = self.file_system.canonicalize(
+            repository
+                .workdir()
+                .context("Git repository has no working directory")?,
+        )?;
+        Ok(workspace.strip_prefix(root)?.to_owned())
     }
 }
 
@@ -98,7 +115,8 @@ fn diff_counts(
     diff: &Diff<'_>,
     prefix: &Path,
     workspace: &Path,
-    cancellation: &impl Execution,
+    file_system: &dyn FileSystem,
+    cancellation: &dyn Execution,
 ) -> Result<HashMap<String, Option<LineStats>>> {
     let mut counts = HashMap::new();
     // git2 exposes no cancellation callback for diff generation, rename
@@ -117,7 +135,7 @@ fn diff_counts(
             continue;
         }
         if delta.status() == Delta::Untracked {
-            let metadata = match workspace.join(path).symlink_metadata() {
+            let metadata = match file_system.symlink_metadata(&workspace.join(path)) {
                 Ok(metadata) => Some(metadata),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(error.into()),

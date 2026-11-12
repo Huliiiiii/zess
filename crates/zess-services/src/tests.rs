@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 
 use super::{NativeServices, Observation, QueryRequest};
 
+mod git_queries;
+
 struct Fixture(PathBuf);
 
 impl Fixture {
@@ -430,6 +432,50 @@ fn directory_previews_default_non_boolean_ignore_options_to_false() {
 }
 
 #[test]
+fn git_status_lists_changes_when_the_palette_cannot_be_read() {
+    use zess_platform::{
+        Cancellation, NativeFileSystem, NativeWatchBackend, OwnedProcess, ProcessRunner,
+        ProcessSpec, SystemProcessRunner,
+    };
+
+    struct UnavailablePalette;
+
+    impl ProcessRunner for UnavailablePalette {
+        fn output(
+            &self,
+            spec: &ProcessSpec,
+            input: Option<&[u8]>,
+            cancellation: &dyn Cancellation,
+        ) -> anyhow::Result<std::process::Output> {
+            if spec.args.iter().any(|arg| arg == "--type=color") {
+                anyhow::bail!("reading the palette failed");
+            }
+            SystemProcessRunner.output(spec, input, cancellation)
+        }
+
+        fn spawn(&self, spec: &ProcessSpec) -> anyhow::Result<OwnedProcess> {
+            SystemProcessRunner.spawn(spec)
+        }
+    }
+
+    let fixture = Fixture::new();
+    git(&fixture.0, &["init", "--quiet"]);
+    fs::write(fixture.0.join("note.txt"), "text\n").unwrap();
+    let mut services = NativeServices::with_backends(
+        fixture.0.clone(),
+        Arc::new(NativeFileSystem),
+        Arc::new(UnavailablePalette),
+        Arc::new(NativeWatchBackend),
+    )
+    .unwrap();
+
+    let handle = start(&mut services, "git.status", json!({}));
+    let status = ready(&mut services, handle);
+    assert_eq!(status["entries"][0]["path"], "note.txt");
+    assert_eq!(status["entries"][0]["untracked"], true);
+}
+
+#[test]
 fn git_status_ignores_arguments() {
     let fixture = Fixture::new();
     git(&fixture.0, &["init", "--quiet"]);
@@ -502,6 +548,7 @@ fn untracked_line_counts_distinguish_text_binary_and_oversized_files() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn untracked_counts_use_nested_workspace_paths_and_symbolic_link_content() {
     let fixture = Fixture::new();
@@ -1032,6 +1079,55 @@ fn cached_queries_reuse_live_snapshots_without_starting_work() {
 }
 
 #[test]
+fn directory_entries_use_workspace_relative_paths() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.0.join("nested/deeper")).unwrap();
+    fs::write(fixture.0.join("nested/deeper/file"), "").unwrap();
+    let mut services = fixture.services();
+    let result = services.call("fs.list", json!({"path": "nested/deeper"}));
+    assert_eq!(result["entries"][0]["path"], "nested/deeper/file");
+    for (path, expected) in [
+        ("nested/deeper/", "nested/deeper/file"),
+        ("./nested/deeper", "./nested/deeper/file"),
+    ] {
+        let result = services.call("fs.list", json!({"path": path}));
+        assert_eq!(result["entries"][0]["path"], expected);
+    }
+    #[cfg(windows)]
+    {
+        let result = services.call("fs.list", json!({"path": "nested\\deeper"}));
+        assert_eq!(result["entries"][0]["path"], "nested/deeper/file");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_listing_rejects_non_utf8_filenames() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join(std::ffi::OsStr::from_bytes(b"\xff")), "").unwrap();
+    let result = fixture.services().call("fs.list", json!({}));
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("filename that is not UTF-8")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_entry_paths_preserve_literal_backslashes() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.0.join("nested")).unwrap();
+    fs::write(fixture.0.join("nested/a\\b"), "").unwrap();
+    let mut services = fixture.services();
+    let result = services.call("fs.list", json!({"path": "nested"}));
+    assert_eq!(result["entries"][0]["path"], "nested/a\\b");
+}
+
+#[test]
 fn cached_directory_queries_preserve_each_requests_filter_and_path() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join(".gitignore"), "*.tmp\n").unwrap();
@@ -1374,6 +1470,7 @@ fn file_observations_follow_replaced_parent_directories() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn file_observations_follow_retargeted_symbolic_link_directories() {
     let fixture = Fixture::new();
@@ -1409,6 +1506,7 @@ fn file_observations_follow_retargeted_symbolic_link_directories() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn directory_observations_follow_retargeted_symbolic_links() {
     let fixture = Fixture::new();
@@ -1441,6 +1539,7 @@ fn directory_observations_follow_retargeted_symbolic_links() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn file_observations_follow_retargeted_intermediate_symbolic_links() {
     let fixture = Fixture::new();
@@ -1813,16 +1912,16 @@ fn an_explicit_diff_pager_replaces_the_configured_external_renderer() {
     let mut request = json!({
         "source":{"kind":"changes", "side":"unstaged"},
         "files":[{"path":"note.txt", "original_path":null}],
-        "render":{"width":120, "pager":"printf 'override:%s\\n' \"$COLUMNS\"; cat"},
+        "render":{"width":120, "pager":{"program":"sh", "args":["-c", "printf 'override:%s\\n' \"$COLUMNS\"; cat"]}},
     });
     let rendered = services.call("git.diff-files", request.clone());
     let file = &rendered["diff"]["files"][0];
     let raw = file["raw"].as_str().unwrap();
     assert_eq!(file["rendered"]["text"], format!("override:120\n{raw}"));
     assert!(!fixture.0.join("external-started").exists());
-    request["render"]["pager"] = json!("cat");
+    request["render"]["pager"] = json!({"program":"cat", "args":[]});
     let plain = services.call("git.diff-files", request.clone());
-    assert!(plain["diff"]["files"][0]["rendered"].is_null());
+    assert_eq!(plain["diff"]["files"][0]["rendered"]["text"], raw);
     assert_eq!(plain["diff"]["files"][0]["raw"], raw);
     assert!(!fixture.0.join("external-started").exists());
     request["render"]["pager"] = serde_json::Value::Null;
@@ -1845,10 +1944,10 @@ fn empty_diff_pager_commands_are_rejected() {
             json!({
                 "source":{"kind":"changes", "side":"unstaged"},
                 "files":[],
-                "render":{"pager":pager},
+                "render":{"pager":{"program":pager, "args":[]}},
             }),
         );
-        assert_eq!(result["error"], "diff pager must not be empty");
+        assert_eq!(result["error"], "diff pager program must not be empty");
     }
 }
 
@@ -2429,6 +2528,48 @@ fn filesystem_subscriptions_retry_when_the_worker_queue_is_full() {
 }
 
 #[test]
+fn git_queries_wait_for_worker_capacity_without_publishing_progress() {
+    let fixture = Fixture::new();
+    git(&fixture.0, &["init", "--quiet"]);
+    for index in 0..36 {
+        fs::write(fixture.0.join(format!("{index}.txt")), "text").unwrap();
+    }
+    let mut services = fixture.services();
+    let mut probe = ReadProbe::install(&mut services, 4);
+    let _git = observe(&mut services, "git.status", &json!({}));
+    let _files = (0..36)
+        .map(|index| {
+            observe(
+                &mut services,
+                "fs.preview",
+                &json!({"path":format!("{index}.txt")}),
+            )
+        })
+        .collect::<Vec<_>>();
+    for index in 0..36 {
+        let handle = start(
+            &mut services,
+            "fs.preview",
+            json!({"path":format!("{index}.txt")}),
+        );
+        if index < 4 {
+            probe.wait_for_read(&mut services, handle);
+        }
+    }
+    let handle = start(&mut services, "git.status", json!({}));
+    assert!(matches!(
+        services.poll_query(handle).unwrap(),
+        super::QueryPoll::Pending
+    ));
+    assert!(services.status_progress(handle).unwrap().is_none());
+
+    probe.release();
+    let status = ready(&mut services, handle);
+    assert_eq!(status["entries"].as_array().unwrap().len(), 36);
+    assert!(services.status_progress(handle).is_err());
+}
+
+#[test]
 fn cached_previews_preserve_directory_requirements_in_path_aliases() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join("note.txt"), "text").unwrap();
@@ -2572,6 +2713,7 @@ fn historical_previews_read_objects_from_a_linked_worktree() {
     assert_eq!(files["files"][0]["deletions"], 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn historical_previews_reject_binary_large_and_symbolic_link_objects() {
     let fixture = Fixture::new();
@@ -2912,6 +3054,7 @@ fn released_subscriptions_do_not_install_queued_watches() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn successful_preview_retries_preserve_the_original_registration_failure() {
     let fixture = Fixture::new();
