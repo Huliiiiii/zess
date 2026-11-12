@@ -2,11 +2,34 @@ use super::input::Input;
 use super::*;
 
 #[test]
+fn line_insertion_preserves_crlf_when_saved() {
+    for (commands, expected) in [
+        (
+            &["text.insert", "text.insert-newline"][..],
+            "\r\nfirst\r\nsecond\r\n",
+        ),
+        (&["text.open-above"][..], "\r\nfirst\r\nsecond\r\n"),
+        (&["text.open-below"][..], "first\r\n\r\nsecond\r\n"),
+    ] {
+        let fixture = Fixture::new();
+        let path = fixture.write("source.txt", "first\r\nsecond\r\n");
+        let mut session = fixture.session(&[path.clone()]);
+        for command in commands {
+            session.execute_command(command, Value::Null).unwrap();
+        }
+        session.execute_command("text.escape", Value::Null).unwrap();
+        session.command("w").unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), expected, "{commands:?}");
+    }
+}
+
+#[test]
 fn a_mode_change_does_not_consume_the_first_inserted_character_as_an_old_prefix() {
     let fixture = Fixture::new();
     let mut session = fixture.session(&[]);
     session.input("g");
     session.set_mode(session.focus, "insert").unwrap();
+    assert!(session.frame().prompt.is_empty());
     session.input("x");
     assert_eq!(Input::new(&mut session).text_state().source, "x");
 }
@@ -20,7 +43,7 @@ fn a_count_in_another_mode_cannot_restore_a_previous_modes_prefix() {
     session.input("g");
     session.set_mode(session.focus, "select").unwrap();
     session.input("2");
-    assert!(session.pending.is_empty());
+    assert!(session.key_sequence.keys().is_empty());
     session.set_mode(session.focus, "normal").unwrap();
     session.input("e");
     assert_eq!(
@@ -182,4 +205,24 @@ fn counts_and_key_prefixes_remain_separate_until_cancelled() {
         session.input("Esc");
         assert!(session.frame().prompt.is_empty());
     }
+}
+
+#[test]
+fn changing_key_bindings_clears_the_previous_prefix_before_rendering_hints() {
+    let scripts = Fixture::new();
+    let fixture = Fixture::new();
+    let mut session = fixture.session(&[]);
+    session.input("g");
+    assert_eq!(session.frame().prompt, "g … · Esc to cancel");
+    session
+        .scripts
+        .as_mut()
+        .unwrap()
+        .load(&scripts.write(
+            "updated-keys.w",
+            "map-modal \"text\" \"z\" \"text.move-right\"\n",
+        ))
+        .unwrap();
+    assert!(session.frame().prompt.is_empty());
+    assert!(session.key_sequence.keys().is_empty());
 }

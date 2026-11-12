@@ -1,4 +1,6 @@
 use super::*;
+use etcetera::base_strategy::{BaseStrategy, choose_base_strategy};
+use std::env;
 
 #[test]
 fn a_failed_grammar_does_not_skip_the_remaining_selected_grammars() {
@@ -8,7 +10,7 @@ fn a_failed_grammar_does_not_skip_the_remaining_selected_grammars() {
     )
     .unwrap();
     let attempted = Mutex::new(Vec::new());
-    let error = run_grammars(selected, "build", 2, |grammar| {
+    let error = run_grammars(selected, "build", 2, &|_, _| {}, |grammar| {
         attempted.lock().unwrap().push(grammar.grammar_id.clone());
         if grammar.grammar_id == "rust" || grammar.grammar_id == "python" {
             anyhow::bail!("missing source");
@@ -101,6 +103,45 @@ fn building_the_bundled_grammar_installs_inherited_language_queries() {
         ])
         .env("ZESS_TEST_QUERY_INSTALLATION", "1")
         .env("ZESS_RUNTIME", directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_lookup_survives_replacement_of_the_running_executable() {
+    if env::var_os("ZESS_TEST_DELETED_EXECUTABLE").is_some() {
+        let executable = env::current_exe().unwrap();
+        let runtime = executable.parent().unwrap().join("runtime");
+        std::fs::remove_file(&executable).unwrap();
+        assert_eq!(default_directory().unwrap(), runtime);
+        std::fs::remove_dir(&runtime).unwrap();
+        let strategy = choose_base_strategy().unwrap();
+        assert_eq!(
+            default_directory().unwrap(),
+            strategy.cache_dir().join("zess/runtime")
+        );
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("runtime-test");
+    std::fs::copy(env::current_exe().unwrap(), &executable).unwrap();
+    std::fs::create_dir(directory.path().join("runtime")).unwrap();
+    let output = std::process::Command::new(executable)
+        .args([
+            "--exact",
+            "runtime::tests::runtime_lookup_survives_replacement_of_the_running_executable",
+            "--nocapture",
+        ])
+        .env("ZESS_TEST_DELETED_EXECUTABLE", "1")
+        .env_remove("ZESS_RUNTIME")
         .output()
         .unwrap();
     assert!(

@@ -138,7 +138,7 @@ fn surface_mouse_events_belong_to_their_page_and_leave_file_selection_unchanged(
         serde_json::to_value(&session.views[&left].location.selection).unwrap(),
         selection
     );
-    assert_eq!(session.views[&left].layer, None);
+    assert_eq!(session.views.child(left), None);
     let frame = session.frame();
     session.mouse(
         frame.mouse_context,
@@ -377,7 +377,7 @@ fn clicking_a_surface_finishes_pending_browser_input_before_the_next_key() {
                 session.input(key);
             }
             assert!(
-                !session.pending.is_empty()
+                !session.key_sequence.keys().is_empty()
                     || !session.views[&source].count.is_empty()
                     || !matches!(session.views[&source].register, RegisterInput::None)
                     || session.views[&source].jump.is_some(),

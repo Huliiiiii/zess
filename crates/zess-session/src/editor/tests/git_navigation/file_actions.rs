@@ -26,6 +26,22 @@ fn yank(session: &mut Session, key: &str) -> Vec<String> {
     clipboard
 }
 
+fn yank_operation(session: &mut Session, event: &str) -> Vec<String> {
+    let buffer = session.views[&session.focus].location.buffer;
+    let Buffer::Data { kind, .. } = &session.buffers[&buffer] else {
+        panic!("expected a Git file list");
+    };
+    let command = format!("{kind}.{event}");
+    session.execute_command(&command, json!({})).unwrap();
+    settle(session);
+    let mut clipboard = Vec::new();
+    session.flush_clipboard_writes(|text| {
+        clipboard.push(text);
+        Ok(())
+    });
+    clipboard
+}
+
 #[test]
 fn file_actions_follow_the_selected_worktree_or_commit() {
     let (fixture, _) = repository();
@@ -37,7 +53,7 @@ fn file_actions_follow_the_selected_worktree_or_commit() {
             session.command("git.page-history").unwrap();
             settle(&mut session);
             session.input("y");
-            assert!(session.pending.is_empty());
+            assert!(session.key_sequence.keys().is_empty());
             session.input("Enter");
             settle(&mut session);
         }
@@ -140,20 +156,17 @@ fn directories_and_deleted_files_keep_their_paths_without_fabricating_contents()
     session.command("git").unwrap();
     settle(&mut session);
     select(&mut session, "directory:dir");
-    assert_eq!(yank(&mut session, "p"), ["dir"]);
-    assert!(yank(&mut session, "f").is_empty());
-    assert_eq!(
-        session.message,
-        "error: Select files to yank contents or diffs"
-    );
-    assert!(yank(&mut session, "d").is_empty());
-    assert_eq!(
-        session.message,
-        "error: Select files to yank contents or diffs"
-    );
+    assert_eq!(yank_operation(&mut session, "yank-path"), ["dir"]);
+    for command in ["git.yank-content", "git.yank-diff"] {
+        let error = session.execute_command(command, json!({})).unwrap_err();
+        assert_eq!(error.to_string(), "Select files to yank contents or diffs");
+    }
     select(&mut session, "file:dir/nested/deleted.txt");
-    assert_eq!(yank(&mut session, "p"), ["dir/nested/deleted.txt"]);
-    assert!(yank(&mut session, "f").is_empty());
+    assert_eq!(
+        yank_operation(&mut session, "yank-path"),
+        ["dir/nested/deleted.txt"]
+    );
+    assert!(yank_operation(&mut session, "yank-content").is_empty());
     assert!(session.message.contains("read "), "{}", session.message);
 }
 
@@ -169,10 +182,10 @@ fn historical_yanks_do_not_read_a_worktree_replacement_for_a_deleted_file() {
     settle(&mut session);
     session.input("Enter");
     settle(&mut session);
-    assert_eq!(yank(&mut session, "p"), ["note.txt"]);
-    assert!(yank(&mut session, "f").is_empty());
+    assert_eq!(yank_operation(&mut session, "yank-path"), ["note.txt"]);
+    assert!(yank_operation(&mut session, "yank-content").is_empty());
     assert_eq!(session.message, "This file does not exist in this commit");
-    let diff = yank(&mut session, "d");
+    let diff = yank_operation(&mut session, "yank-diff");
     assert!(diff[0].contains("-historical\n"));
     assert!(!diff[0].contains("replacement"));
 }
@@ -190,10 +203,13 @@ fn historical_renames_keep_their_destination_path_and_commit_contents() {
     settle(&mut session);
     session.input("Enter");
     settle(&mut session);
-    assert_eq!(yank(&mut session, "p"), ["renamed.txt"]);
-    assert_eq!(yank(&mut session, "n"), ["renamed.txt"]);
-    assert_eq!(yank(&mut session, "f"), ["historical\n"]);
-    let diff = yank(&mut session, "d");
+    assert_eq!(yank_operation(&mut session, "yank-path"), ["renamed.txt"]);
+    assert_eq!(yank_operation(&mut session, "yank-name"), ["renamed.txt"]);
+    assert_eq!(
+        yank_operation(&mut session, "yank-content"),
+        ["historical\n"]
+    );
+    let diff = yank_operation(&mut session, "yank-diff");
     assert!(diff[0].contains("rename from note.txt\n"));
     assert!(diff[0].contains("rename to renamed.txt\n"));
     assert!(!diff[0].contains("replacement"));

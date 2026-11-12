@@ -113,6 +113,11 @@ pub enum QueryResult {
         text: String,
         truncated: bool,
     },
+    FileRead {
+        #[serde(skip)]
+        target: std::path::PathBuf,
+        text: String,
+    },
     Diff {
         path: String,
         text: String,

@@ -45,16 +45,12 @@ impl Workspace {
         let result: Result<_> = match request {
             QueryRequest::ReadFile { path } => {
                 anyhow::ensure!(path.is_absolute(), "file read requires an absolute path");
-                let text = self
+                let (target, text) = self
                     .filesystem
-                    .read_to_string(path)
+                    .read_text_file(path)
                     .with_context(|| format!("read {}", path.display()))?;
                 cancellation.check()?;
-                Ok(QueryResult::Text {
-                    path: path.to_string_lossy().into_owned(),
-                    text,
-                    truncated: false,
-                })
+                Ok(QueryResult::FileRead { target, text })
             }
             QueryRequest::List { .. } | QueryRequest::Preview { .. } => {
                 let (path, request) = Request::from_query(request)?;

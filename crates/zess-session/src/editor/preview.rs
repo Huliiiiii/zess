@@ -1,3 +1,4 @@
+use super::ScrollMode;
 use super::commands::PreviewCommand;
 use super::pages::{
     PreviewPublication, PreviewSlots, PreviewSurface, RenderTarget, Slot, SlotContent,
@@ -22,6 +23,7 @@ enum SourceLine {
 }
 
 pub(super) struct PendingDiffSource {
+    operation_id: Option<String>,
     origin: ViewId,
     buffer: BufferId,
     handle: u64,
@@ -30,6 +32,7 @@ pub(super) struct PendingDiffSource {
 }
 
 pub(super) struct PendingPatch {
+    operation_id: Option<String>,
     source: ViewId,
     buffer: BufferId,
     task: zess_services::PatchTask,
@@ -45,7 +48,7 @@ impl Session {
             return;
         };
         if diff.mapped_rendering() {
-            if view.location.manual_viewport {
+            if view.location.scroll_mode == ScrollMode::UserControlled {
                 let visible = view.location.scroll
                     ..view
                         .location
@@ -54,11 +57,11 @@ impl Session {
                 view.location
                     .diff_selection
                     .focus_visible(diff.index(diff::Presentation::Rendered), visible);
-                view.location.manual_viewport = false;
+                view.location.scroll_mode = ScrollMode::FollowSelection;
             }
             return;
         }
-        if view.location.manual_viewport {
+        if view.location.scroll_mode == ScrollMode::UserControlled {
             let selection = diff.raw_selection_at_rendered(view.location.scroll);
             let current = view.location.diff_selection.row();
             let same_file = current
@@ -75,7 +78,7 @@ impl Session {
         view.location.diff_presentation = diff::Presentation::Raw;
         view.location.scroll = view.location.diff_selection.row().unwrap_or(0);
         view.location.horizontal_scroll = 0;
-        view.location.manual_viewport = false;
+        view.location.scroll_mode = ScrollMode::FollowSelection;
     }
 
     pub(super) fn blur_diff(&mut self, id: ViewId) {
@@ -106,7 +109,7 @@ impl Session {
                 view.location.horizontal_scroll = 0;
             }
             view.location.diff_presentation = diff::Presentation::Rendered;
-            view.location.manual_viewport = true;
+            view.location.scroll_mode = ScrollMode::UserControlled;
         }
     }
 
@@ -148,7 +151,12 @@ impl Session {
 
     pub(super) fn plugin_file_path(&self, path: &str) -> Result<PathBuf> {
         let absolute = self.absolute(Path::new(path));
-        let absolute = absolute.canonicalize().unwrap_or(absolute);
+        let absolute = self
+            .services
+            .borrow()
+            .file_system()
+            .canonicalize(&absolute)
+            .unwrap_or(absolute);
         let authorized = self.buffers.values().any(|buffer| {
             matches!(buffer, Buffer::Text(text) if text.path() == Some(absolute.as_path()))
         });
@@ -164,18 +172,27 @@ impl Session {
         path: &str,
         line: usize,
     ) -> Result<()> {
-        if self.views[&parent].layer.is_some() {
+        if self.views.child(parent).is_some() {
             bail!("view already has a layer");
         }
         self.focus_view(parent)?;
         let path = self.plugin_file_path(path)?;
+        self.cancel_input_context()?;
+        let parent = self.focus;
+        anyhow::ensure!(
+            self.views.child(parent).is_none(),
+            "view already has a layer"
+        );
         let buffer = self.open_file_buffer(&path)?;
         let child = self.create_page(buffer);
-        let view = self.views.get_mut(&child).unwrap();
-        view.parent = Some(parent);
-        view.layer_content = Some(LayerContent::File);
-        view.presentation = LayerPresentation::Fullscreen;
-        self.views.get_mut(&parent).unwrap().layer = Some(child);
+        self.views.attach_layer(
+            child,
+            super::LayerAttachment {
+                parent,
+                content: LayerContent::File,
+                presentation: LayerPresentation::Fullscreen,
+            },
+        );
         self.focus_view(child)?;
         self.buffers
             .get_mut(&buffer)
@@ -186,14 +203,9 @@ impl Session {
         Ok(())
     }
 
-    fn retire_preview(&mut self, source: ViewId, id: ViewId, mut view: View) {
-        if let Some(child) = view.layer.take() {
-            let mut parent = source;
-            while let Some(layer) = self.views[&parent].layer {
-                parent = layer;
-            }
-            self.views.get_mut(&child).unwrap().parent = Some(parent);
-            self.views.get_mut(&parent).unwrap().layer = Some(child);
+    fn retire_preview(&mut self, source: ViewId, id: ViewId, view: View) {
+        if let Some(child) = self.views.child(id) {
+            self.reparent_layer_to_source(child, source);
         }
         self.retire_view(id, view);
     }
@@ -221,6 +233,18 @@ impl Session {
             .is_some_and(|previews| previews.contains(self.focus));
         if focused {
             self.cancel_input_context()?;
+        }
+        let prompt_targets = self
+            .prompts()
+            .map(|prompt| prompt.target.view)
+            .filter(|view| {
+                self.views
+                    .previews(page)
+                    .is_some_and(|previews| previews.contains(*view))
+            })
+            .collect::<Vec<_>>();
+        for view in prompt_targets {
+            self.cancel_prompt_for_view(view)?;
         }
         for slot in self.views.take_previews(page) {
             self.retire_preview_slot(source, slot);
@@ -358,6 +382,19 @@ impl Session {
             self.cancel_input_context()?;
             self.activate_view(source);
         }
+        let prompt_targets = self
+            .prompts()
+            .map(|prompt| prompt.target.view)
+            .filter(|view| {
+                self.views
+                    .previews(page)
+                    .is_some_and(|previews| previews.contains(*view))
+                    && !retained_views.iter().any(|(_, target)| target == view)
+            })
+            .collect::<Vec<_>>();
+        for view in prompt_targets {
+            self.cancel_prompt_for_view(view)?;
+        }
         let mut retired = self.views.take_previews(page);
         for (index, target) in retained_views {
             let position = retired
@@ -397,15 +434,19 @@ impl Session {
                 self.focus_view(target)?;
             }
         }
-        self.invalidate_text_prompt();
+        self.invalidate_prompt()?;
         Ok(())
     }
 
     fn preview_buffer(&self, path: &str, content: PreviewContent) -> Result<Buffer> {
         Ok(match content {
             PreviewContent::Text { text } => {
-                let mut text =
-                    TextBuffer::new_preview_with_path(&text, &self.absolute(Path::new(&path)));
+                let mut text = TextBuffer::new_preview_with_capabilities(
+                    &text,
+                    &self.absolute(Path::new(&path)),
+                    self.services.borrow().file_system(),
+                    self.syntax_provider.clone(),
+                );
                 text.set_readonly(true);
                 Buffer::PreviewText {
                     path: path.to_owned(),
@@ -422,9 +463,11 @@ impl Session {
                 diff: diff::Diff::from_git(diff, &self.workspace),
             },
             PreviewContent::Snapshot { snapshot } => {
-                let mut text = TextBuffer::new_preview_with_path(
+                let mut text = TextBuffer::new_preview_with_capabilities(
                     &snapshot.text,
                     &self.absolute(Path::new(&snapshot.id.path)),
+                    self.services.borrow().file_system(),
+                    self.syntax_provider.clone(),
                 );
                 text.set_readonly(true);
                 Buffer::PreviewText {
@@ -459,6 +502,21 @@ impl Session {
                     ..Display::default()
                 },
             },
+            PreviewContent::Items {
+                rows,
+                column_alignment,
+            } => Buffer::Items {
+                role: ItemsRole::Preview,
+                kind: "preview".into(),
+                path: path.to_owned(),
+                display: Display {
+                    title: path.to_owned(),
+                    rows,
+                    column_alignment,
+                    ..Display::default()
+                },
+                help_context: None,
+            },
             PreviewContent::Unsupported { message } => Buffer::PreviewRows {
                 kind: PreviewRowKind::Unsupported,
                 path: path.to_owned(),
@@ -480,6 +538,9 @@ impl Session {
         path: String,
         content: PreviewContent,
     ) -> Result<BufferId> {
+        if matches!(content, PreviewContent::Items { .. }) {
+            bail!("item previews require a view");
+        }
         if let Some(buffer) = old {
             let replacement = match (&self.buffers[&buffer], &content) {
                 (
@@ -539,14 +600,13 @@ impl Session {
                 }) {
                     return Ok(target);
                 }
-                if self.prompt.as_ref().is_some_and(|prompt| {
-                    matches!(prompt.kind, PromptKind::DiffSearch(_))
-                        && self
-                            .views
-                            .get(&prompt.view)
-                            .is_some_and(|view| view.location.buffer == buffer)
-                }) {
-                    self.prompt_command(PromptCommand::Cancel)?;
+                let targets = self
+                    .prompts()
+                    .filter(|prompt| prompt.target.buffer == buffer)
+                    .map(|prompt| prompt.target.view)
+                    .collect::<Vec<_>>();
+                for view in targets {
+                    self.cancel_prompt_for_view(view)?;
                 }
             }
             if let Some(target) = target {
@@ -688,6 +748,7 @@ impl Session {
         } else {
             let mut model = self.preview_buffer(&path, content)?;
             if let Some(target) = target {
+                self.cancel_prompt_for_view(target)?;
                 let buffer = self.views[&target].location.buffer;
                 if let Some(text) = model.text() {
                     text.set_registers(self.registers.clone());
@@ -706,6 +767,18 @@ impl Session {
                         },
                         Buffer::PreviewRows { kind, path, .. },
                     ) => old_kind == kind && old_path == path,
+                    (
+                        Buffer::Items {
+                            role: ItemsRole::Preview,
+                            path: old_path,
+                            ..
+                        },
+                        Buffer::Items {
+                            role: ItemsRole::Preview,
+                            path,
+                            ..
+                        },
+                    ) => old_path == path,
                     _ => false,
                 };
                 self.buffers.insert(buffer, model);
@@ -718,7 +791,7 @@ impl Session {
                         view.location.selection = ItemSelection::default();
                         view.location.scroll = 0;
                         view.location.horizontal_scroll = 0;
-                        view.location.manual_viewport = false;
+                        view.location.scroll_mode = ScrollMode::FollowSelection;
                     }
                 }
                 target
@@ -730,6 +803,7 @@ impl Session {
         let buffer = self.views[&target].location.buffer;
         let display = match &self.buffers[&buffer] {
             Buffer::PreviewRows { display, .. } => display.clone(),
+            Buffer::Items { display, .. } => display.clone(),
             _ => Display {
                 title: path,
                 ..Display::default()
@@ -742,10 +816,14 @@ impl Session {
         {
             let header = std::mem::take(&mut view.location.display.header);
             let loading = view.location.display.loading;
-            view.location.set_display(display.clone());
+            if matches!(&self.buffers[&buffer], Buffer::Items { .. }) {
+                view.project_items(&display);
+            } else {
+                view.location.set_display(display.clone());
+                view.location.selection = ItemSelection::default();
+            }
             view.location.display.header = header;
             view.location.display.loading = loading;
-            view.location.selection = ItemSelection::default();
         }
         Ok(target)
     }
@@ -774,8 +852,8 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn move_preview(&mut self, direction: ViewDirection) -> Result<()> {
-        if let Some(RenderTarget::Surface { page, slot }) = self.active_preview(self.focus) {
+    pub(super) fn move_preview(&mut self, origin: ViewId, direction: ViewDirection) -> Result<()> {
+        if let Some(RenderTarget::Surface { page, slot }) = self.active_preview(origin) {
             let (horizontal, vertical) = match direction {
                 ViewDirection::Left => (-1, 0),
                 ViewDirection::Right => (1, 0),
@@ -785,10 +863,10 @@ impl Session {
             self.scroll_surface(page, &slot, horizontal, vertical);
             return Ok(());
         }
-        let target = if self.buffers[&self.views[&self.focus].location.buffer].is_preview() {
-            self.focus
+        let target = if self.buffers[&self.views[&origin].location.buffer].is_preview() {
+            origin
         } else {
-            let Some(target) = self.preview_target(self.focus) else {
+            let Some(target) = self.preview_target(origin) else {
                 return Ok(());
             };
             if !self.views.contains_key(&target) {
@@ -830,7 +908,7 @@ impl Session {
                             .saturating_sub(view.viewport_width),
                     );
                 }
-                view.location.manual_viewport = true;
+                view.location.scroll_mode = ScrollMode::UserControlled;
             }
             Buffer::PreviewRows { .. } => {
                 let view = self.views.get_mut(&target).unwrap();
@@ -848,7 +926,7 @@ impl Session {
                         .saturating_add_signed(horizontal)
                         .min(view.horizontal_scroll_limit());
                 }
-                view.location.manual_viewport = true;
+                view.location.scroll_mode = ScrollMode::UserControlled;
             }
             _ => {}
         }
@@ -880,8 +958,8 @@ impl Session {
         }
     }
 
-    pub(super) fn focus_preview(&mut self) -> Result<()> {
-        let Some(target) = self.preview_target(self.focus) else {
+    pub(super) fn focus_preview(&mut self, origin: ViewId) -> Result<()> {
+        let Some(target) = self.preview_target(origin) else {
             return Ok(());
         };
         let Some(view) = self.views.get(&target) else {
@@ -894,13 +972,13 @@ impl Session {
                     .location
                     .scroll
                     .saturating_add(view.viewport_height.max(1));
-            if view.location.manual_viewport
+            if view.location.scroll_mode == ScrollMode::UserControlled
                 && view.location.diff_presentation == diff::Presentation::Raw
             {
                 view.location
                     .diff_selection
                     .focus_visible(diff.index(view.location.diff_presentation), visible);
-                view.location.manual_viewport = false;
+                view.location.scroll_mode = ScrollMode::FollowSelection;
             }
         }
         let view = &self.views[&target];
@@ -927,10 +1005,13 @@ impl Session {
                 selection: view.location.diff_selection.clone(),
                 scroll: view.location.scroll,
                 horizontal_scroll: view.location.horizontal_scroll,
-                manual_viewport: view.location.manual_viewport,
+                scroll_mode: view.location.scroll_mode,
             }),
             text: String::new(),
-            view: self.focus,
+            target: super::PromptTarget {
+                view: self.focus,
+                buffer: view.location.buffer,
+            },
             completion: None,
             cursor: 0,
             error: None,
@@ -938,8 +1019,8 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn search_diff(&mut self, forward: bool) -> Result<()> {
-        let view = self.views.get_mut(&self.focus).unwrap();
+    pub(super) fn search_diff(&mut self, origin: ViewId, forward: bool) -> Result<()> {
+        let view = self.views.get_mut(&origin).unwrap();
         let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] else {
             return Ok(());
         };
@@ -955,27 +1036,27 @@ impl Session {
                 forward,
             )? {
                 view.location.diff_selection.set_head(Some(row));
-                view.location.manual_viewport = false;
+                view.location.scroll_mode = ScrollMode::FollowSelection;
             }
         }
         Ok(())
     }
 
-    pub(super) fn move_diff(&mut self, forward: bool, block: bool) -> Result<()> {
-        let view = self.views.get_mut(&self.focus).unwrap();
+    pub(super) fn move_diff(&mut self, origin: ViewId, forward: bool, block: bool) -> Result<()> {
+        let view = self.views.get_mut(&origin).unwrap();
         if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
             view.location.diff_selection.move_by(
                 diff.index(view.location.diff_presentation),
                 forward,
                 block,
             );
-            view.location.manual_viewport = false;
+            view.location.scroll_mode = ScrollMode::FollowSelection;
         }
         Ok(())
     }
 
-    pub(super) fn navigate_diff(&mut self, command: PreviewCommand) -> Result<()> {
-        let view = self.views.get_mut(&self.focus).unwrap();
+    pub(super) fn navigate_diff(&mut self, origin: ViewId, command: PreviewCommand) -> Result<()> {
+        let view = self.views.get_mut(&origin).unwrap();
         let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] else {
             return Ok(());
         };
@@ -1018,12 +1099,12 @@ impl Session {
             }
             _ => unreachable!("only diff navigation commands are dispatched here"),
         }
-        view.location.manual_viewport = false;
+        view.location.scroll_mode = ScrollMode::FollowSelection;
         Ok(())
     }
 
-    pub(super) fn select_diff_hunk(&mut self) -> Result<()> {
-        let view = self.views.get_mut(&self.focus).unwrap();
+    pub(super) fn select_diff_hunk(&mut self, origin: ViewId) -> Result<()> {
+        let view = self.views.get_mut(&origin).unwrap();
         if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
             view.location
                 .diff_selection
@@ -1032,8 +1113,8 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn toggle_diff_selection(&mut self) -> Result<()> {
-        let view = self.views.get_mut(&self.focus).unwrap();
+    pub(super) fn toggle_diff_selection(&mut self, origin: ViewId) -> Result<()> {
+        let view = self.views.get_mut(&origin).unwrap();
         if let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] {
             view.location
                 .diff_selection
@@ -1042,8 +1123,8 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn range_diff_selection(&mut self) -> Result<()> {
-        let view = self.views.get_mut(&self.focus).unwrap();
+    pub(super) fn range_diff_selection(&mut self, origin: ViewId) -> Result<()> {
+        let view = self.views.get_mut(&origin).unwrap();
         if matches!(
             self.buffers[&view.location.buffer],
             Buffer::PreviewDiff { .. }
@@ -1053,8 +1134,8 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn return_from_preview(&mut self) -> Result<()> {
-        let view = self.views.get_mut(&self.focus).unwrap();
+    pub(super) fn return_from_preview(&mut self, origin: ViewId) -> Result<()> {
+        let view = self.views.get_mut(&origin).unwrap();
         if matches!(
             self.buffers[&view.location.buffer],
             Buffer::PreviewDiff { .. }
@@ -1063,7 +1144,7 @@ impl Session {
             view.location.diff_selection.toggle_range();
             return Ok(());
         }
-        if let Some(source) = self.preview_source(self.focus) {
+        if let Some(source) = self.preview_source(origin) {
             self.focus_view(source)?;
         }
         Ok(())
@@ -1085,16 +1166,16 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn apply_diff_selection(&mut self) -> Result<()> {
+    pub(super) fn apply_diff_selection(&mut self, origin: ViewId) -> Result<()> {
         use zess_git::PatchRequest;
         if self.git_patch.is_some() {
             bail!("a Git index update is already running");
         }
         let source = self
-            .preview_source(self.focus)
+            .preview_source(origin)
             .context("staging requires a Git changes preview")?;
-        self.ensure_diff_ready(self.focus)?;
-        let view = &self.views[&self.focus];
+        self.ensure_diff_ready(origin)?;
+        let view = &self.views[&origin];
         let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] else {
             bail!("staging requires a Git diff");
         };
@@ -1120,10 +1201,14 @@ impl Session {
             rows,
         })?;
         self.git_patch = Some(PendingPatch {
+            operation_id: self.current_operation.clone(),
             source,
             buffer: self.views[&source].location.buffer,
             task,
         });
+        if let Some(operation_id) = &self.current_operation {
+            self.pending_operations.insert(operation_id.clone());
+        }
         self.message = match side {
             zess_git::DiffSide::Staged => "Unstaging selected changes…",
             zess_git::DiffSide::Unstaged => "Staging selected changes…",
@@ -1141,6 +1226,15 @@ impl Session {
             return false;
         };
         let pending = self.git_patch.take().unwrap();
+        if let Some(operation_id) = pending.operation_id {
+            let outcome = match &result {
+                Ok(()) => zess_protocol::CommandOutcome::Applied,
+                Err(error) => zess_protocol::CommandOutcome::Failed {
+                    message: error.clone(),
+                },
+            };
+            self.finish_operation(operation_id, outcome);
+        }
         let message = match result {
             Ok(()) => "Git index updated".into(),
             Err(error) => error,
@@ -1225,14 +1319,14 @@ impl Session {
         })
     }
 
-    pub(super) fn edit_diff_source(&mut self) -> Result<()> {
+    pub(super) fn edit_diff_source(&mut self, origin: ViewId) -> Result<()> {
         if !matches!(
-            self.buffers[&self.views[&self.focus].location.buffer],
+            self.buffers[&self.views[&origin].location.buffer],
             Buffer::PreviewDiff { .. }
         ) {
             return Ok(());
         }
-        self.open_diff_source(SnapshotPresentation::Fullscreen)
+        self.open_diff_source(origin, SnapshotPresentation::Fullscreen)
     }
 
     pub(super) fn open_worktree_source(
@@ -1243,22 +1337,29 @@ impl Session {
         presentation: SnapshotPresentation,
     ) -> Result<()> {
         let absolute = self.plugin_file_path(&path)?;
-        anyhow::ensure!(absolute.try_exists()?, "Git source file no longer exists");
+        anyhow::ensure!(
+            self.services.borrow().file_system().try_exists(&absolute)?,
+            "Git source file no longer exists"
+        );
         self.focus_view(view)?;
         match presentation {
             SnapshotPresentation::Fullscreen => self.open_file_layer(view, &path, line),
-            SnapshotPresentation::Editor => self.open_preview_path(path, line),
+            SnapshotPresentation::Editor => self.open_preview_path(view, path, line),
         }
     }
 
-    fn open_diff_source(&mut self, presentation: SnapshotPresentation) -> Result<()> {
-        match self.diff_source(self.focus)? {
+    fn open_diff_source(
+        &mut self,
+        origin: ViewId,
+        presentation: SnapshotPresentation,
+    ) -> Result<()> {
+        match self.diff_source(origin)? {
             SourceLine::Worktree { path, line } => {
-                self.open_worktree_source(self.focus, path, line, presentation)
+                self.open_worktree_source(origin, path, line, presentation)
             }
             SourceLine::ExplicitPath { path, line } => match presentation {
-                SnapshotPresentation::Fullscreen => self.open_file_layer(self.focus, &path, line),
-                SnapshotPresentation::Editor => self.open_preview_path(path, line),
+                SnapshotPresentation::Fullscreen => self.open_file_layer(origin, &path, line),
+                SnapshotPresentation::Editor => self.open_preview_path(origin, path, line),
             },
             SourceLine::Commit { commit, path, line } => {
                 self.cancel_diff_source(None);
@@ -1267,12 +1368,16 @@ impl Session {
                     .borrow_mut()
                     .start_query(QueryRequest::Blob { commit, path })?;
                 self.pending_diff_source = Some(PendingDiffSource {
-                    origin: self.focus,
-                    buffer: self.views[&self.focus].location.buffer,
+                    operation_id: self.current_operation.clone(),
+                    origin: origin,
+                    buffer: self.views[&origin].location.buffer,
                     handle,
                     presentation,
                     line,
                 });
+                if let Some(operation_id) = &self.current_operation {
+                    self.pending_operations.insert(operation_id.clone());
+                }
                 Ok(())
             }
         }
@@ -1296,6 +1401,14 @@ impl Session {
             && let Some(pending) = self.pending_diff_source.take()
         {
             self.services.borrow_mut().cancel_query(pending.handle);
+            if let Some(operation_id) = pending.operation_id {
+                self.finish_operation(
+                    operation_id,
+                    zess_protocol::CommandOutcome::Failed {
+                        message: "operation cancelled".into(),
+                    },
+                );
+            }
         }
     }
 
@@ -1342,14 +1455,23 @@ impl Session {
             )),
             Err(error) => Err(error),
         };
+        if let Some(operation_id) = pending.operation_id {
+            let outcome = match &opened {
+                Ok(()) => zess_protocol::CommandOutcome::Applied,
+                Err(error) => zess_protocol::CommandOutcome::Failed {
+                    message: format!("{error:#}"),
+                },
+            };
+            self.finish_operation(operation_id, outcome);
+        }
         if let Err(error) = opened {
             self.message = format!("{error:#}");
         }
         true
     }
 
-    pub(super) fn open_preview_source(&mut self) -> Result<()> {
-        let view = &self.views[&self.focus];
+    pub(super) fn open_preview_source(&mut self, origin: ViewId) -> Result<()> {
+        let view = &self.views[&origin];
         if let Buffer::PreviewText {
             snapshot: Some(id),
             text,
@@ -1360,24 +1482,28 @@ impl Session {
                 id: id.clone(),
                 text: text.text(),
             };
-            let source = self.preview_source(self.focus).unwrap_or(self.focus);
+            let source = self.preview_source(origin).unwrap_or(origin);
             return self.open_snapshot(source, snapshot, SnapshotPresentation::Editor);
         }
         let (path, line) = match &self.buffers[&view.location.buffer] {
             Buffer::PreviewDiff { .. } => {
-                return self.open_diff_source(SnapshotPresentation::Editor);
+                return self.open_diff_source(origin, SnapshotPresentation::Editor);
             }
-            Buffer::PreviewText { path, text, .. } => {
-                (path.clone(), text.view(self.focus).cursor().0)
-            }
+            Buffer::PreviewText { path, text, .. } => (path.clone(), text.view(origin).cursor().0),
             Buffer::PreviewRows {
                 kind: PreviewRowKind::Directory,
                 path,
                 ..
             } => {
                 let path = path.clone();
-                if self.absolute(Path::new(&path)).is_dir() {
-                    if let Some(source) = self.preview_source(self.focus) {
+                if self
+                    .services
+                    .borrow()
+                    .file_system()
+                    .metadata(&self.absolute(Path::new(&path)))
+                    .is_ok_and(|entry| entry.is_dir())
+                {
+                    if let Some(source) = self.preview_source(origin) {
                         let view = &self.views[&source];
                         if let Buffer::Data { kind, .. } = &self.buffers[&view.location.buffer]
                             && kind == "files"
@@ -1386,20 +1512,20 @@ impl Session {
                             return self.dispatch(source, "navigate", json!({"path":path}));
                         }
                     }
-                    return self.open_plugin("files", json!({"path":path}));
+                    return self.open_plugin(origin, "files", json!({"path":path}));
                 }
                 (path, 0)
             }
             _ => return Ok(()),
         };
-        self.open_preview_path(path, line)
+        self.open_preview_path(origin, path, line)
     }
 
-    fn open_preview_path(&mut self, path: String, line: usize) -> Result<()> {
+    fn open_preview_path(&mut self, origin: ViewId, path: String, line: usize) -> Result<()> {
         if path.is_empty() {
             bail!("preview has no source path");
         }
-        let source = self.views.main(self.views.page_id(self.focus));
+        let source = self.views.main(self.views.page_id(origin));
         if matches!(
             self.buffers[&self.views[&source].location.buffer],
             Buffer::Data { .. } | Buffer::Items { .. }
@@ -1407,6 +1533,6 @@ impl Session {
             self.focus_view(source)?;
             return self.open_browser_source(source, json!({"path":path, "line":line}));
         }
-        self.request(self.focus, HostRequest::OpenFile { path, line })
+        self.request(origin, HostRequest::OpenFile { path, line })
     }
 }

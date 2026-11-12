@@ -105,6 +105,7 @@ fn invalid_recursive_queries_preserve_results_and_selection_until_corrected() {
 
 #[test]
 fn query_kind_shortcuts_toggle_matching_and_allow_keymap_overrides() {
+    let scripts = Fixture::new();
     let fixture = Fixture::new();
     fs::write(fixture.0.join("one.rs"), "one").unwrap();
     fs::write(fixture.0.join("two.txt"), "two").unwrap();
@@ -151,10 +152,10 @@ fn query_kind_shortcuts_toggle_matching_and_allow_keymap_overrides() {
             .scripts
             .as_mut()
             .unwrap()
-            .load_source(
+            .load(&scripts.write(
+                "query-shortcut.w",
                 "map-key \"global\" \"prompt\" \"A-g\" \"prompt.clear\"",
-                Path::new("query-shortcut.w"),
-            )
+            ))
             .unwrap();
         session.input("A-g");
         assert_eq!(session.prompt.as_ref().unwrap().text, "");
@@ -197,15 +198,13 @@ fn query_editing_keeps_the_matching_kind_when_moving_or_clearing_input() {
 
 #[test]
 fn create_and_rename_input_preserves_the_source_selection() {
+    let scripts = Fixture::new();
     let fixture = Fixture::new();
     for name in ["a.txt", "b.txt", "c.txt"] {
         fs::write(fixture.0.join(name), name).unwrap();
     }
     let mut session = fixture.session(&[]);
-    session.scripts.as_mut().unwrap().load_source(
-        "map-key \"files\" \"insert\" \"x\" \"data.move-down\"\nmap-key \"files\" \"prompt\" \"y\" \"data.move-down\"",
-        Path::new("file-input-key.w"),
-    ).unwrap();
+    session.scripts.as_mut().unwrap().load(&scripts.write("file-input-key.w", "map-key \"files\" \"insert\" \"x\" \"data.move-down\"\nmap-key \"files\" \"prompt\" \"y\" \"data.move-down\"")).unwrap();
     session.command("files").unwrap();
     settle(&mut session);
     session.input("j");
@@ -245,6 +244,7 @@ fn create_and_rename_input_preserves_the_source_selection() {
 
 #[test]
 fn minibuffer_input_preserves_the_text_and_its_mode() {
+    let scripts = Fixture::new();
     let fixture = Fixture::new();
     let path = fixture.0.join("source.txt");
     fs::write(&path, "source\n").unwrap();
@@ -253,7 +253,8 @@ fn minibuffer_input_preserves_the_text_and_its_mode() {
         .scripts
         .as_mut()
         .unwrap()
-        .load_source(
+        .load(&scripts.write(
+            "text-prompt.w",
             r#"
 require "zess/ui"
 register-command "ask" "Ask for input"
@@ -262,8 +263,7 @@ register-command "ask" "Ask for input"
 map-key "text" "insert" "x" "text.insert-newline"
 map-key "text" "prompt" "y" "text.insert-newline"
 "#,
-            Path::new("text-prompt.w"),
-        )
+        ))
         .unwrap();
     session.input("i");
     session.command("ask").unwrap();
@@ -509,13 +509,11 @@ fn recursive_search_respects_the_ignored_paths_setting() {
 
 #[test]
 fn find_uses_configured_bindings_and_appears_in_help() {
+    let scripts = Fixture::new();
     let fixture = Fixture::new();
     nested_files(&fixture);
     let mut session = fixture.session(&[]);
-    session.scripts.as_mut().unwrap().load_source(
-        "map-modal \"files\" \"F\" \"files.find\"\nmap-key \"files.find\" \"prompt\" \"C-j\" \"data.move-down\"",
-        Path::new("custom-key.w"),
-    ).unwrap();
+    session.scripts.as_mut().unwrap().load(&scripts.write("custom-key.w", "map-modal \"files\" \"F\" \"files.find\"\nmap-key \"files.find\" \"prompt\" \"C-j\" \"data.move-down\"")).unwrap();
     session.command("files").unwrap();
     settle(&mut session);
     session.input("?");
@@ -631,4 +629,98 @@ fn filtering_shows_the_query_once_and_preserves_git_page_headers() {
         );
         assert!(session.views[&source].item_ids().is_empty());
     }
+}
+
+#[test]
+fn closing_help_restores_find_input_and_its_original_cancellation_target() {
+    let fixture = Fixture::new();
+    nested_files(&fixture);
+    let mut session = fixture.session(&[]);
+    session.command("files").unwrap();
+    settle(&mut session);
+    session.input("j");
+    let source = session.focus;
+    let original = serde_json::to_value(&session.views[&source].location.selection).unwrap();
+    let rows = session.views[&source].item_ids();
+    session.input("f");
+    type_text(&mut session, "first");
+    settle(&mut session);
+    session.command("help").unwrap();
+    session.execute_command("help.close", json!({})).unwrap();
+    assert_eq!(session.focus, source);
+    assert_eq!(session.active_prompt().unwrap().text, "first");
+    assert!(session.views[&source].location.mode == ViewMode::Custom("find".into()));
+    assert_eq!(
+        session.views[&source].item_ids(),
+        ["deep/closed/leaf/first.txt"]
+    );
+    session.input("C-u");
+    type_text(&mut session, "second");
+    settle(&mut session);
+    assert_eq!(
+        session.views[&source].item_ids(),
+        ["deep/closed/leaf/second.txt"]
+    );
+    session.input("Esc");
+    settle(&mut session);
+    assert!(session.prompt.is_none());
+    assert!(session.views[&source].location.mode == ViewMode::Normal);
+    assert_eq!(session.views[&source].item_ids(), rows);
+    assert_eq!(
+        serde_json::to_value(&session.views[&source].location.selection).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn pinning_help_cancels_find_before_leaving_the_source_in_another_split() {
+    let fixture = Fixture::new();
+    nested_files(&fixture);
+    let mut session = fixture.session(&[]);
+    session.command("files").unwrap();
+    settle(&mut session);
+    let source = session.focus;
+    let rows = session.views[&source].item_ids();
+    session.input("f");
+    type_text(&mut session, "first");
+    session.command("help").unwrap();
+    session.execute_command("help.pin", json!({})).unwrap();
+    assert!(session.help.is_none());
+    assert!(session.prompt.is_none());
+    assert!(session.views[&source].location.mode == ViewMode::Normal);
+    session.focus_view(source).unwrap();
+    settle(&mut session);
+    assert_eq!(session.views[&source].item_ids(), rows);
+    session.input("f");
+    assert_eq!(session.active_prompt().unwrap().text, "");
+}
+
+#[test]
+fn changing_the_source_mode_ends_find_while_help_owns_its_input() {
+    let fixture = Fixture::new();
+    nested_files(&fixture);
+    let mut session = fixture.session(&[]);
+    session.command("files").unwrap();
+    settle(&mut session);
+    let source = session.focus;
+    let rows = session.views[&source].item_ids();
+    session.input("f");
+    type_text(&mut session, "first");
+    settle(&mut session);
+    session.command("help").unwrap();
+    session
+        .request(
+            source,
+            HostRequest::SetMode {
+                mode: "normal".into(),
+            },
+        )
+        .unwrap();
+    assert!(session.help.is_some());
+    session.execute_command("help.close", json!({})).unwrap();
+    settle(&mut session);
+    assert_eq!(session.focus, source);
+    assert!(session.prompt.is_none());
+    assert!(session.views[&source].location.mode == ViewMode::Normal);
+    assert_eq!(session.views[&source].item_ids(), rows);
 }

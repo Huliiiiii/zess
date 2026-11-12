@@ -1,3 +1,4 @@
+use super::ScrollMode;
 use zess_ui::{MouseContext, MouseEvent, MouseKind};
 
 use super::*;
@@ -98,7 +99,7 @@ impl Session {
                 Some(None) => return,
                 None => {
                     self.prompt = None;
-                    self.pending.clear();
+                    self.key_sequence.clear();
                     self.command_mouse = None;
                 }
             }
@@ -121,7 +122,7 @@ impl Session {
     }
 
     fn clear_mouse_input(&mut self, id: ViewId) {
-        self.pending.clear();
+        self.key_sequence.clear();
         let view = self.views.get_mut(&id).unwrap();
         view.count.clear();
         view.register = RegisterInput::None;
@@ -232,7 +233,7 @@ impl Session {
                     let view = self.views.get_mut(&id).unwrap();
                     view.location.scroll =
                         view.location.scroll.saturating_add_signed(lines).min(limit);
-                    view.location.manual_viewport = true;
+                    view.location.scroll_mode = ScrollMode::UserControlled;
                 }
             }
             MouseKind::Press | MouseKind::DoubleClick | MouseKind::Drag => {
@@ -270,7 +271,7 @@ impl Session {
                 if matches!(target, Target::None) {
                     return Ok(());
                 }
-                self.clipboard_read = None;
+                self.cancel_clipboard_read("clipboard read cancelled by mouse selection");
                 self.message.clear();
                 let extend = event.kind == MouseKind::Drag;
                 match target {
@@ -300,7 +301,7 @@ impl Session {
                                 extend,
                             )
                         {
-                            view.location.manual_viewport = false;
+                            view.location.scroll_mode = ScrollMode::FollowSelection;
                         }
                     }
                     Target::Item(target) => {

@@ -12,6 +12,11 @@ use zess_ui::{Display, DisplayRow};
 #[cfg(test)]
 mod tests;
 
+pub(crate) mod json;
+pub(super) mod status;
+
+use json::Json;
+
 pub(super) struct Input(pub PluginInput);
 impl Custom for Input {}
 #[derive(Clone)]
@@ -60,6 +65,28 @@ impl Custom for Context {}
 
 pub(super) fn register(engine: &mut Engine) {
     let mut module = BuiltInModule::new("zess/native");
+    module.register_fn("%status-spans", status::spans);
+    module.register_fn("%status-format-defaults", || {
+        Json(
+            zess_plugin::DEFAULT_STATUS_FORMATS
+                .iter()
+                .map(|(name, template)| ((*name).to_owned(), serde_json::json!(template)))
+                .collect::<serde_json::Map<_, _>>()
+                .into(),
+        )
+    });
+    module.register_fn(
+        "%validate-status-formats",
+        |formats: Json| -> steel::rvals::Result<Json> {
+            zess_plugin::validate_status_formats(&formats.0).map_err(|error| {
+                steel::rerrs::SteelErr::new(
+                    steel::rerrs::ErrorKind::TypeMismatch,
+                    error.to_string(),
+                )
+            })?;
+            Ok(formats)
+        },
+    );
     module.register_fn("%input-text", |input: &Input| {
         TextContext(input.0.context.text.clone().unwrap_or_default())
     });
@@ -97,11 +124,15 @@ pub(super) fn register(engine: &mut Engine) {
         context.0.filesystem_revision
     });
     module.register_fn("%input-event", |input: &Input| input.0.event.clone());
-    module.register_fn("%input-argument", |input: &Input| input.0.argument.clone());
+    module.register_fn("%input-argument", |input: &Input| {
+        Json(input.0.argument.clone())
+    });
     module.register_fn("%input-query", |input: &Input| {
         input.0.query.clone().map(Query)
     });
-    module.register_fn("%input-options", |input: &Input| input.0.options.clone());
+    module.register_fn("%input-options", |input: &Input| {
+        Json(input.0.options.clone())
+    });
     module.register_fn("%input-context", |input: &Input| {
         Context(input.0.context.clone())
     });
@@ -177,11 +208,7 @@ pub(super) fn register(engine: &mut Engine) {
     });
     module.register_fn(
         "buffer-display",
-        |title: String,
-         header: String,
-         rows: Vec<Row>,
-         loading: bool,
-         status: serde_json::Value| {
+        |title: String, header: String, rows: Vec<Row>, loading: bool, status: Json| {
             Content(Display {
                 column_alignment: Default::default(),
                 tabs: Vec::new(),
@@ -190,10 +217,15 @@ pub(super) fn register(engine: &mut Engine) {
                 rows: rows.into_iter().map(|row| row.0).collect(),
                 rows_revision: None,
                 loading,
-                status,
+                status: status.0,
+                status_data: Default::default(),
             })
         },
     );
+    module.register_fn("with-status-data", |mut display: Content, data: Json| {
+        display.0.status_data = data.0;
+        display
+    });
     module.register_fn(
         "buffer-output",
         |display: Option<Content>, selection: Option<Selection>, requests: Vec<Request>| {
@@ -212,15 +244,12 @@ pub(super) fn register(engine: &mut Engine) {
             output
         },
     );
-    module.register_fn(
-        "watch-query",
-        |operation: String, argument: serde_json::Value| {
-            Watch(QueryWatch {
-                operation,
-                argument,
-            })
-        },
-    );
+    module.register_fn("watch-query", |operation: String, argument: Json| {
+        Watch(QueryWatch {
+            operation,
+            argument: argument.0,
+        })
+    });
     module.register_fn("preview-text", |text: String| {
         Preview(PreviewContent::Text { text })
     });
@@ -307,19 +336,21 @@ pub(super) fn register(engine: &mut Engine) {
         output.0.modified = Some(modified);
         output
     });
-    module.register_fn(
-        "%request-action",
-        |name: String, argument: serde_json::Value| Request(HostRequest::Action { name, argument }),
-    );
+    module.register_fn("%request-action", |name: String, argument: Json| {
+        Request(HostRequest::Action {
+            name,
+            argument: argument.0,
+        })
+    });
     module.register_fn("%request-open-file", |path: String, line: usize| {
         Request(HostRequest::OpenFile { path, line })
     });
-    module.register_fn(
-        "%request-open-buffer",
-        |kind: String, argument: serde_json::Value| {
-            Request(HostRequest::OpenBuffer { kind, argument })
-        },
-    );
+    module.register_fn("%request-open-buffer", |kind: String, argument: Json| {
+        Request(HostRequest::OpenBuffer {
+            kind,
+            argument: argument.0,
+        })
+    });
     module.register_fn("%request-focus-text", |buffer_id: u64, line: usize| {
         Request(HostRequest::FocusText { buffer_id, line })
     });
@@ -362,8 +393,8 @@ pub(super) fn register(engine: &mut Engine) {
         Request(HostRequest::Schedule { after_ms })
     });
     module.register_fn("%request-close", || Request(HostRequest::Close));
-    module.register_fn("%configure-view", |options: serde_json::Value| {
-        Request(HostRequest::ConfigureView { options })
+    module.register_fn("%configure-view", |options: Json| {
+        Request(HostRequest::ConfigureView { options: options.0 })
     });
     module.register_fn(
         "%request-preview",

@@ -21,9 +21,11 @@ mod native_plugins;
 mod outline;
 mod preview_config;
 mod preview_surfaces;
+mod prompt_lifecycle;
 mod regex_input;
 mod simulation;
 mod status;
+mod sync_state;
 mod text_input;
 
 struct Fixture(PathBuf);
@@ -42,6 +44,12 @@ impl Fixture {
         ));
         fs::create_dir(&path).unwrap();
         Self(path)
+    }
+
+    fn write(&self, name: &str, source: &str) -> PathBuf {
+        let path = self.0.join(name);
+        fs::write(&path, source).unwrap();
+        path
     }
 
     fn session(&self, files: &[PathBuf]) -> Session {
@@ -367,28 +375,50 @@ fn a_failed_scratch_save_does_not_leave_an_error_on_later_close_commands() {
         input_command(&mut session, "w");
         assert_eq!(session.message, "error: buffer has no file name");
         input_command(&mut session, command);
-        assert!(session.exiting());
+        assert!(!session.exiting());
         assert!(session.message.is_empty());
         assert!(session.active_prompt().is_none());
     }
 }
 
 #[test]
-fn the_last_window_refuses_to_exit_with_unsaved_hidden_buffers() {
+fn closing_a_scratch_buffer_preserves_unsaved_hidden_buffers() {
     let fixture = Fixture::new();
     let path = fixture.0.join("note.txt");
     fs::write(&path, "source").unwrap();
     let mut session = fixture.session(&[path]);
+    let original = session.views[&session.focus].location.buffer;
     for key in ["i", "!", "Esc"] {
         session.input(key);
     }
     input_command(&mut session, "new");
+    let scratch = session.views[&session.focus].location.buffer;
+    for id in session
+        .client_actions
+        .iter()
+        .map(|action| action.id)
+        .collect::<Vec<_>>()
+    {
+        assert_eq!(
+            session.begin_operation(
+                "workspace",
+                &zess_protocol::CommandAction::AcknowledgeClientAction { action_id: id }
+            ),
+            Some(zess_protocol::CommandOutcome::Applied)
+        );
+    }
     input_command(&mut session, "q");
-    assert!(!session.exiting());
-    assert_eq!(session.message, "error: unsaved buffers; :w or :q!");
-    input_command(&mut session, "q!");
-    assert!(session.exiting());
-    assert!(session.frame().status.is_empty());
+    let action = session
+        .client_actions
+        .iter()
+        .find(|action| matches!(action.kind, zess_protocol::ClientActionKind::Close { .. }))
+        .unwrap()
+        .id;
+    session
+        .close_client_buffer(action, scratch, Some(original), false)
+        .unwrap();
+    assert_eq!(session.views[&session.focus].location.buffer, original);
+    assert!(session.modified());
 }
 
 #[test]
@@ -449,6 +479,37 @@ fn draft_layers_reject_plugin_buffer_switches() {
         session.command("buffers").unwrap();
         assert_eq!(session.frame().status, buffers);
     }
+}
+
+#[test]
+fn closing_a_parent_finishes_its_draft_layer_and_keeps_the_parent_open() {
+    let fixture = Fixture::new();
+    let mut session = fixture.session(&[]);
+    let source = session.focus;
+    session
+        .request(
+            source,
+            HostRequest::Layer {
+                purpose: "draft".into(),
+                text: "draft text".into(),
+                inline: true,
+            },
+        )
+        .unwrap();
+    let layer = session.focus;
+    let buffer = session.views[&layer].location.buffer;
+    session.focus_view(source).unwrap();
+    session.command("quit").unwrap();
+    assert!(!session.exiting());
+    assert_eq!(session.focus, source);
+    assert_eq!(session.views.values().count(), 1);
+    assert_eq!(session.views.child(source), None);
+    assert_eq!(session.views.parent(layer), None);
+    assert!(!session.buffers.contains_key(&buffer));
+    assert_eq!(
+        session.views[&source].location.memories["draft:draft"]["text"],
+        "draft text"
+    );
 }
 
 #[test]
@@ -721,7 +782,7 @@ fn rejecting_an_outside_directory_keeps_the_open_file_layer() {
     );
     assert_eq!(session.focus, focus);
     assert_eq!(session.views[&focus].location.buffer, buffer);
-    assert!(session.views[&focus].parent.is_some());
+    assert!(session.views.parent(focus).is_some());
     let Buffer::Text(text) = session.buffers.get_mut(&buffer).unwrap() else {
         panic!("expected a text file layer")
     };
@@ -732,6 +793,7 @@ fn rejecting_an_outside_directory_keeps_the_open_file_layer() {
 
 #[test]
 fn opening_files_uses_the_same_action_for_default_and_custom_bindings() {
+    let scripts = Fixture::new();
     let fixture = Fixture::new();
     let path = fixture.0.join("note.txt");
     fs::write(&path, "source").unwrap();
@@ -744,10 +806,7 @@ fn opening_files_uses_the_same_action_for_default_and_custom_bindings() {
             .scripts
             .as_mut()
             .unwrap()
-            .load_source(
-                "map-modal \"files\" \"o\" \"files.open\"",
-                Path::new("custom-key.w"),
-            )
+            .load(&scripts.write("custom-key.w", "map-modal \"files\" \"o\" \"files.open\""))
             .unwrap();
         for key in keys {
             session.input(key);
@@ -1107,7 +1166,7 @@ fn diff_previews_show_one_source_line_number_per_row() {
             .flat_map(|row| &row.spans)
             .all(|span| { !span.style.starts_with("selection") && span.style != "linenr.current" })
     );
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     let (rows, _) = session.render_view(target, width, height);
     assert!(
         rows[2]
@@ -1307,7 +1366,7 @@ fn saving_a_fullscreen_file_layer_keeps_it_open_until_explicitly_closed() {
     session.input("e");
     let layer = session.focus;
     assert_ne!(layer, source, "{}", session.message);
-    assert_eq!(session.views[&layer].parent, Some(source));
+    assert_eq!(session.views.parent(layer), Some(source));
     assert_eq!(panes(&session), layout);
     let buffer = session.views[&layer].location.buffer;
     assert_eq!(
@@ -1339,8 +1398,8 @@ fn saving_a_fullscreen_file_layer_keeps_it_open_until_explicitly_closed() {
     );
     assert!(session.command("edit note.txt").is_err());
     assert!(session.help.is_some());
-    assert_eq!(session.views[&source].layer, Some(layer));
-    assert_eq!(session.views[&layer].parent, Some(source));
+    assert_eq!(session.views.child(source), Some(layer));
+    assert_eq!(session.views.parent(layer), Some(source));
     session
         .execute_command("help.close", serde_json::json!({}))
         .unwrap();
@@ -1351,7 +1410,7 @@ fn saving_a_fullscreen_file_layer_keeps_it_open_until_explicitly_closed() {
     session.command("write").unwrap();
     assert_eq!(fs::read_to_string(path).unwrap(), format!("!{original}"));
     assert_eq!(session.focus, layer);
-    assert_eq!(session.views[&source].layer, Some(layer));
+    assert_eq!(session.views.child(source), Some(layer));
     assert_eq!(panes(&session), layout);
     session.command("quit").unwrap();
     assert_eq!(session.focus, source);

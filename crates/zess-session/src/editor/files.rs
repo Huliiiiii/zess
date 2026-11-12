@@ -66,9 +66,12 @@ impl FileWatch {
                     QueryPoll::Ready(result) => {
                         self.reload = Reload::Idle;
                         match result {
-                            Ok(QueryResult::Text { text: contents, .. }) => {
+                            Ok(QueryResult::FileRead {
+                                target,
+                                text: contents,
+                            }) => {
                                 let before = text.version();
-                                text.reload_contents(&contents);
+                                text.reload_contents(target, &contents);
                                 Ok(before != text.version())
                             }
                             Ok(_) => bail!("file read returned an unexpected result"),
@@ -85,7 +88,11 @@ impl Session {
     /// Bind before reading, so changes during the initial read remain observable.
     pub(super) fn open_file_buffer(&mut self, path: &Path) -> Result<BufferId> {
         let watch = FileWatch::new(path, &mut self.services.borrow_mut())?;
-        let text = TextBuffer::open(path)?;
+        let text = TextBuffer::open_with_capabilities(
+            path,
+            self.services.borrow().file_system(),
+            self.syntax_provider.clone(),
+        )?;
         let buffer = self.add_buffer(Buffer::Text(text));
         self.file_watches.insert(buffer, watch);
         Ok(buffer)

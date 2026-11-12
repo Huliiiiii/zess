@@ -233,6 +233,11 @@ pub enum PreviewContent {
         #[serde(default)]
         column_alignment: zess_ui::ColumnAlignment,
     },
+    Items {
+        rows: Vec<DisplayRow>,
+        #[serde(default)]
+        column_alignment: zess_ui::ColumnAlignment,
+    },
     Directory {
         rows: Vec<DisplayRow>,
         #[serde(default)]

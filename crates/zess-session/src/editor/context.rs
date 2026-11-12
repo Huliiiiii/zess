@@ -43,6 +43,7 @@ impl Session {
             _ => None,
         });
         PluginContext {
+            operation_id: self.current_operation.clone(),
             workspace: self.workspace.to_string_lossy().into_owned(),
             text,
             filesystem_revision: if fields.iter().any(|field| field == "fs.revision") {

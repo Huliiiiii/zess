@@ -17,7 +17,7 @@ use std::io::{BufRead, Write};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROXY_PROTOCOL_VERSION: u32 = 2;
+pub const PROXY_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]

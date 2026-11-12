@@ -579,7 +579,7 @@ fn clicking_outside_command_candidates_cancels_and_selects_the_text() {
     let frame = session.frame();
     gesture(&mut session, &frame, MouseKind::Press, 5, 0);
     assert!(session.active_prompt().is_none());
-    assert!(session.pending.is_empty());
+    assert!(session.key_sequence.keys().is_empty());
     let id = session.focus;
     let buffer = session.views[&id].location.buffer;
     assert_eq!(

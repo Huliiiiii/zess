@@ -43,7 +43,7 @@ fn non_text_views_cannot_use_another_buffers_outline() {
                 session.command("git").unwrap();
                 settle(&mut session);
                 if kind == "diff" {
-                    session.focus_preview().unwrap();
+                    session.focus_preview(session.focus).unwrap();
                     assert!(matches!(
                         session.buffers[&session.views[&session.focus].location.buffer],
                         Buffer::PreviewDiff { .. }
@@ -52,6 +52,7 @@ fn non_text_views_cannot_use_another_buffers_outline() {
             }
             "items" => {
                 let buffer = session.add_buffer(Buffer::Items {
+                    role: ItemsRole::Standalone,
                     kind: "results".into(),
                     path: String::new(),
                     display: Display::default(),
@@ -111,6 +112,7 @@ fn plain_text_cannot_open_an_outline() {
 
 #[test]
 fn text_context_does_not_require_outline_support() {
+    let scripts = Fixture::new();
     let fixture = Fixture::new();
     let path = fixture.0.join("note.txt");
     fs::write(&path, "plain text\n").unwrap();
@@ -119,7 +121,8 @@ fn text_context_does_not_require_outline_support() {
         .scripts
         .as_mut()
         .unwrap()
-        .load_source(
+        .load(&scripts.write(
+            "text-info.w",
             r#"
 require "zess/buffer"
 require "zess/ui"
@@ -134,8 +137,7 @@ register-command "source-info" "Show text source"
   lambda : argument
     request-open-buffer "text-info" argument
 "#,
-            Path::new("text-info.w"),
-        )
+        ))
         .unwrap();
     session.command("source-info").unwrap();
     assert_eq!(

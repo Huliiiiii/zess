@@ -9,6 +9,9 @@ use std::time::Duration;
 use steel::{rvals::Custom, steel_vm::builtin::BuiltInModule};
 use zess_plugin::ItemSelection;
 
+mod configuration;
+mod status_layout;
+
 fn input(view_id: ViewId, event: &str) -> PluginInput {
     PluginInput {
         buffer_id: 1,
@@ -29,15 +32,16 @@ fn input(view_id: ViewId, event: &str) -> PluginInput {
 
 #[test]
 fn host_json_arrays_reach_scripts_as_lists() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "arrays.scm",
             r#"(register-event "arrays"
                 (lambda (argument)
                     (and (list? argument) (list? (car argument))
                          (equal? (car argument) '(1 2)))))"#,
-            Path::new("arrays.scm"),
-        )
+        ))
         .unwrap();
     assert_eq!(
         runtime
@@ -52,16 +56,466 @@ fn default_statusline_preserves_plugin_status_spans() {
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     let status = serde_json::json!(["prefix", {"text": "changed", "style": "git.added"}]);
     let output = runtime
-        .format_statusline("default", &serde_json::json!({"plugin_status": status}))
+        .format_statusline(
+            "default",
+            &zess_plugin::StatusContext {
+                plugin_status: status,
+                ..Default::default()
+            },
+        )
         .unwrap();
-    assert_eq!(output["center"], status);
+    assert_eq!(output.center.len(), 2);
+    assert_eq!(output.center[0].text, "prefix");
+    assert_eq!(output.center[0].style, "");
+    assert_eq!(output.center[1].text, "changed");
+    assert_eq!(output.center[1].style, "git.added");
+}
+
+#[test]
+fn global_status_formats_merge_and_view_overrides_take_precedence() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    runtime
+        .load(&directory.write(
+            "formats.w",
+            r#"require "zess/status"
+set-status-formats! : obj 'pending "P:{count}" 'items "{selected}/{items}"
+set-status-formats! : obj "pending" "Q:{count}"
+"#,
+        ))
+        .unwrap();
+    for (options, expected) in [
+        (serde_json::json!({}), "Q:2 · 0/0"),
+        (
+            serde_json::json!({"status-formats": {"pending": "V:{count}"}}),
+            "V:2 · 0/0",
+        ),
+    ] {
+        let line = runtime
+            .format_statusline(
+                "default",
+                &zess_plugin::StatusContext {
+                    plugin_status_data: serde_json::json!({"files": {"pending_count": 2}}),
+                    options,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(line.right[0].text, expected);
+    }
+}
+
+#[test]
+fn invalid_global_status_formats_leave_previous_values_unchanged() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    runtime
+        .load(&directory.write(
+            "formats.w",
+            "require \"zess/status\"\nset-status-formats! : obj 'pending \"P:{count}\" 'items \"I:{items}\"\n",
+        ))
+        .unwrap();
+    for formats in [
+        "(obj 'items \"changed\" 'pending \"{unknown}\")",
+        "(obj 'items \"changed\" 'pending 42)",
+        "(obj 'items \"changed\" 'unknown \"bad\")",
+        "(hash 42 \"bad\")",
+        "#f",
+    ] {
+        assert!(
+            runtime
+                .load(&directory.write(
+                    "invalid-formats.w",
+                    &format!("set-status-formats! {formats}\n"),
+                ))
+                .is_err()
+        );
+        let line = runtime
+            .format_statusline(
+                "default",
+                &zess_plugin::StatusContext {
+                    plugin_status_data: serde_json::json!({"files": {"pending_count": 2}}),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(line.right[0].text, "P:2 · I:0");
+    }
+}
+
+#[test]
+fn custom_statuslines_share_the_configured_formats_and_defaults() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    runtime
+        .load(&directory.write(
+            "formats.w",
+            r#"require "zess/status"
+set-status-formats! : obj 'pending "P:{count}"
+register-statusline "custom"
+  lambda : context
+    statusline (status-format context 'git-failed) ""
+      status-format context 'pending : obj 'count 2
+"#,
+        ))
+        .unwrap();
+    for (options, expected) in [
+        (serde_json::json!({}), "P:2"),
+        (
+            serde_json::json!({"status-formats": {"pending": "V:{count}"}}),
+            "V:2",
+        ),
+    ] {
+        let line = runtime
+            .format_statusline(
+                "custom",
+                &zess_plugin::StatusContext {
+                    options,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(line.left[0].text, "Could not load changes");
+        assert_eq!(line.right[0].text, expected);
+    }
+}
+
+#[test]
+fn hiding_file_status_parts_does_not_leave_separators() {
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    for (pending, options, expected) in [
+        (0, serde_json::json!({}), "0 selected / 0 items"),
+        (
+            2,
+            serde_json::json!({"status-formats": {"pending": ""}}),
+            "0 selected / 0 items",
+        ),
+        (
+            2,
+            serde_json::json!({"status-formats": {"items": ""}}),
+            "2 pending",
+        ),
+        (
+            2,
+            serde_json::json!({"status-formats": {"pending": "", "items": ""}}),
+            "",
+        ),
+    ] {
+        let line = runtime
+            .format_statusline(
+                "default",
+                &zess_plugin::StatusContext {
+                    plugin_status: serde_json::json!("legacy"),
+                    plugin_status_data: serde_json::json!({"files": {"pending_count": pending}}),
+                    options,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            line.center
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            ""
+        );
+        assert_eq!(
+            line.right
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn git_status_formats_keep_the_counts_and_their_semantic_styles() {
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    for (status, options, expected) in [
+        (
+            serde_json::json!({"state": "loading"}),
+            serde_json::json!({}),
+            "Loading changes…",
+        ),
+        (
+            serde_json::json!({"state": "failed"}),
+            serde_json::json!({"status-formats": {"git-failed": "Failed"}}),
+            "Failed",
+        ),
+        (
+            serde_json::json!({"state": "ready"}),
+            serde_json::json!({}),
+            "Line counts unavailable",
+        ),
+        (
+            serde_json::json!({"state": "ready", "additions": 12, "deletions": 3}),
+            serde_json::json!({}),
+            "+12  -3",
+        ),
+        (
+            serde_json::json!({"state": "refreshing", "additions": 12, "deletions": 3, "unknown_files": 2}),
+            serde_json::json!({"status-formats": {"git-refreshing": "Wait ", "git-added": "add:{count}", "git-deleted": "del:{count}", "git-uncounted": " unknown:{count}"}}),
+            "Wait add:12  del:3 unknown:2",
+        ),
+    ] {
+        let line = runtime
+            .format_statusline(
+                "default",
+                &zess_plugin::StatusContext {
+                    plugin_status: serde_json::json!({"git": status}),
+                    options,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            line.right
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            expected
+        );
+        if status.get("additions").is_some() {
+            assert_eq!(line.right[1].style, "git.added");
+            assert_eq!(line.right[3].style, "git.deleted");
+        }
+    }
+}
+
+#[test]
+fn dynamic_callbacks_preserve_nested_json_numbers_exactly() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, value| value).unwrap();
+    runtime.load(&directory.write("numbers.scm", r#"
+        (register-command "echo" "Echo dynamic data" (lambda (argument) (host-call "echo" argument)))
+        (register-event "echo" (lambda (argument) (host-call "echo" argument)))
+    "#)).unwrap();
+    let value = serde_json::json!({"nested": [i64::MIN, i64::MAX, u64::MAX, 9007199254740993_u64, 1.25, null, true]});
+    assert_eq!(runtime.event("echo", &value).unwrap(), value);
+    let CommandOutput::Value(actual) = runtime.command("echo", &value).unwrap() else {
+        panic!("echo returned a request");
+    };
+    assert_eq!(actual, value);
+}
+
+#[test]
+fn default_statusline_keeps_integer_positions_in_a_one_column_view() {
+    use zess_plugin::{StatusContent, StatusContext, StatusPosition};
+
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    let line = runtime
+        .format_statusline(
+            "default",
+            &StatusContext {
+                active: true,
+                width: 1,
+                mode: Some("normal".into()),
+                content: StatusContent::Text {
+                    position: StatusPosition { row: 1, column: 2 },
+                    selection_count: 1,
+                    encoding: "UTF-8".into(),
+                },
+                ..StatusContext::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(line.left[0].text, "N");
+    assert_eq!(line.right[0].text, "1 sel  1:2  UTF-8");
+}
+
+#[test]
+fn dynamic_callbacks_report_numbers_outside_the_json_range() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, value| value).unwrap();
+    runtime
+        .load(&directory.write(
+            "invalid-numbers.scm",
+            r#"
+        (register-event "too-large" (lambda (_) (hash 'nested (list 18446744073709551616))))
+        (register-event "too-small" (lambda (_) -9223372036854775809))
+        (register-event "infinite" (lambda (_) +inf.0))
+        (register-event "nan" (lambda (_) +nan.0))
+    "#,
+        ))
+        .unwrap();
+    for name in ["too-large", "too-small", "infinite", "nan"] {
+        let error = runtime.event(name, &Value::Null).unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<SteelErr>().unwrap().kind(),
+                ErrorKind::ConversionError
+            ),
+            "{name}: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn script_json_functions_match_sandboxed_steel() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    let mut steel = Engine::new_sandboxed();
+    let expressions = [
+        r#"(to-string (string->jsexpr "[1, 1.25, [true, null]]"))"#,
+        r#"(to-string (json:string->jsexpr "[1, 1.25, [true, null]]"))"#,
+        "(to-string (value->jsexpr-string (list 1 1.25 (list #t))))",
+        "(to-string (json:value->jsexpr-string (list 1 1.25 (list #t))))",
+    ];
+    let mut source = String::from("(require-builtin steel/json as json:)\n");
+    for (index, expression) in expressions.iter().enumerate() {
+        source.push_str(&format!(
+            "(register-event \"{index}\" (lambda (_) {expression}))\n"
+        ));
+    }
+    runtime.load(&directory.write("json.scm", &source)).unwrap();
+    steel.run("(require-builtin steel/json as json:)").unwrap();
+    for (index, expression) in expressions.iter().enumerate() {
+        let result = steel.run(*expression).unwrap();
+        let expected = String::from_steelval(result.last().unwrap()).unwrap();
+        assert_eq!(
+            runtime.event(&index.to_string(), &Value::Null).unwrap(),
+            Value::String(expected)
+        );
+    }
+}
+
+#[test]
+fn buffer_dynamic_fields_preserve_nested_json_numbers() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, value| value).unwrap();
+    runtime
+        .load(&directory.write(
+            "dynamic-buffer.w",
+            r#"
+require "zess/buffer"
+require "zess/ui"
+register-buffer "dynamic"
+  lambda : input
+    buffer-result null null null
+      output-watches
+        buffer-output
+          buffer-display "" "" '() #f : input-argument input
+          . #f
+          list
+            request-action "echo" : input-argument input
+            request-open-buffer "dynamic" : input-argument input
+            configure-view : input-options input
+        list : watch-query "echo" : input-argument input
+"#,
+        ))
+        .unwrap();
+    let value = serde_json::json!({"numbers": [i64::MIN, u64::MAX, 9007199254740993_u64]});
+    let mut input = input(1, "refresh");
+    input.argument = value.clone();
+    input.options = value.clone();
+    let output = runtime.dispatch("dynamic", &input).unwrap();
+    assert_eq!(output.display.unwrap().status, value);
+    assert_eq!(output.watches.unwrap()[0].argument, value);
+    assert!(
+        matches!(&output.requests[0], HostRequest::Action { argument, .. } if argument == &value)
+    );
+    assert!(
+        matches!(&output.requests[1], HostRequest::OpenBuffer { argument, .. } if argument == &value)
+    );
+    assert!(
+        matches!(&output.requests[2], HostRequest::ConfigureView { options } if options == &value)
+    );
+}
+
+#[test]
+fn statusline_context_keeps_available_content_fields_and_exact_ids() {
+    use zess_plugin::{StatusContent, StatusContext, StatusPosition};
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    runtime.load(&directory.write("context.scm", r#"
+        (register-statusline "context"
+          (lambda (context)
+            (hash 'left (to-string (hash-ref context 'buffer_id))
+                  'center (hash-ref context 'plugin_status)
+                  'right (if (hash-contains? context 'position)
+                             (list (to-string (hash-ref (hash-ref context 'position) 'row))
+                                   (hash-ref context 'encoding))
+                             (if (hash-contains? context 'source_position)
+                                 (list (to-string (hash-ref (hash-ref context 'source_position) 'old_line))
+                                       (to-string (hash-ref context 'new_line)))
+                                 (list (to-string (hash-ref context 'selected_count))
+                                       (to-string (hash-ref context 'item_count))))))))
+    "#)).unwrap();
+    let mut context = StatusContext {
+        buffer_id: u64::MAX,
+        plugin_status: serde_json::json!([{"text": "ready", "style": "status"}]),
+        content: StatusContent::Text {
+            position: StatusPosition { row: 12, column: 4 },
+            selection_count: 2,
+            encoding: "UTF-8".into(),
+        },
+        ..Default::default()
+    };
+    for (content, expected) in [
+        (context.content, ["12", "UTF-8"]),
+        (
+            StatusContent::Diff {
+                old_line: None,
+                new_line: Some(7),
+                selection_count: 1,
+            },
+            ["#<void>", "7"],
+        ),
+        (
+            StatusContent::Items {
+                selection_count: 3,
+                primary: Some("item".into()),
+                item_count: 20,
+            },
+            ["3", "20"],
+        ),
+    ] {
+        context.content = content;
+        let line = runtime.format_statusline("context", &context).unwrap();
+        assert_eq!(line.left[0].text, u64::MAX.to_string());
+        assert_eq!(line.center[0].text, "ready");
+        assert_eq!(line.center[0].style, "status");
+        assert_eq!(
+            line.right
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn statusline_regions_accept_legacy_shapes_and_reject_missing_span_text() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    runtime.load(&directory.write("regions.scm", r#"
+        (register-statusline "regions" (lambda (_) (hash 'left (list "plain" (hash 'text "styled" 'style "accent")) 'right (list->vector (list "vector")))))
+        (register-statusline "empty" (lambda (_) (hash 'left null)))
+        (register-statusline "invalid" (lambda (_) (hash 'left (list (hash 'style "accent")))))
+    "#)).unwrap();
+    let context = zess_plugin::StatusContext::default();
+    let line = runtime.format_statusline("regions", &context).unwrap();
+    assert_eq!(line.left.len(), 2);
+    assert_eq!(line.left[0].text, "plain");
+    assert_eq!(line.left[0].style, "");
+    assert_eq!(line.left[1].text, "styled");
+    assert_eq!(line.left[1].style, "accent");
+    assert!(line.center.is_empty());
+    assert_eq!(line.right[0].text, "vector");
+    let line = runtime.format_statusline("empty", &context).unwrap();
+    assert!(line.left.is_empty() && line.center.is_empty() && line.right.is_empty());
+    assert!(runtime.format_statusline("invalid", &context).is_err());
 }
 
 #[test]
 fn deferred_yanks_keep_the_register_captured_by_the_script() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "deferred-yank.w",
             r#"
 require "zess/buffer"
 require "zess/ui"
@@ -74,8 +528,7 @@ register-buffer "deferred-yank"
         buffer-output #f #f
           list : request-yank (list "saved") : buffer-input-view input
 "#,
-            Path::new("deferred-yank.w"),
-        )
+        ))
         .unwrap();
     for register in [Some('+'), Some('*'), Some('a'), None] {
         let mut launch = input(1, "yank");
@@ -100,9 +553,11 @@ register-buffer "deferred-yank"
 
 #[test]
 fn yank_requests_accept_an_optional_character_register() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "register-yank.w",
             r#"
 require "zess/ui"
 register-command "default-yank" "Yank to the current register"
@@ -115,8 +570,7 @@ register-command "invalid-yank" "Reject a string register"
   lambda : argument
     request-yank (list "saved") "a"
 "#,
-            Path::new("register-yank.w"),
-        )
+        ))
         .unwrap();
     for (command, destination) in [("default-yank", None), ("named-yank", Some('a'))] {
         assert!(matches!(
@@ -139,9 +593,11 @@ register-command "invalid-yank" "Reject a string register"
 
 #[test]
 fn minibuffer_requests_accept_an_optional_key_scope() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "input.w",
             r#"
 require "zess/ui"
 register-command "plain-input" "Ask for input"
@@ -154,8 +610,7 @@ register-command "extra-input-argument" "Reject an extra argument"
   lambda : argument
     request-mini-buffer "answer" "initial" "custom.input" "extra"
 "#,
-            Path::new("input.w"),
-        )
+        ))
         .unwrap();
     for (command, expected_scope) in [
         ("plain-input", None),
@@ -182,9 +637,11 @@ register-command "extra-input-argument" "Reject an extra argument"
 
 #[test]
 fn scripts_can_declare_typed_responsive_preview_groups() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "pair.w",
             r#"
 require "zess/buffer"
 require "zess/ui"
@@ -203,8 +660,7 @@ register-command "pair" "Show paired previews"
       preview-layout-responsive 60
       . #f
 "#,
-            Path::new("pair.w"),
-        )
+        ))
         .unwrap();
     let CommandOutput::Request(HostRequest::PreviewGroup {
         panes,
@@ -250,9 +706,11 @@ register-command "pair" "Show paired previews"
 
 #[test]
 fn script_structs_and_closures_survive_between_buffer_updates() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "counter.w",
             r#"
 require "zess/buffer"
 struct counter (next) #:transparent
@@ -274,8 +732,7 @@ register-buffer "counter"
             . #f ""
           . #f '()
 "#,
-            Path::new("counter.w"),
-        )
+        ))
         .unwrap();
     let output = runtime.dispatch("counter", &input(10, "init")).unwrap();
     assert_eq!(output.display.unwrap().rows[0].text, "(1 1)");
@@ -292,6 +749,7 @@ impl Custom for Counter {}
 
 #[test]
 fn native_objects_pass_through_script_apis_without_serialization() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     let mut module = BuiltInModule::new("example/counter");
     module.register_fn("increment!", |counter: &Counter| {
@@ -300,10 +758,10 @@ fn native_objects_pass_through_script_apis_without_serialization() {
     });
     runtime.register_native_module(module);
     runtime
-        .load_source(
+        .load(&directory.write(
+            "counter.w",
             "require-builtin example/counter\nregister-api \"counter.increment\" increment!\n",
-            Path::new("counter.w"),
-        )
+        ))
         .unwrap();
     let counter = Counter(Arc::new(AtomicUsize::new(0)));
     let result: Counter = runtime.api("counter.increment", counter.clone()).unwrap();
@@ -313,9 +771,11 @@ fn native_objects_pass_through_script_apis_without_serialization() {
 
 #[test]
 fn invalid_buffer_output_does_not_replace_the_previous_script_state() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "counter.w",
             r#"
 require "zess/buffer"
 struct counter (value) #:transparent
@@ -331,8 +791,7 @@ register-buffer "counter"
             buffer-display "Counter" "" (list (display-row "value" (to-string value) "" 0)) #f ""
             . #f '()
 "#,
-            Path::new("counter.w"),
-        )
+        ))
         .unwrap();
     runtime.dispatch("counter", &input(10, "init")).unwrap();
     assert!(runtime.dispatch("counter", &input(10, "invalid")).is_err());
@@ -342,13 +801,14 @@ register-buffer "counter"
 
 #[test]
 fn view_options_replace_the_previous_configuration() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "options.w",
             "set-view-options! 'example : obj 'statusline \"old\" 'gutter #f\n\
              set-view-options! \"example\" : obj 'statusline \"new\"\n",
-            Path::new("options.w"),
-        )
+        ))
         .unwrap();
     assert_eq!(
         runtime.view_options("example"),
@@ -358,13 +818,14 @@ fn view_options_replace_the_previous_configuration() {
 
 #[test]
 fn view_options_apply_to_every_kind_only_when_all_names_are_valid() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "options.w",
             "set-view-options! '(first \"second\") : obj 'statusline \"shared\"\n\
              set-view-options! (array 'third \"fourth\") : obj 'statusline \"shared\"\n",
-            Path::new("options.w"),
-        )
+        ))
         .unwrap();
     for kind in ["first", "second", "third", "fourth"] {
         assert_eq!(
@@ -374,10 +835,10 @@ fn view_options_apply_to_every_kind_only_when_all_names_are_valid() {
     }
     assert!(
         runtime
-            .load_source(
-                "set-view-options! '(first 42) : obj 'statusline \"changed\"\n",
-                Path::new("invalid.w"),
-            )
+            .load(&directory.write(
+                "invalid.w",
+                "set-view-options! '(first 42) : obj 'statusline \"changed\"\n"
+            ))
             .is_err()
     );
     assert_eq!(
@@ -387,7 +848,34 @@ fn view_options_apply_to_every_kind_only_when_all_names_are_valid() {
 }
 
 #[test]
+fn session_options_control_retention_after_client_exit() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    assert_eq!(
+        runtime.on_client_exit(),
+        zess_plugin::OnClientExit::StopIfUnused
+    );
+    runtime
+        .load(&directory.write(
+            "session.w",
+            "set-session-options! : obj 'on-client-exit 'keep\n",
+        ))
+        .unwrap();
+    assert_eq!(runtime.on_client_exit(), zess_plugin::OnClientExit::Keep);
+    assert!(
+        runtime
+            .load(&directory.write(
+                "invalid.w",
+                "set-session-options! : obj 'on-client-exit 'stop\n"
+            ))
+            .is_err()
+    );
+    assert_eq!(runtime.on_client_exit(), zess_plugin::OnClientExit::Keep);
+}
+
+#[test]
 fn editor_options_validate_types_before_replacing_settings() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     assert_eq!(
         runtime.editor_options(),
@@ -395,13 +883,14 @@ fn editor_options_validate_types_before_replacing_settings() {
             mouse: true,
             scroll_lines: 3,
             preview_debounce: Duration::from_millis(150),
+            ..EditorOptions::default()
         }
     );
     runtime
-        .load_source(
+        .load(&directory.write(
+            "options.w",
             "set-editor-options! : obj 'mouse #f 'scroll-lines 5 'preview-debounce-ms 0\n",
-            Path::new("options.w"),
-        )
+        ))
         .unwrap();
     assert_eq!(
         runtime.editor_options(),
@@ -412,10 +901,10 @@ fn editor_options_validate_types_before_replacing_settings() {
         }
     );
     runtime
-        .load_source(
+        .load(&directory.write(
+            "options.w",
             "set-editor-options! : obj 'preview-debounce-ms 275\n",
-            Path::new("options.w"),
-        )
+        ))
         .unwrap();
     assert_eq!(
         runtime.editor_options().preview_debounce,
@@ -449,7 +938,7 @@ fn editor_options_validate_types_before_replacing_settings() {
     ] {
         assert_eq!(
             runtime
-                .load_source(source, Path::new("invalid.w"))
+                .load(&directory.write("invalid.w", source))
                 .unwrap_err()
                 .root_cause()
                 .to_string(),
@@ -468,15 +957,16 @@ fn editor_options_validate_types_before_replacing_settings() {
 
 #[test]
 fn commands_can_register_commands_while_they_run() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "commands.scm",
             r#"(register-command "install" "Install a command"
             (lambda (argument)
                 (register-command "installed" "Installed command" (lambda (value) value))
                 argument))"#,
-            Path::new("commands.scm"),
-        )
+        ))
         .unwrap();
     assert!(
         matches!(runtime.command("install", &Value::String("first".into())).unwrap(), CommandOutput::Value(Value::String(value)) if value == "first")
@@ -520,9 +1010,11 @@ fn command_implementations_preserve_their_argument_sources() {
 
 #[test]
 fn detaching_a_view_from_one_buffer_preserves_its_state_in_other_buffers() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "counter.w",
             r#"require "zess/buffer"
 register-buffer "counter"
   lambda : input
@@ -534,8 +1026,7 @@ register-buffer "counter"
           buffer-display "Counter" "" (list (display-row "value" (to-string count) "" 0)) #f ""
           . #f '()
 "#,
-            Path::new("counter.w"),
-        )
+        ))
         .unwrap();
     let first = input(10, "init");
     let second = PluginInput {
@@ -587,9 +1078,11 @@ register-buffer "counter"
 
 #[test]
 fn passive_preview_surfaces_reject_view_key_scopes() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "surface.w",
             r#"
 require "zess/buffer"
 require "zess/ui"
@@ -603,8 +1096,7 @@ register-command "invalid-surface" "Assign a view key scope to a surface"
       preview-layout-rows
       . #f
 "#,
-            Path::new("surface.w"),
-        )
+        ))
         .unwrap();
     let error = runtime
         .command("invalid-surface", &Value::Null)
@@ -618,15 +1110,16 @@ register-command "invalid-surface" "Assign a view key scope to a surface"
 
 #[test]
 fn interpreter_replacement_preserves_key_context_identities() {
+    let directory = SourceDirectory::new();
     let mut previous = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     previous
-        .load_source(
+        .load(&directory.write(
+            "previous.scm",
             r#"
 (register-mode "browser" "select")
 (map-key "browser" "select" "j" "old")
 "#,
-            Path::new("previous.scm"),
-        )
+        ))
         .unwrap();
     let identities = previous.identities();
     let kind = identities.buffer_kind("browser").unwrap();
@@ -636,14 +1129,14 @@ fn interpreter_replacement_preserves_key_context_identities() {
 
     let mut reloaded = ScriptRuntime::with_identities(|_, _| Value::Null, identities).unwrap();
     reloaded
-        .load_source(
+        .load(&directory.write(
+            "reloaded.scm",
             r#"
 (register-mode "other" "normal")
 (register-mode "browser" "select")
 (map-key "browser" "select" "j" "new")
 "#,
-            Path::new("reloaded.scm"),
-        )
+        ))
         .unwrap();
     assert!(reloaded.modes()[1].kind == kind);
     assert!(reloaded.modes()[1].name == mode);
@@ -654,9 +1147,11 @@ fn interpreter_replacement_preserves_key_context_identities() {
 
 #[test]
 fn internal_actions_execute_without_a_command_line_entry() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "actions.w",
             r#"
 register-action "internal.move" "Move selection"
   lambda : argument
@@ -666,8 +1161,7 @@ register-command "public-move" "Move through the command line"
   lambda : argument
     string-append "" "moved publicly"
 "#,
-            Path::new("actions.w"),
-        )
+        ))
         .unwrap();
     for name in ["internal.move", "step"] {
         assert!(runtime.resolve_command_line(name).is_err());
@@ -680,26 +1174,26 @@ register-command "public-move" "Move through the command line"
         "public-move"
     );
     runtime
-        .load_source(
+        .load(&directory.write(
+            "publish.w",
             r#"register-command "internal.move" "Publish movement"
   lambda : argument
     string-append "" "published"
 "#,
-            Path::new("publish.w"),
-        )
+        ))
         .unwrap();
     assert_eq!(
         runtime.resolve_command_line("step").unwrap(),
         "internal.move"
     );
     runtime
-        .load_source(
+        .load(&directory.write(
+            "internal.w",
             r#"register-action "internal.move" "Internal movement"
   lambda : argument
     string-append "" "private"
 "#,
-            Path::new("internal.w"),
-        )
+        ))
         .unwrap();
     assert!(runtime.resolve_command_line("step").is_err());
     assert!(
@@ -766,6 +1260,7 @@ fn wisp_load_errors_report_the_original_unicode_source_location() {
 
 #[test]
 fn module_callback_errors_retain_the_original_wisp_call_sites() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
         .register_module_source(
@@ -775,14 +1270,14 @@ fn module_callback_errors_retain_the_original_wisp_call_sites() {
         )
         .unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "callbacks.w",
             r#"require "failing"
 register-event "fail"
   lambda : value
     list : fail "wrong"
 "#,
-            Path::new("callbacks.w"),
-        )
+        ))
         .unwrap();
     let error = runtime.event("fail", &Value::Null).unwrap_err();
     let message = format!("{error:#}");
@@ -799,6 +1294,7 @@ register-event "fail"
 
 #[test]
 fn module_load_errors_report_the_modules_own_source() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
         .register_module_source(
@@ -808,7 +1304,7 @@ fn module_load_errors_report_the_modules_own_source() {
         )
         .unwrap();
     let error = runtime
-        .load_source("require \"invalid\"\n", Path::new("config.w"))
+        .load(&directory.write("config.w", "require \"invalid\"\n"))
         .unwrap_err();
     let message = format!("{error:#}");
     assert!(message.contains("plugins/invalid.w:2:12"), "{message}");
@@ -816,16 +1312,17 @@ fn module_load_errors_report_the_modules_own_source() {
 
 #[test]
 fn native_call_errors_report_the_original_wisp_call_site() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "native.w",
             r#"; 说明
 register-event "native-failure"
   lambda : value
     set-editor-options! : obj 'mouse "界"
 "#,
-            Path::new("native.w"),
-        )
+        ))
         .unwrap();
     let error = runtime.event("native-failure", &Value::Null).unwrap_err();
     let message = format!("{error:#}");
@@ -835,10 +1332,12 @@ register-event "native-failure"
 
 #[test]
 fn builtin_plugins_preserve_configuration_bindings_and_initialize_once() {
+    let directory = SourceDirectory::new();
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
     runtime.load_builtin_plugins().unwrap();
     runtime
-        .load_source(
+        .load(&directory.write(
+            "builtin-configuration.w",
             r#"
 define-mode "custom" "probe" ("x" "outline")
 set-view-options! "help" : obj 'gutter #t
@@ -861,8 +1360,7 @@ register-event "builtin-bindings"
       equal? struct:outline-view struct:outline-view
       equal? struct:outline-state struct:outline-state
 "#,
-            Path::new("builtin-configuration.w"),
-        )
+        ))
         .unwrap();
     assert_eq!(
         runtime.event("builtin-bindings", &Value::Null).unwrap(),
@@ -888,8 +1386,16 @@ fn builtin_plugins_load_outside_the_source_checkout() {
         assert!(runtime.commands().contains(&"outline".to_owned()));
         assert_eq!(
             runtime
-                .format_statusline("default", &serde_json::json!({"plugin_status":"ready"}))
-                .unwrap()["center"],
+                .format_statusline(
+                    "default",
+                    &zess_plugin::StatusContext {
+                        plugin_status: "ready".into(),
+                        ..Default::default()
+                    }
+                )
+                .unwrap()
+                .center[0]
+                .text,
             "ready"
         );
         return;

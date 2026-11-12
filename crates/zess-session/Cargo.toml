@@ -18,6 +18,7 @@ zess-ipc.workspace = true
 zess-text.workspace = true
 zess-script.workspace = true
 zess-services.workspace = true
+zess-platform.workspace = true
 zess-plugins.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
