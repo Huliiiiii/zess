@@ -57,7 +57,9 @@ fn ready(git: &mut Git, input: &mut PluginInput) -> PluginOutput {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let output = git.update(input).unwrap();
-        if git.models[&1].mutation.is_none() && git.views[&(1, 1)].task.is_none() {
+        if matches!(git.models[&1].mutation, MutationState::Idle { .. })
+            && git.views[&(1, 1)].load.is_none()
+        {
             return output;
         }
         assert!(Instant::now() < deadline, "Git operation did not complete");
@@ -70,6 +72,43 @@ fn initialize(git: &mut Git) -> PluginInput {
     git.update(&input).unwrap();
     ready(git, &mut input);
     input
+}
+
+#[test]
+fn directory_operations_include_changes_hidden_by_the_filter() {
+    let workspace = Workspace::new();
+    fs::create_dir(workspace.0.join("dir")).unwrap();
+    for path in ["dir/visible.txt", "dir/hidden.txt", "outside.txt"] {
+        fs::write(workspace.0.join(path), path).unwrap();
+    }
+    let mut git = workspace.plugin();
+    let mut input = initialize(&mut git);
+    input.event = "filter_changed".into();
+    input.query = Some(zess_filter::Query {
+        text: "visible".into(),
+        ..zess_filter::Query::default()
+    });
+    git.update(&input).unwrap();
+    input.selection = browser::single(Some("directory:dir".into()));
+    input.event = "stage".into();
+    git.update(&input).unwrap();
+    ready(&mut git, &mut input);
+    assert_eq!(
+        workspace.git(&["diff", "--cached", "--name-only"]),
+        "dir/hidden.txt\ndir/visible.txt\n"
+    );
+    input.event = "unstage".into();
+    git.update(&input).unwrap();
+    ready(&mut git, &mut input);
+    assert_eq!(workspace.git(&["diff", "--cached", "--name-only"]), "");
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("dir/hidden.txt")).unwrap(),
+        "dir/hidden.txt"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("outside.txt")).unwrap(),
+        "outside.txt"
+    );
 }
 
 #[test]
@@ -104,7 +143,10 @@ fn discard_requires_confirmation_and_preserves_the_staged_version() {
     input.event = "layer_result".into();
     input.argument = json!({"purpose":purpose,"text":"yes","cancelled":true});
     git.update(&input).unwrap();
-    assert!(git.models[&1].mutation.is_none());
+    assert!(matches!(
+        git.models[&1].mutation,
+        MutationState::Idle { .. }
+    ));
     assert_eq!(
         fs::read_to_string(workspace.0.join("file")).unwrap(),
         "worktree\n"
@@ -153,16 +195,10 @@ fn directory_selection_includes_collapsed_children_once_and_warns_before_deletin
         purpose,
         "Delete untracked files: \"dir/nested/new\". Type yes to confirm"
     );
-    assert_eq!(
-        git.views[&(1, 1)]
-            .discard
-            .as_ref()
-            .unwrap()
-            .request
-            .entries
-            .len(),
-        1
-    );
+    let MutationIntent::ConfirmingDiscard(confirmation) = &git.views[&(1, 1)].mutation else {
+        panic!("discard confirmation was not requested");
+    };
+    assert_eq!(confirmation.request.entries.len(), 1);
     assert!(workspace.0.join("dir/nested/new").exists());
     input.event = "layer_result".into();
     input.argument = json!({"purpose":purpose,"text":"yes","cancelled":false});
@@ -181,7 +217,9 @@ fn stage_without_delivering_completion(git: &mut Git, input: &mut PluginInput) {
     input.selection = browser::single(Some("file:file".into()));
     input.event = "stage".into();
     git.update(input).unwrap();
-    let task = git.models.get_mut(&1).unwrap().mutation.as_mut().unwrap();
+    let MutationState::Writing { task, .. } = &mut git.models.get_mut(&1).unwrap().mutation else {
+        panic!("the mutation did not start");
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(result) = task.poll() {
@@ -191,6 +229,29 @@ fn stage_without_delivering_completion(git: &mut Git, input: &mut PluginInput) {
         assert!(Instant::now() < deadline, "Git mutation did not finish");
         std::thread::yield_now();
     }
+}
+
+#[test]
+fn ignoring_after_staging_waits_for_the_status_refresh() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("file"), "head\n").unwrap();
+    workspace.git(&["add", "."]);
+    workspace.git(&["commit", "--quiet", "-m", "baseline"]);
+    fs::write(workspace.0.join("file"), "worktree\n").unwrap();
+    fs::write(workspace.0.join("local"), "local\n").unwrap();
+    let exclude = workspace.0.join(".git/info/exclude");
+    let mut expected = fs::read(&exclude).unwrap();
+    expected.extend_from_slice(b"/local\n");
+    let mut git = workspace.plugin();
+    let mut input = initialize(&mut git);
+    stage_without_delivering_completion(&mut git, &mut input);
+    input.selection = browser::single(Some("file:local".into()));
+    input.event = "exclude".into();
+    git.update(&input).unwrap();
+    ready(&mut git, &mut input);
+    assert_eq!(fs::read(exclude).unwrap(), expected);
+    assert_eq!(workspace.git(&["check-ignore", "local"]), "local\n");
+    assert_eq!(workspace.git(&["show", ":file"]), "worktree\n");
 }
 
 #[test]
@@ -357,7 +418,7 @@ fn navigation_during_a_mutation_refresh_keeps_the_previous_diff_until_settled() 
                 .iter()
                 .any(|request| matches!(request, HostRequest::PreviewPending))
         );
-        if git.views[&(1, 1)].task.is_none() {
+        if git.views[&(1, 1)].load.is_none() {
             break;
         }
         assert!(Instant::now() < deadline, "Git status did not refresh");
@@ -382,12 +443,802 @@ fn leaving_during_a_status_refresh_preserves_the_pending_diff_refresh() {
     let mut input = initialize(&mut git);
     assert!(matches!(git.models[&1].result, LoadResult::Ready));
     let view = git.views.get_mut(&(1, 1)).unwrap();
-    view.refresh_diffs = true;
-    view.task = Some(Task::start(&git.services, QueryRequest::Status {}).unwrap());
+    view.diff_refresh = DiffRefresh::WaitingForStatus {
+        epoch: 0,
+        focus: None,
+    };
+    view.load = Some(GitLoad {
+        epoch: 0,
+        task: Task::start(&git.services, QueryRequest::Status {}).unwrap(),
+        generation: git.models[&1].load_generation,
+        published_revision: git.models[&1].revision,
+    });
 
     input.event = "view_leaving".into();
     git.update(&input).unwrap();
 
-    assert!(git.views[&(1, 1)].task.is_none());
-    assert!(git.views[&(1, 1)].refresh_diffs);
+    assert!(git.views[&(1, 1)].load.is_none());
+    assert!(matches!(
+        git.views[&(1, 1)].diff_refresh,
+        DiffRefresh::WaitingForStatus { .. }
+    ));
+}
+
+#[test]
+fn an_older_commit_query_cannot_replace_the_newer_shared_result() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("old"), "first\n").unwrap();
+    workspace.git(&["add", "."]);
+    workspace.git(&["commit", "--quiet", "-m", "first"]);
+    let first = workspace.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    fs::write(workspace.0.join("new"), "second\n").unwrap();
+    workspace.git(&["add", "."]);
+    workspace.git(&["commit", "--quiet", "-m", "second"]);
+    let second = workspace.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let services = Rc::new(RefCell::new(
+        NativeServices::new(workspace.0.clone()).unwrap(),
+    ));
+    let mut git = Git::new(services, Page::CommitFiles);
+    let mut input = input();
+    input.event = "init".into();
+    input.argument = json!({"commit": first});
+    git.update(&input).unwrap();
+    input.view_id = 2;
+    input.argument = json!({"commit": second});
+    git.update(&input).unwrap();
+    input.event = "tick".into();
+    input.argument = serde_json::Value::Null;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = git.update(&input).unwrap();
+        if git.views[&(1, input.view_id)].load.is_none() {
+            assert_eq!(
+                output
+                    .display
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["file:new"]
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    input.view_id = 1;
+    loop {
+        let output = git.update(&input).unwrap();
+        if git.views[&(1, input.view_id)].load.is_none() {
+            assert_eq!(
+                output
+                    .display
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["file:new"]
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn leaving_after_confirming_discard_preserves_the_started_write() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("file"), "untracked\n").unwrap();
+    let mut git = workspace.plugin();
+    let mut input = initialize(&mut git);
+    input.selection = browser::single(Some("file:file".into()));
+    input.event = "discard".into();
+    let output = git.update(&input).unwrap();
+    let purpose = output
+        .requests
+        .iter()
+        .find_map(|request| match request {
+            HostRequest::MiniBuffer { purpose, .. } => Some(purpose.clone()),
+            _ => None,
+        })
+        .unwrap();
+    input.event = "layer_result".into();
+    input.argument = json!({"purpose": purpose, "text": "yes"});
+    git.update(&input).unwrap();
+    input.event = "view_leaving".into();
+    git.update(&input).unwrap();
+    input.event = "tick".into();
+    ready(&mut git, &mut input);
+    assert!(!workspace.0.join("file").exists());
+    assert!(matches!(git.views[&(1, 1)].mutation, MutationIntent::Idle));
+}
+
+#[test]
+fn concurrent_views_can_finish_their_initial_status_load() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("file"), "untracked\n").unwrap();
+    let mut git = workspace.plugin();
+    let mut input = input();
+    input.event = "init".into();
+    for view in [1, 2] {
+        input.view_id = view;
+        git.update(&input).unwrap();
+    }
+    input.event = "tick".into();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for view in [1, 2] {
+            input.view_id = view;
+            git.update(&input).unwrap();
+        }
+        if git.views.values().all(|view| view.load.is_none()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "concurrent views did not finish loading"
+        );
+        std::thread::yield_now();
+    }
+    for view in [1, 2] {
+        input.view_id = view;
+        let output = git.update(&input).unwrap();
+        assert_eq!(
+            output
+                .display
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["file:file"]
+        );
+    }
+}
+
+#[test]
+fn leaving_cancels_an_unconfirmed_discard() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("file"), "untracked\n").unwrap();
+    let mut git = workspace.plugin();
+    let mut input = initialize(&mut git);
+    input.selection = browser::single(Some("file:file".into()));
+    input.event = "discard".into();
+    input.context.operation_id = Some("discard-operation".into());
+    let output = git.update(&input).unwrap();
+    assert_eq!(output.pending_operations, ["discard-operation"]);
+    assert!(output.completed_operations.is_empty());
+    input.context.operation_id = None;
+    let purpose = output
+        .requests
+        .iter()
+        .find_map(|request| match request {
+            HostRequest::MiniBuffer { purpose, .. } => Some(purpose.clone()),
+            _ => None,
+        })
+        .unwrap();
+    input.event = "view_leaving".into();
+    let output = git.update(&input).unwrap();
+    assert!(output.completed_operations.is_empty());
+    let mut outputs = git.poll_operations();
+    assert_eq!(outputs.len(), 1);
+    let output = outputs.pop().unwrap();
+    assert!(output.requests.is_empty());
+    assert_eq!(output.completed_operations.len(), 1);
+    assert_eq!(
+        output.completed_operations[0].operation_id,
+        "discard-operation"
+    );
+    assert!(matches!(
+        output.completed_operations[0].result,
+        OperationResult::Cancelled
+    ));
+    input.event = "layer_result".into();
+    input.argument = json!({"purpose": purpose, "text": "yes"});
+    git.update(&input).unwrap();
+    ready(&mut git, &mut input);
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("file")).unwrap(),
+        "untracked\n"
+    );
+}
+
+struct CleanFilterGate(std::path::PathBuf);
+
+impl CleanFilterGate {
+    fn failing(workspace: &Workspace) -> Self {
+        fs::write(
+            workspace.0.join(".git/info/attributes"),
+            "a filter=record\nb filter=blocked\n",
+        )
+        .unwrap();
+        workspace.git(&[
+            "config",
+            "filter.record.clean",
+            "sh -c 'test -f .git/filter-finished || touch .git/concurrent-write; cat'",
+        ]);
+        workspace.git(&["config", "filter.blocked.clean", "sh .git/blocked-clean"]);
+        workspace.git(&["config", "filter.blocked.required", "true"]);
+        fs::write(
+            workspace.0.join(".git/blocked-clean"),
+            "touch .git/filter-entered\nwhile [ -d .git ] && [ ! -f .git/filter-release ]; do sleep 0.01; done\ntouch .git/filter-finished\nexit 1\n",
+        )
+        .unwrap();
+        Self(workspace.0.join(".git/filter-release"))
+    }
+
+    fn wait_until_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.0.with_file_name("filter-entered").exists() {
+            assert!(Instant::now() < deadline, "the clean filter did not start");
+            std::thread::yield_now();
+        }
+    }
+
+    fn release(&self) {
+        fs::write(&self.0, "release").unwrap();
+    }
+}
+
+impl Drop for CleanFilterGate {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, "release");
+    }
+}
+
+struct QueryWorkerGate {
+    release: std::path::PathBuf,
+    tasks: Vec<Task>,
+}
+
+impl QueryWorkerGate {
+    fn occupy(workspace: &Workspace, services: &Services) -> Self {
+        fs::write(
+            workspace.0.join(".git/blocked-query"),
+            "touch .git/query-blocked-$$\nwhile [ -d .git ] && [ ! -f .git/query-release ]; do sleep 0.01; done\ncat\n",
+        )
+        .unwrap();
+        let request = QueryRequest::DiffFiles {
+            source: DiffSource::Changes {
+                side: DiffSide::Unstaged,
+            },
+            files: vec![DiffTarget {
+                path: "a".into(),
+                original_path: None,
+            }],
+            render: DiffRenderOptions {
+                pager: Some(zess_git::PagerCommand {
+                    program: "sh".into(),
+                    args: vec![".git/blocked-query".into()],
+                }),
+                ..DiffRenderOptions::default()
+            },
+        };
+        // NativeServices has four query workers. Hold all four at real pager
+        // processes so refresh/stage can establish a waiting intent deterministically.
+        let mut gate = Self {
+            release: workspace.0.join(".git/query-release"),
+            tasks: (0..4)
+                .map(|_| Task::start(services, request.clone()).unwrap())
+                .collect(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            for task in &mut gate.tasks {
+                assert!(task.poll().unwrap().is_none());
+            }
+            let blocked = fs::read_dir(workspace.0.join(".git"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().starts_with("query-blocked-"))
+                .count();
+            if blocked == gate.tasks.len() {
+                return gate;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "query workers did not reach their gates"
+            );
+            std::thread::yield_now();
+        }
+    }
+}
+
+impl Drop for QueryWorkerGate {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, "release");
+    }
+}
+
+#[test]
+fn a_waiting_view_preserves_another_views_write_and_its_failure() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("a"), "head a\n").unwrap();
+    fs::write(workspace.0.join("b"), "head b\n").unwrap();
+    workspace.git(&["add", "."]);
+    workspace.git(&["commit", "--quiet", "-m", "baseline"]);
+    fs::write(workspace.0.join("a"), "worktree a\n").unwrap();
+    fs::write(workspace.0.join("b"), "worktree b\n").unwrap();
+    let mut git = workspace.plugin();
+    let mut input = initialize(&mut git);
+    let gate = CleanFilterGate::failing(&workspace);
+    input.view_id = 2;
+    input.event = "render".into();
+    git.update(&input).unwrap();
+
+    let query_gate = QueryWorkerGate::occupy(&workspace, &git.services);
+    input.view_id = 1;
+    input.selection = browser::single(Some("file:a".into()));
+    input.event = "refresh".into();
+    git.update(&input).unwrap();
+    input.event = "stage".into();
+    input.context.operation_id = Some("waiting-stage".into());
+    let output = git.update(&input).unwrap();
+    assert_eq!(output.pending_operations, ["waiting-stage"]);
+    assert!(output.completed_operations.is_empty());
+    input.view_id = 2;
+    input.selection = browser::single(Some("file:b".into()));
+    input.event = "stage".into();
+    input.context.operation_id = Some("failing-stage".into());
+    let output = git.update(&input).unwrap();
+    assert_eq!(output.pending_operations, ["failing-stage"]);
+    assert!(output.completed_operations.is_empty());
+    input.context.operation_id = None;
+    gate.wait_until_entered();
+    drop(query_gate);
+    input.view_id = 1;
+    input.selection = browser::single(Some("file:a".into()));
+    input.event = "tick".into();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while git.views[&(1, 1)].load.is_some() {
+        git.update(&input).unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "the waiting status did not finish"
+        );
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        git.views[&(1, 1)].mutation,
+        MutationIntent::WaitingForStatus { .. }
+    ));
+    gate.release();
+
+    let mut errors = Vec::new();
+    let mut completions = Vec::new();
+    loop {
+        let output = git.update(&input).unwrap();
+        completions.extend(output.completed_operations);
+        completions.extend(
+            git.poll_operations()
+                .into_iter()
+                .flat_map(|output| output.completed_operations),
+        );
+        errors.extend(
+            output
+                .requests
+                .into_iter()
+                .filter_map(|request| match request {
+                    HostRequest::Message { text } => Some(text),
+                    _ => None,
+                }),
+        );
+        if matches!(git.models[&1].mutation, MutationState::Idle { .. })
+            && matches!(git.views[&(1, 1)].mutation, MutationIntent::Idle)
+            && git.views[&(1, 1)].load.is_none()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the queued write did not finish");
+        std::thread::yield_now();
+    }
+    assert_eq!(completions.len(), 2);
+    assert!(
+        completions
+            .iter()
+            .any(|completion| completion.operation_id == "waiting-stage"
+                && matches!(completion.result, OperationResult::Completed))
+    );
+    assert!(
+        completions
+            .iter()
+            .any(|completion| completion.operation_id == "failing-stage"
+                && matches!(completion.result, OperationResult::Failed { .. }))
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].starts_with("git add -A:"), "{errors:?}");
+    assert_eq!(workspace.git(&["show", ":a"]), "worktree a\n");
+    assert_eq!(workspace.git(&["show", ":b"]), "head b\n");
+    assert!(!workspace.0.join(".git/concurrent-write").exists());
+}
+
+#[test]
+fn another_view_waits_for_status_after_a_write_before_unstaging() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("file"), "head\n").unwrap();
+    workspace.git(&["add", "."]);
+    workspace.git(&["commit", "--quiet", "-m", "baseline"]);
+    fs::write(workspace.0.join("file"), "worktree\n").unwrap();
+    let mut git = workspace.plugin();
+    let mut input = initialize(&mut git);
+    input.view_id = 2;
+    input.event = "refresh".into();
+    git.update(&input).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let load = git.views.get_mut(&(1, 2)).unwrap().load.as_mut().unwrap();
+        if let Some(entries) = load.task.status_progress().unwrap() {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].index, " ");
+            assert_eq!(entries[0].worktree, "M");
+            break;
+        }
+        // Advance registration and start the worker, then pause after its status
+        // entries arrive and before publishing the complete result. If a worker
+        // finishes between these polls, start another request to reach that pause.
+        if load.task.poll().unwrap().is_some() {
+            git.update(&input).unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the old status did not produce progress"
+        );
+        std::thread::yield_now();
+    }
+    input.view_id = 1;
+    stage_without_delivering_completion(&mut git, &mut input);
+    assert_eq!(workspace.git(&["show", ":file"]), "worktree\n");
+    input.event = "view_leaving".into();
+    git.update(&input).unwrap();
+
+    // Completion on the leaving View cannot start a fresh status request there.
+    // The other View still owns a status response from before the write.
+    assert!(matches!(
+        git.models[&1].mutation,
+        MutationState::RefreshingStatus { .. }
+    ));
+    input.view_id = 2;
+    input.event = "unstage".into();
+    let mut output = git.update(&input).unwrap();
+    input.event = "tick".into();
+    loop {
+        assert!(
+            !output
+                .requests
+                .iter()
+                .any(|request| matches!(request, HostRequest::Message { .. }))
+        );
+        if matches!(git.models[&1].mutation, MutationState::Idle { .. })
+            && matches!(git.views[&(1, 2)].mutation, MutationIntent::Idle)
+            && git.views[&(1, 2)].load.is_none()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second View did not finish unstaging"
+        );
+        std::thread::yield_now();
+        output = git.update(&input).unwrap();
+    }
+    assert_eq!(workspace.git(&["show", ":file"]), "head\n");
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("file")).unwrap(),
+        "worktree\n"
+    );
+    let rows = output.display.unwrap().rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "file:file");
+    assert_eq!(rows[0].cells[0].spans[0].text, " ");
+    assert_eq!(rows[0].cells[0].spans[1].text, "M");
+}
+
+#[test]
+fn pager_configuration_rejects_shell_strings_and_invalid_command_objects() {
+    let workspace = Workspace::new();
+    let mut git = workspace.plugin();
+    for pager in [
+        json!("cat -n"),
+        json!({ "args": [] }),
+        json!({ "program": "  ", "args": [] }),
+        json!({ "program": "cat", "args": "-n" }),
+        json!({ "program": "cat", "args": [1] }),
+        json!({ "program": "cat", "args": ["\0"] }),
+    ] {
+        let mut input = input();
+        input.options = json!({ "diff-pager": pager });
+        assert!(
+            git.update(&input).is_err(),
+            "accepted invalid pager: {}",
+            input.options
+        );
+    }
+}
+
+#[test]
+fn a_started_write_reports_its_actual_failure_after_its_buffer_is_removed() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("a"), "head a\n").unwrap();
+    fs::write(workspace.0.join("b"), "head b\n").unwrap();
+    workspace.git(&["add", "."]);
+    workspace.git(&["commit", "--quiet", "-m", "baseline"]);
+    fs::write(workspace.0.join("b"), "worktree b\n").unwrap();
+    let mut git = workspace.plugin();
+    let mut input = initialize(&mut git);
+    let gate = CleanFilterGate::failing(&workspace);
+    input.event = "stage".into();
+    input.selection = browser::single(Some("file:b".into()));
+    input.context.operation_id = Some("blocked-stage".into());
+    let output = git.update(&input).unwrap();
+    assert_eq!(output.pending_operations, ["blocked-stage"]);
+    assert!(output.completed_operations.is_empty());
+    gate.wait_until_entered();
+    assert!(git.poll_operations().is_empty());
+    git.remove_buffer(1);
+    assert!(git.poll_operations().is_empty());
+    gate.release();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let completions = loop {
+        let completions = git
+            .poll_operations()
+            .into_iter()
+            .flat_map(|output| output.completed_operations)
+            .collect::<Vec<_>>();
+        if !completions.is_empty() {
+            break completions;
+        }
+        assert!(Instant::now() < deadline, "write completion did not arrive");
+        std::thread::yield_now();
+    };
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].operation_id, "blocked-stage");
+    assert!(
+        matches!(&completions[0].result, OperationResult::Failed { message } if message.starts_with("git add -A:"))
+    );
+    assert_eq!(workspace.git(&["show", ":b"]), "head b\n");
+    assert!(git.poll_operations().is_empty());
+}
+
+#[test]
+fn a_successful_write_reports_completion_once_without_a_view_update() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("file"), "worktree\n").unwrap();
+    let mut git = workspace.plugin();
+    let mut input = initialize(&mut git);
+    input.context.operation_id = Some("stage-operation".into());
+    stage_without_delivering_completion(&mut git, &mut input);
+    let completions = git
+        .poll_operations()
+        .into_iter()
+        .flat_map(|output| output.completed_operations)
+        .collect::<Vec<_>>();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].operation_id, "stage-operation");
+    assert!(matches!(completions[0].result, OperationResult::Completed));
+    assert_eq!(workspace.git(&["show", ":file"]), "worktree\n");
+    assert!(git.poll_operations().is_empty());
+    input.context.operation_id = None;
+    assert!(ready(&mut git, &mut input).completed_operations.is_empty());
+}
+
+#[test]
+fn leaving_cancels_a_historical_file_waiting_for_its_contents() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("a"), "committed\n").unwrap();
+    workspace.git(&["add", "."]);
+    workspace.git(&["commit", "--quiet", "-m", "baseline"]);
+    let commit = workspace.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    fs::write(workspace.0.join("a"), "worktree\n").unwrap();
+    let mut git = workspace.plugin();
+    git.page = Page::CommitFiles;
+    let mut input = input();
+    input.event = "init".into();
+    input.argument = json!({ "commit": commit });
+    git.update(&input).unwrap();
+    ready(&mut git, &mut input);
+    let _gate = QueryWorkerGate::occupy(&workspace, &git.services);
+    input.selection = browser::single(Some("file:a".into()));
+    input.event = "edit".into();
+    input.context.operation_id = Some("historical-file".into());
+    let output = git.update(&input).unwrap();
+    assert_eq!(output.pending_operations, ["historical-file"]);
+    assert!(output.completed_operations.is_empty());
+    assert!(
+        !output
+            .requests
+            .iter()
+            .any(|request| matches!(request, HostRequest::OpenSnapshot { .. }))
+    );
+    input.event = "view_leaving".into();
+    input.context.operation_id = None;
+    let output = git.update(&input).unwrap();
+    assert!(output.completed_operations.is_empty());
+    let mut outputs = git.poll_operations();
+    assert_eq!(outputs.len(), 1);
+    let output = outputs.pop().unwrap();
+    assert!(output.requests.is_empty());
+    assert_eq!(output.completed_operations.len(), 1);
+    assert_eq!(
+        output.completed_operations[0].operation_id,
+        "historical-file"
+    );
+    assert!(matches!(
+        output.completed_operations[0].result,
+        OperationResult::Cancelled
+    ));
+    assert!(git.poll_operations().is_empty());
+}
+
+#[test]
+fn opening_a_historical_file_reports_completion_with_the_loaded_snapshot() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("a"), "committed\n").unwrap();
+    workspace.git(&["add", "."]);
+    workspace.git(&["commit", "--quiet", "-m", "baseline"]);
+    let commit = workspace.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let mut git = workspace.plugin();
+    git.page = Page::CommitFiles;
+    let mut input = input();
+    input.event = "init".into();
+    input.argument = json!({ "commit": commit });
+    git.update(&input).unwrap();
+    ready(&mut git, &mut input);
+    input.selection = browser::single(Some("file:a".into()));
+    input.event = "edit".into();
+    input.context.operation_id = Some("historical-file".into());
+    let mut output = git.update(&input).unwrap();
+    assert_eq!(output.pending_operations, ["historical-file"]);
+    input.event = "tick".into();
+    input.context.operation_id = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while output.completed_operations.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "snapshot completion did not arrive"
+        );
+        std::thread::yield_now();
+        output = git.update(&input).unwrap();
+    }
+    assert_eq!(output.completed_operations.len(), 1);
+    assert_eq!(
+        output.completed_operations[0].operation_id,
+        "historical-file"
+    );
+    assert!(matches!(
+        output.completed_operations[0].result,
+        OperationResult::Completed
+    ));
+    assert!(output.requests.iter().any(|request| matches!(request, HostRequest::OpenSnapshot { snapshot, .. } if snapshot.text == "committed\n")));
+}
+
+#[test]
+fn write_completions_are_separate_from_yank_requests() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("file"), "worktree\n").unwrap();
+    let mut git = workspace.plugin();
+    let mut input = initialize(&mut git);
+    input.context.operation_id = Some("stage-operation".into());
+    stage_without_delivering_completion(&mut git, &mut input);
+    input.context.operation_id = None;
+    input.event = "tick".into();
+    let update = git.update(&input).unwrap();
+    assert!(update.completed_operations.is_empty());
+    input.context.operation_id = Some("yank-operation".into());
+    let mut queued = PluginOutput::default();
+    git.views
+        .get_mut(&(1, 1))
+        .unwrap()
+        .yanks
+        .queue(
+            &git.services,
+            Event::YankPath,
+            &input,
+            vec![Target {
+                path: "file".into(),
+                name: "file".into(),
+                kind: TargetKind::File {
+                    source: Source::Worktree,
+                    original_path: None,
+                },
+            }],
+            &mut queued,
+        )
+        .unwrap();
+    assert_eq!(queued.pending_operations, ["yank-operation"]);
+    let outputs = git.poll_operations();
+    assert_eq!(outputs.len(), 2);
+    let write = outputs
+        .iter()
+        .find(|output| {
+            output
+                .completed_operations
+                .iter()
+                .any(|completion| completion.operation_id == "stage-operation")
+        })
+        .unwrap();
+    assert!(write.requests.is_empty());
+    assert_eq!(write.completed_operations.len(), 1);
+    assert!(matches!(
+        write.completed_operations[0].result,
+        OperationResult::Completed
+    ));
+    let yank = outputs
+        .iter()
+        .find(|output| {
+            output
+                .completed_operations
+                .iter()
+                .any(|completion| completion.operation_id == "yank-operation")
+        })
+        .unwrap();
+    assert_eq!(yank.completed_operations.len(), 1);
+    assert!(
+        matches!(yank.requests.as_slice(), [HostRequest::Yank { values, .. }] if values == &["file"])
+    );
+    assert!(git.poll_operations().is_empty());
+}
+
+#[test]
+fn replacing_a_snapshot_keeps_the_cancelled_operation_separate_from_the_new_open() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("a"), "committed\n").unwrap();
+    workspace.git(&["add", "."]);
+    workspace.git(&["commit", "--quiet", "-m", "baseline"]);
+    let commit = workspace.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    fs::write(workspace.0.join("a"), "worktree\n").unwrap();
+    let mut git = workspace.plugin();
+    git.page = Page::CommitFiles;
+    let mut input = input();
+    input.event = "init".into();
+    input.argument = json!({ "commit": commit });
+    git.update(&input).unwrap();
+    ready(&mut git, &mut input);
+    let gate = QueryWorkerGate::occupy(&workspace, &git.services);
+    input.selection = browser::single(Some("file:a".into()));
+    input.event = "edit".into();
+    input.context.operation_id = Some("old-snapshot".into());
+    let output = git.update(&input).unwrap();
+    assert_eq!(output.pending_operations, ["old-snapshot"]);
+    input.context.operation_id = Some("new-snapshot".into());
+    let output = git.update(&input).unwrap();
+    assert_eq!(output.pending_operations, ["new-snapshot"]);
+    assert!(output.completed_operations.is_empty());
+    let outputs = git.poll_operations();
+    assert_eq!(outputs.len(), 1);
+    assert!(outputs[0].requests.is_empty());
+    assert_eq!(outputs[0].completed_operations.len(), 1);
+    assert_eq!(
+        outputs[0].completed_operations[0].operation_id,
+        "old-snapshot"
+    );
+    assert!(matches!(
+        outputs[0].completed_operations[0].result,
+        OperationResult::Cancelled
+    ));
+    drop(gate);
+    input.event = "tick".into();
+    input.context.operation_id = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let output = loop {
+        let output = git.update(&input).unwrap();
+        if !output.completed_operations.is_empty() {
+            break output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement snapshot did not arrive"
+        );
+        std::thread::yield_now();
+    };
+    assert_eq!(output.completed_operations.len(), 1);
+    assert_eq!(output.completed_operations[0].operation_id, "new-snapshot");
+    assert!(matches!(
+        output.completed_operations[0].result,
+        OperationResult::Completed
+    ));
+    assert!(output.requests.iter().any(|request| matches!(request, HostRequest::OpenSnapshot { snapshot, .. } if snapshot.text == "committed\n")));
+    assert!(git.poll_operations().is_empty());
 }

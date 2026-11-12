@@ -40,7 +40,7 @@ fn directory_navigation_keeps_tree_selection_and_opens_leaf_diffs() {
     );
     session.input("e");
     assert_eq!(session.focus, source);
-    assert!(session.views[&source].layer.is_none());
+    assert!(session.views.child(source).is_none());
     session.input("l");
     assert_eq!(selected_row(&session, source).text, "▾ nested");
     session.input("l");
@@ -413,7 +413,7 @@ fn configured_git_colors_are_shared_by_counts_and_diff_lines() {
     }
     let source = session.focus;
     let target = session.preview_target(source).unwrap();
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     session
         .execute_command("diff.select-hunk", serde_json::json!({}))
         .unwrap();

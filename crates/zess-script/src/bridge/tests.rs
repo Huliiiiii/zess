@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn script_displays_keep_structured_status_separate_from_legacy_text() {
+    let mut engine = Engine::new();
+    register(&mut engine);
+    let values = engine
+        .run(
+            r#"
+        (require-builtin zess/native)
+        (buffer-output
+          (with-status-data
+            (buffer-display "Files" "" '() #f "legacy")
+            (hash 'pending_count 2))
+          #f '())
+    "#,
+        )
+        .unwrap();
+    let display = output(values.last().unwrap()).unwrap().display.unwrap();
+    assert_eq!(display.status, "legacy");
+    assert_eq!(display.status_data, serde_json::json!({"pending_count": 2}));
+    let serialized = serde_json::to_value(&display).unwrap();
+    let restored: Display = serde_json::from_value(serialized).unwrap();
+    assert_eq!(restored.status_data, display.status_data);
+    let legacy: Display = serde_json::from_value(serde_json::json!({"status": "legacy"})).unwrap();
+    assert_eq!(legacy.status, "legacy");
+    assert_eq!(legacy.status_data, serde_json::Value::Null);
+}
+
+#[test]
 fn script_cells_preserve_each_styled_span() {
     let mut engine = Engine::new();
     register(&mut engine);

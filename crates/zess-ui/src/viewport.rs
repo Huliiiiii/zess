@@ -1,6 +1,12 @@
 #[cfg(test)]
 mod tests;
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum ScrollMode {
+    FollowSelection,
+    UserControlled,
+}
+
 pub enum ScrollDirection {
     Up,
     Down,

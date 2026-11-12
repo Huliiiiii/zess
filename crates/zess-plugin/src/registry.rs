@@ -40,6 +40,7 @@ pub struct Registry<H> {
     view_defaults: BTreeMap<BufferKindId, serde_json::Map<String, Value>>,
     view_options: BTreeMap<BufferKindId, Value>,
     pub editor_options: EditorOptions,
+    pub on_client_exit: crate::OnClientExit,
     pub keymap: Keymap,
     modes: Vec<ModeRegistration>,
 }
@@ -65,6 +66,7 @@ impl<H> Registry<H> {
             view_defaults: BTreeMap::new(),
             view_options: BTreeMap::new(),
             editor_options: EditorOptions::default(),
+            on_client_exit: crate::OnClientExit::default(),
             modes: Vec::new(),
         }
     }
@@ -213,6 +215,9 @@ impl<H> Registry<H> {
             if !statusline.is_empty() && !self.statuslines.contains_key(statusline) {
                 return Err(anyhow!("unknown statusline {statusline}"));
             }
+        }
+        if let Some(formats) = options.get("status-formats") {
+            crate::validate_status_formats(formats)?;
         }
         if options
             .get("header-style")

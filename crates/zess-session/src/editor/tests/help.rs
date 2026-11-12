@@ -66,7 +66,7 @@ fn pending_file_actions_show_their_effective_bindings() {
         }
         session.input("y");
         session.tick();
-        assert_eq!(session.pending, ["y"]);
+        assert_eq!(session.key_sequence.keys(), ["y"]);
         let frame = rendered(&mut session);
         for description in [
             "Yank relative paths",
@@ -692,4 +692,36 @@ fn command_line_names_complete_independently_of_action_ids() {
     }
     session.input("Tab");
     assert_eq!(session.prompt.as_ref().unwrap().text, "save-custom");
+}
+
+#[test]
+fn opening_a_draft_from_help_keeps_it_attached_to_the_original_source() {
+    let fixture = Fixture::new();
+    let mut session = fixture.session(&[]);
+    let source = session.focus;
+    session.command("help").unwrap();
+    let help = session.focus;
+    session
+        .request(
+            help,
+            HostRequest::Layer {
+                purpose: "draft".into(),
+                text: "draft text".into(),
+                inline: true,
+            },
+        )
+        .unwrap();
+    let draft = session.focus;
+    assert!(session.help.is_none());
+    assert!(!session.views.contains_key(&help));
+    assert_eq!(session.views.parent(draft), Some(source));
+    assert_eq!(session.views.child(source), Some(draft));
+    assert_eq!(session.focus, draft);
+    session.command("write").unwrap();
+    assert_eq!(session.focus, source);
+    assert_eq!(session.views.child(source), None);
+    assert_eq!(
+        session.views[&source].location.memories["draft:draft"]["text"],
+        "draft text"
+    );
 }

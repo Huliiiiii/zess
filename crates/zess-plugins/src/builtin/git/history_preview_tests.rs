@@ -52,6 +52,82 @@ fn next_handle(services: &Services) -> u64 {
 }
 
 #[test]
+fn opening_a_commit_reuses_only_its_own_published_files() {
+    let services = services();
+    let first = commit("1111111111111111111111111111111111111111");
+    let second = commit("2222222222222222222222222222222222222222");
+    let mut history = Git::new(services.clone(), Page::History);
+    history.models.insert(
+        1,
+        Model {
+            commits: vec![commit(&first.oid), commit(&second.oid)],
+            result: LoadResult::Ready,
+            ..Model::default()
+        },
+    );
+    history.views.insert(
+        (1, 1),
+        GitView {
+            history: HistoryPreview {
+                state: QueryState::Idle {
+                    query: Some(first.oid.clone()),
+                },
+                published: Some(HistorySummary {
+                    commit: first.oid.clone(),
+                    info: vec![],
+                    summary: vec![],
+                    files: Some(vec![zess_git::CommitFile {
+                        path: "one".into(),
+                        status: "A".into(),
+                        original_path: None,
+                        additions: Some(1),
+                        deletions: Some(0),
+                    }]),
+                }),
+                ..HistoryPreview::default()
+            },
+            ..GitView::default()
+        },
+    );
+    let mut input = input();
+    input.event = "open".into();
+    input.selection = browser::single(Some(first.oid.clone()));
+    let first_output = history.update(&input).unwrap();
+    let first_argument = first_output
+        .requests
+        .into_iter()
+        .find_map(|request| match request {
+            HostRequest::Navigate {
+                navigation: Navigation::Push { argument, .. },
+            } => Some(argument),
+            _ => None,
+        })
+        .unwrap();
+    let mut files = Git::new(services, Page::CommitFiles);
+    input.event = "view_entered".into();
+    input.argument = first_argument;
+    input.selection = ItemSelection::default();
+    let output = files.update(&input).unwrap();
+    assert_eq!(output.display.unwrap().rows[0].id, "file:one");
+
+    input.event = "open".into();
+    input.argument = serde_json::Value::Null;
+    input.selection = browser::single(Some(second.oid));
+    let second_output = history.update(&input).unwrap();
+    let second_argument = second_output
+        .requests
+        .into_iter()
+        .find_map(|request| match request {
+            HostRequest::Navigate {
+                navigation: Navigation::Push { argument, .. },
+            } => Some(argument),
+            _ => None,
+        })
+        .unwrap();
+    assert!(second_argument["files"].is_null());
+}
+
+#[test]
 fn repeated_steps_at_the_same_commit_cancel_the_unpublished_summary() {
     let services = services();
     let input = input();
@@ -68,11 +144,15 @@ fn repeated_steps_at_the_same_commit_cancel_the_unpublished_summary() {
             query: selected.oid.clone(),
             task,
         },
-        commit: Some("previous".into()),
-        summary: vec![DisplayRow {
-            text: "previous summary".into(),
-            ..DisplayRow::default()
-        }],
+        published: Some(HistorySummary {
+            commit: "previous".into(),
+            files: None,
+            info: Vec::new(),
+            summary: vec![DisplayRow {
+                text: "previous summary".into(),
+                ..DisplayRow::default()
+            }],
+        }),
         ..HistoryPreview::default()
     };
     let now = Instant::now();
@@ -94,8 +174,17 @@ fn repeated_steps_at_the_same_commit_cancel_the_unpublished_summary() {
             .unwrap();
         assert!(matches!(preview.state, QueryState::Waiting { ready_at, .. }
             if ready_at == now + Duration::from_secs(elapsed) + input.preview_debounce));
-        assert_eq!(preview.commit.as_deref(), Some("previous"));
-        assert_eq!(preview.summary[0].text, "previous summary");
+        assert_eq!(
+            preview
+                .published
+                .as_ref()
+                .map(|summary| summary.commit.as_str()),
+            Some("previous")
+        );
+        assert_eq!(
+            preview.published.as_ref().unwrap().summary[0].text,
+            "previous summary"
+        );
     }
     let stats = services
         .borrow_mut()
@@ -112,15 +201,18 @@ fn navigation_keeps_the_previous_commit_visible_until_the_last_selection_settles
     let last = commit("2222222222222222222222222222222222222222");
     let now = Instant::now();
     let mut preview = HistoryPreview {
-        commit: Some("previous commit".into()),
-        info: vec![DisplayRow {
-            text: "previous info".into(),
-            ..DisplayRow::default()
-        }],
-        summary: vec![DisplayRow {
-            text: "previous summary".into(),
-            ..DisplayRow::default()
-        }],
+        published: Some(HistorySummary {
+            commit: "previous commit".into(),
+            files: None,
+            info: vec![DisplayRow {
+                text: "previous info".into(),
+                ..DisplayRow::default()
+            }],
+            summary: vec![DisplayRow {
+                text: "previous summary".into(),
+                ..DisplayRow::default()
+            }],
+        }),
         ..HistoryPreview::default()
     };
     let before = next_handle(&services);
@@ -142,13 +234,19 @@ fn navigation_keeps_the_previous_commit_visible_until_the_last_selection_settles
                 now + Duration::from_secs(elapsed),
             )
             .unwrap();
-        assert_eq!(preview.info[0].text, "previous info");
-        assert_eq!(preview.summary[0].text, "previous summary");
+        assert_eq!(
+            preview.published.as_ref().unwrap().info[0].text,
+            "previous info"
+        );
+        assert_eq!(
+            preview.published.as_ref().unwrap().summary[0].text,
+            "previous summary"
+        );
         for request in output.requests {
             if let HostRequest::PreviewGroup { panes, .. } = request {
                 assert!(panes.iter().all(|pane| matches!(pane, PreviewPane::View { path, .. } if path == "previous commit")));
                 assert!(
-                    matches!(&panes[1], PreviewPane::View { content: PreviewContent::Rows { rows, .. }, .. } if rows[0].text == "previous summary")
+                    matches!(&panes[1], PreviewPane::View { content: PreviewContent::Items { rows, .. }, .. } if rows[0].text == "previous summary")
                 );
             }
         }
@@ -270,15 +368,18 @@ fn an_empty_completed_source_clears_the_previous_commit() {
     let services = services();
     let input = input();
     let mut preview = HistoryPreview {
-        commit: Some("previous commit".into()),
-        info: vec![DisplayRow {
-            text: "previous info".into(),
-            ..DisplayRow::default()
-        }],
-        summary: vec![DisplayRow {
-            text: "previous summary".into(),
-            ..DisplayRow::default()
-        }],
+        published: Some(HistorySummary {
+            commit: "previous commit".into(),
+            files: None,
+            info: vec![DisplayRow {
+                text: "previous info".into(),
+                ..DisplayRow::default()
+            }],
+            summary: vec![DisplayRow {
+                text: "previous summary".into(),
+                ..DisplayRow::default()
+            }],
+        }),
         ..HistoryPreview::default()
     };
     let mut loading = output();
@@ -293,7 +394,10 @@ fn an_empty_completed_source_clears_the_previous_commit() {
             Instant::now(),
         )
         .unwrap();
-    assert_eq!(preview.summary[0].text, "previous summary");
+    assert_eq!(
+        preview.published.as_ref().unwrap().summary[0].text,
+        "previous summary"
+    );
     preview
         .advance(
             &services,
@@ -305,9 +409,7 @@ fn an_empty_completed_source_clears_the_previous_commit() {
         )
         .unwrap();
 
-    assert!(preview.commit.is_none());
-    assert!(preview.info.is_empty());
-    assert!(preview.summary.is_empty());
+    assert!(preview.published.is_none());
     assert_eq!(
         preview.totals.status(),
         json!({"git": {

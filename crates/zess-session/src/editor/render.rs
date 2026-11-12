@@ -1,4 +1,6 @@
+use super::ScrollMode;
 use super::*;
+use zess_plugin::{StatusContent, StatusContext, StatusPosition};
 
 #[cfg(test)]
 mod tests;
@@ -154,12 +156,12 @@ impl Session {
             return (Vec::new(), None);
         }
         let buffer = self.views[&id].location.buffer;
-        let layer = self.views[&id].layer;
+        let layer = self.views.child(id);
         let active = self.focus == id;
         let caret = active
             && self.active_prompt().is_none()
             && self.help.is_none()
-            && self.pending.is_empty();
+            && self.key_sequence.keys().is_empty();
         let (kind, title, modified) = match &self.buffers[&buffer] {
             Buffer::Text(text) => (
                 "text".to_owned(),
@@ -170,7 +172,7 @@ impl Session {
                             .display()
                             .to_string()
                     })
-                    .unwrap_or_else(|| match &self.views[&id].layer_content {
+                    .unwrap_or_else(|| match &self.views.layer_content(id) {
                         Some(LayerContent::Draft { purpose }) => purpose.clone(),
                         _ => "[scratch]".into(),
                     }),
@@ -226,7 +228,7 @@ impl Session {
         let pane_height = height.saturating_sub(usize::from(!status_name.is_empty()));
         let view = &self.views[&id];
         let display = &view.location.display;
-        let shortcuts = if display.tabs.is_empty() || self.pending.is_empty() {
+        let shortcuts = if display.tabs.is_empty() || self.key_sequence.keys().is_empty() {
             Vec::new()
         } else {
             self.scripts
@@ -245,8 +247,9 @@ impl Session {
                                     .iter()
                                     .find(|binding| {
                                         binding.command == tab.command
-                                            && binding.keys.len() == self.pending.len() + 1
-                                            && binding.keys.starts_with(&self.pending)
+                                            && binding.keys.len()
+                                                == self.key_sequence.keys().len() + 1
+                                            && binding.keys.starts_with(&self.key_sequence.keys())
                                     })
                                     .map(|binding| {
                                         format!("{} {}", binding.keys.last().unwrap(), tab.label)
@@ -296,25 +299,27 @@ impl Session {
         let mut cursor = None;
         let mut mouse_content = mouse::Content::Rows;
         let mut mouse_gutter = 0;
-        let mut context = json!({
-            "kind": kind,
-            "title": title,
-            "active": active,
-            "modified": modified,
-            "loading": self.views[&id].location.display.loading,
-            "plugin_status": self.views[&id].location.display.status,
-            "view_id": id,
-            "buffer_id": buffer,
-        });
-        context["options"] = options.clone();
-        context["width"] = json!(width);
+        let mut context = StatusContext {
+            kind: kind.clone(),
+            title,
+            active,
+            modified,
+            loading: self.views[&id].location.display.loading,
+            plugin_status: self.views[&id].location.display.status.clone(),
+            plugin_status_data: self.views[&id].location.display.status_data.clone(),
+            view_id: id,
+            buffer_id: buffer,
+            options: options.clone(),
+            width,
+            ..StatusContext::default()
+        };
         let gutter_left_padding = options
             .get("gutter-left-padding")
             .and_then(Value::as_u64)
             .unwrap_or(1)
             .min(width as u64) as usize;
         if let Some(text) = self.buffers.get_mut(&buffer).and_then(Buffer::text) {
-            let gutter = if self.views[&id].presentation == LayerPresentation::Inline
+            let gutter = if self.views.presentation(id) == LayerPresentation::Inline
                 || options.get("gutter").is_some_and(|value| value == false)
             {
                 0
@@ -330,10 +335,15 @@ impl Session {
             };
             let view = text.view(id);
             let position = view.cursor();
-            context["mode"] = json!(view.mode());
-            context["selection_count"] = json!(view.selection_count());
-            context["position"] = json!({"row":position.0+1,"column":position.1+1});
-            context["encoding"] = json!("UTF-8");
+            context.mode = Some(view.mode().into());
+            context.content = StatusContent::Text {
+                position: StatusPosition {
+                    row: position.0 + 1,
+                    column: position.1 + 1,
+                },
+                selection_count: view.selection_count(),
+                encoding: "UTF-8".into(),
+            };
             for (index, mut row) in rendered.rows.into_iter().enumerate() {
                 if gutter > 0 {
                     let number = rendered.scroll + index + 1;
@@ -369,7 +379,7 @@ impl Session {
             {
                 let index = diff.index(view.location.diff_presentation);
                 if diff.mapped_rendering()
-                    && !view.location.manual_viewport
+                    && view.location.scroll_mode == ScrollMode::FollowSelection
                     && let Some(selection) = view.location.diff_selection.rows(index)
                 {
                     if *selection.start() < view.location.scroll {
@@ -430,22 +440,26 @@ impl Session {
                     .and_then(|row| index.rows.get(row));
                 let old = position.and_then(|row| row.old_line);
                 let new = position.and_then(|row| row.new_line);
-                context["mode"] = json!(if diff.mapped_rendering() {
-                    match view.location.diff_selection {
-                        diff::Selection::Block { .. } => "hunk",
-                        diff::Selection::Line { .. } => "line",
-                        diff::Selection::Range { .. } => "range",
+                context.mode = Some(
+                    if diff.mapped_rendering() {
+                        match view.location.diff_selection {
+                            diff::Selection::Block { .. } => "hunk",
+                            diff::Selection::Line { .. } => "line",
+                            diff::Selection::Range { .. } => "range",
+                        }
+                    } else {
+                        "browse"
                     }
-                } else {
-                    "browse"
-                });
-                context["selection_count"] = json!(usize::from(position.is_some()));
-                context["source_position"] = json!({"old_line": old, "new_line": new});
-                context["old_line"] = json!(old);
-                context["new_line"] = json!(new);
+                    .into(),
+                );
+                context.content = StatusContent::Diff {
+                    old_line: old,
+                    new_line: new,
+                    selection_count: usize::from(position.is_some()),
+                };
             } else {
                 let selection = view.location.diff_selection.rows(&diff.index);
-                if !view.location.manual_viewport {
+                if view.location.scroll_mode == ScrollMode::FollowSelection {
                     if let Some(selection) = &selection {
                         if *selection.start() < view.location.scroll {
                             view.location.scroll = *selection.start();
@@ -539,15 +553,19 @@ impl Session {
                     .and_then(|row| diff.index.rows.get(row));
                 let old = position.and_then(|row| row.old_line);
                 let new = position.and_then(|row| row.new_line);
-                context["mode"] = json!(match view.location.diff_selection {
-                    diff::Selection::Block { .. } => "hunk",
-                    diff::Selection::Line { .. } => "line",
-                    diff::Selection::Range { .. } => "range",
-                });
-                context["selection_count"] = json!(usize::from(position.is_some()));
-                context["source_position"] = json!({"old_line": old, "new_line": new});
-                context["old_line"] = json!(old);
-                context["new_line"] = json!(new);
+                context.mode = Some(
+                    match view.location.diff_selection {
+                        diff::Selection::Block { .. } => "hunk",
+                        diff::Selection::Line { .. } => "line",
+                        diff::Selection::Range { .. } => "range",
+                    }
+                    .into(),
+                );
+                context.content = StatusContent::Diff {
+                    old_line: old,
+                    new_line: new,
+                    selection_count: usize::from(position.is_some()),
+                };
             }
         } else if matches!(self.buffers[&buffer], Buffer::PreviewRows { .. }) {
             let view = self.views.get_mut(&id).unwrap();
@@ -597,7 +615,7 @@ impl Session {
             let help = kind == "help" && content_height > 0;
             let available = content_height.saturating_sub(usize::from(help));
             view.viewport_height = available;
-            view.location.scroll = if view.location.manual_viewport {
+            view.location.scroll = if view.location.scroll_mode == ScrollMode::UserControlled {
                 view.location.scroll.min(zess_ui::scroll_limit_with_margin(
                     view.location.display.rows.len(),
                     available,
@@ -712,22 +730,23 @@ impl Session {
                     )
                     .collect(),
             };
-            context["mode"] = json!(view.location.mode.as_str());
-            context["selection_count"] = json!(view.location.selection.selected.len());
-            context["selected_count"] = json!(view.location.selection.selected.len());
-            context["primary"] = json!(view.location.selection.primary);
-            context["item_count"] = json!(view.item_ids().len());
+            context.mode = Some(view.location.mode.as_str().into());
+            context.content = StatusContent::Items {
+                selection_count: view.location.selection.selected.len(),
+                primary: view.location.selection.primary.clone(),
+                item_count: view.item_ids().len(),
+            };
         }
         rows.resize_with(pane_height, FrameRow::default);
         if !status_name.is_empty() {
-            context["width"] = json!(pane_width);
-            context["right_inset"] = json!(right_inset);
+            context.width = pane_width;
+            context.right_inset = right_inset;
             rows.push(FrameRow {
                 spans: self.statusline(id, status_name, context, pane_width, active),
             });
         }
         let has_pane_layer =
-            layer.is_some_and(|child| self.views[&child].presentation != LayerPresentation::Inline);
+            layer.is_some_and(|child| self.views.presentation(child) != LayerPresentation::Inline);
         if !has_pane_layer {
             self.mouse_regions.push(mouse::Region {
                 target: RenderTarget::View(id),
@@ -748,7 +767,7 @@ impl Session {
             });
         }
         if let Some(child) = layer {
-            if self.views[&child].presentation == LayerPresentation::Inline {
+            if self.views.presentation(child) == LayerPresentation::Inline {
                 let available = content_height;
                 let overlay_height = available.min(2);
                 let view = &self.views[&id];
@@ -849,7 +868,7 @@ fn align_row(
     spans
 }
 
-fn skip_columns(spans: &mut [Span], mut skip: usize) {
+pub(super) fn skip_columns(spans: &mut [Span], mut skip: usize) {
     for span in spans {
         let mut start = 0;
         let mut padding = 0;

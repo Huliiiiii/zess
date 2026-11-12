@@ -138,7 +138,7 @@ fn a_deleted_diff_source_does_not_create_an_empty_editor() {
         let error = session.execute_command(command, json!({})).unwrap_err();
         assert_eq!(error.to_string(), "Git source file no longer exists");
         assert_eq!(session.focus, preview);
-        assert!(session.views[&preview].layer.is_none());
+        assert!(session.views.child(preview).is_none());
         assert_eq!(
             session.buffers.keys().copied().collect::<HashSet<_>>(),
             buffers
@@ -154,7 +154,7 @@ fn a_deleted_diff_source_does_not_create_an_empty_editor() {
             session.input(key);
         }
         assert_eq!(session.focus, source);
-        assert!(session.views[&source].layer.is_none());
+        assert!(session.views.child(source).is_none());
         assert_eq!(session.message, "error: Git source file no longer exists");
         assert_eq!(
             session.buffers.keys().copied().collect::<HashSet<_>>(),
@@ -195,7 +195,7 @@ fn a_historical_directory_opens_the_selected_second_file_blob() {
     assert_eq!(id.path, "dir/second.txt");
     assert_eq!(text.text(), "baseline\n");
     assert!(session.command("write").is_err());
-    assert_eq!(session.views[&layer].parent, Some(preview));
+    assert_eq!(session.views.parent(layer), Some(preview));
     session.command("quit").unwrap();
     assert_eq!(session.focus, preview);
     for key in ["g", "f"] {
@@ -296,7 +296,7 @@ fn replacing_a_historical_diff_cancels_its_pending_source_read() {
     assert!(session.pending_diff_source.is_none());
     settle(&mut session);
     assert_eq!(session.focus, preview);
-    assert!(session.views[&preview].layer.is_none());
+    assert!(session.views.child(preview).is_none());
     assert!(
         !session
             .buffers
@@ -370,7 +370,7 @@ fn a_split_diff_opens_its_selected_worktree_file_in_an_editor() {
     assert_eq!(session.views[&independent].location.buffer, buffer);
     session.input("e");
     let layer = session.focus;
-    assert_eq!(session.views[&layer].parent, Some(independent));
+    assert_eq!(session.views.parent(layer), Some(independent));
     let Buffer::Text(text) = &session.buffers[&session.views[&layer].location.buffer] else {
         panic!("expected file layer: {}", session.message);
     };
@@ -436,7 +436,7 @@ fn replacing_a_shared_diff_cancels_source_reads_from_its_other_views() {
     assert!(session.pending_diff_source.is_none());
     settle(&mut session);
     assert_eq!(session.focus, independent);
-    assert!(session.views[&independent].layer.is_none());
+    assert!(session.views.child(independent).is_none());
     assert!(
         !session
             .buffers
@@ -546,7 +546,7 @@ fn a_pending_directory_group_keeps_its_old_contents_readonly_until_publication()
         let error = session.execute_command(command, json!({})).unwrap_err();
         assert_eq!(error.to_string(), "wait for Git previews to finish loading");
         assert_eq!(session.focus, preview);
-        assert!(session.views[&preview].layer.is_none());
+        assert!(session.views.child(preview).is_none());
         assert!(session.git_patch.is_none());
     }
     assert_eq!(git(&fixture, &["write-tree"]), before);
@@ -595,7 +595,7 @@ fn a_published_group_stays_actionable_while_only_the_status_list_refreshes() {
     );
     session.input("e");
     let layer = session.focus;
-    assert_eq!(session.views[&layer].parent, Some(preview));
+    assert_eq!(session.views.parent(layer), Some(preview));
     session.command("quit").unwrap();
     assert_eq!(session.focus, preview);
     session
@@ -632,7 +632,7 @@ register-command "raw-diff" "Read a patch for an explicit new file"
     session.input("e");
     let layer = session.focus;
     assert_ne!(layer, preview);
-    assert_eq!(session.views[&layer].parent, Some(preview));
+    assert_eq!(session.views.parent(layer), Some(preview));
     let Buffer::Text(text) = &session.buffers[&session.views[&layer].location.buffer] else {
         panic!("expected empty file layer: {}", session.message);
     };

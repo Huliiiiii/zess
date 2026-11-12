@@ -2,6 +2,13 @@ use std::time::Duration;
 
 pub const DEFAULT_PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnClientExit {
+    Keep,
+    #[default]
+    StopIfUnused,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EditorOptions {
     pub mouse: bool,

@@ -1,52 +1,12 @@
 use super::*;
-
-fn region(value: &Value) -> Result<Vec<Span>> {
-    if value.is_null() {
-        return Ok(Vec::new());
-    }
-    if let Some(text) = value.as_str() {
-        return Ok(vec![Span {
-            base_style: None,
-            text: text.into(),
-            style: String::new(),
-        }]);
-    }
-    let spans = value
-        .as_array()
-        .context("statusline region must be text or spans")?;
-    spans
-        .iter()
-        .map(|value| {
-            if let Some(text) = value.as_str() {
-                return Ok(Span {
-                    base_style: None,
-                    text: text.into(),
-                    style: String::new(),
-                });
-            }
-            Ok(Span {
-                base_style: None,
-                text: value
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .context("statusline span requires text")?
-                    .into(),
-                style: value
-                    .get("style")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .into(),
-            })
-        })
-        .collect()
-}
+use zess_plugin::StatusContext;
 
 impl Session {
     pub(super) fn statusline(
         &mut self,
         id: ViewId,
         name: &str,
-        context: Value,
+        context: StatusContext,
         width: usize,
         active: bool,
     ) -> Vec<Span> {
@@ -64,12 +24,9 @@ impl Session {
                 .as_mut()
                 .context("statusline runtime unavailable")?
                 .format_statusline(name, &context)?;
-            formatted
-                .as_object()
-                .context("statusline formatter must return left, center and right regions")?;
-            let left = region(&formatted["left"])?;
-            let center = region(&formatted["center"])?;
-            let right = region(&formatted["right"])?;
+            let left = formatted.left;
+            let center = formatted.center;
+            let right = formatted.right;
             let length = |spans: &[Span]| {
                 spans
                     .iter()
@@ -77,12 +34,7 @@ impl Session {
                     .sum::<usize>()
             };
             let left_width = length(&left).min(width);
-            let right_inset = context
-                .get("right_inset")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                .min(width.saturating_sub(left_width) as u64)
-                as usize;
+            let right_inset = context.right_inset.min(width.saturating_sub(left_width));
             let width = width - right_inset;
             let right_width = length(&right).min(width.saturating_sub(left_width));
             let center_width = length(&center).min(width.saturating_sub(left_width + right_width));

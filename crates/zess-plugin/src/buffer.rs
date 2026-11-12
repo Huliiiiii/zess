@@ -50,6 +50,8 @@ pub struct PluginContext {
     pub workspace: String,
     pub text: Option<TextContext>,
     pub filesystem_revision: Option<u64>,
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -84,6 +86,24 @@ pub struct PluginOutput {
     pub display: Option<Display>,
     #[serde(default)]
     pub requests: Vec<HostRequest>,
+    #[serde(default)]
+    pub pending_operations: Vec<String>,
+    #[serde(default)]
+    pub completed_operations: Vec<OperationCompletion>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OperationCompletion {
+    pub operation_id: String,
+    pub result: OperationResult,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum OperationResult {
+    Completed,
+    Failed { message: String },
+    Cancelled,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]

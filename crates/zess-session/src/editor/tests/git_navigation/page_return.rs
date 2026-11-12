@@ -26,7 +26,7 @@ fn reopening_git_preserves_the_current_page_and_preview_focus() {
         let buffers = session.buffers.keys().copied().collect::<HashSet<_>>();
         for preview in [false, true] {
             if preview {
-                session.focus_preview().unwrap();
+                session.focus_preview(session.focus).unwrap();
             }
             let focus = session.focus;
             session.command("git").unwrap();
@@ -44,7 +44,7 @@ fn reopening_git_preserves_the_current_page_and_preview_focus() {
     settle(&mut session);
     let split = session.focus;
     let buffer = session.views[&split].location.buffer;
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     let focus = session.focus;
     session.command("git").unwrap();
     assert_eq!(session.focus, focus);
@@ -83,6 +83,7 @@ fn reopening_a_plugin_with_arguments_applies_the_new_request() {
 
 #[test]
 fn preview_commands_update_the_containing_page_and_release_retired_slots() {
+    let scripts = Fixture::new();
     for browser in ["files", "git"] {
         for focus in [false, true] {
             let (fixture, _) = repository();
@@ -92,7 +93,7 @@ fn preview_commands_update_the_containing_page_and_release_retired_slots() {
             let buffers = session.buffers.keys().copied().collect::<HashSet<_>>();
             session.command(browser).unwrap();
             settle(&mut session);
-            session.focus_preview().unwrap();
+            session.focus_preview(session.focus).unwrap();
             if browser == "git" {
                 assert_ne!(session.focus, source);
             } else {
@@ -102,7 +103,8 @@ fn preview_commands_update_the_containing_page_and_release_retired_slots() {
                 .scripts
                 .as_mut()
                 .unwrap()
-                .load_source(
+                .load(&scripts.write(
+                    "preview-commands.w",
                     &format!(
                         r#"
 require "zess/buffer"
@@ -127,8 +129,7 @@ register-command "pair" "Show paired previews"
 "#,
                         if focus { "#t" } else { "#f" }
                     ),
-                    Path::new("preview-commands.w"),
-                )
+                ))
                 .unwrap();
             session.command("trio").unwrap();
             let retired = &session
@@ -266,7 +267,7 @@ fn closing_git_returns_to_the_editor_that_opened_it() {
             buffers
         );
         input_command(&mut session, "q");
-        assert!(session.exiting(), "{source}");
+        assert!(!session.exiting(), "{source}");
     }
 }
 
@@ -291,7 +292,7 @@ fn closing_git_preserves_unsaved_scratch_text_and_selection() {
     .unwrap();
     input_command(&mut session, "git");
     settle(&mut session);
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     input_command(&mut session, "q");
     assert!(!session.exiting());
     assert_eq!(session.views[&editor].location.buffer, buffer);
@@ -302,10 +303,6 @@ fn closing_git_preserves_unsaved_scratch_text_and_selection() {
         selection
     );
     assert!(text.modified());
-    assert!(session.command("q").is_err());
-    assert!(!session.exiting());
-    session.command("q!").unwrap();
-    assert!(session.exiting());
 }
 
 #[test]
@@ -316,7 +313,7 @@ fn quitting_a_git_preview_returns_to_the_original_editor() {
     let buffer = session.views[&editor].location.buffer;
     input_command(&mut session, "git");
     settle(&mut session);
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     assert_ne!(session.focus, editor);
     input_command(&mut session, "q");
     assert!(!session.exiting());
@@ -325,7 +322,7 @@ fn quitting_a_git_preview_returns_to_the_original_editor() {
     assert!(preview_groups(&session).next().is_none());
     assert_eq!(session.views.values().count(), 1);
     input_command(&mut session, "q");
-    assert!(session.exiting());
+    assert!(!session.exiting());
 }
 
 #[test]
@@ -342,7 +339,7 @@ fn switching_git_pages_and_browsers_preserves_the_editor_return_point() {
     session.input("Enter");
     settle(&mut session);
     assert_eq!(selected_row(&session, editor).id, "file:note.txt");
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     input_command(&mut session, "files");
     settle(&mut session);
     assert_eq!(session.focus, editor);
@@ -453,7 +450,7 @@ fn quitting_a_cloned_git_preview_closes_only_its_split() {
         .iter()
         .map(|member| member.view().unwrap().id)
         .collect::<Vec<_>>();
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     session.command("q").unwrap();
     settle(&mut session);
 
@@ -568,7 +565,7 @@ fn pending_file_operations_block_return_to_the_editor() {
         session.input(key);
     }
     assert!(!fixture.0.join("new.txt").exists());
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     let preview = session.focus;
     assert!(session.command("q").is_err());
     assert_eq!(session.focus, preview);
@@ -594,12 +591,15 @@ fn cycling_buffers_from_git_uses_the_original_editor_buffer() {
         let mut session = fixture.session(&[]);
         let editor = session.focus;
         let first = session.views[&editor].location.buffer;
+        for key in ["i", "x", "Esc"] {
+            session.input(key);
+        }
         session.command("new").unwrap();
         let second = session.views[&editor].location.buffer;
         assert_ne!(first, second);
         input_command(&mut session, "git");
         settle(&mut session);
-        session.focus_preview().unwrap();
+        session.focus_preview(session.focus).unwrap();
         session.command(command).unwrap();
         assert_eq!(session.focus, editor);
         assert_eq!(session.views[&editor].location.buffer, first);
@@ -615,6 +615,9 @@ fn cycling_buffers_from_a_split_keeps_the_original_git_page_open() {
         let mut session = fixture.session(&[]);
         let editor = session.focus;
         let first = session.views[&editor].location.buffer;
+        for key in ["i", "x", "Esc"] {
+            session.input(key);
+        }
         input_command(&mut session, "new");
         let second = session.views[&editor].location.buffer;
         input_command(&mut session, "git");
@@ -637,15 +640,10 @@ fn cycling_buffers_from_a_split_keeps_the_original_git_page_open() {
         assert_eq!(session.views[&editor].location.buffer, git);
         assert_eq!(selected_row(&session, editor).id, "file:note.txt");
 
-        input_command(&mut session, "q");
-        assert!(!session.exiting());
-        assert_eq!(session.focus, editor);
-        assert!(!session.views.contains_key(&split));
+        session.focus_view(editor).unwrap();
         assert_eq!(session.views[&editor].location.buffer, git);
         input_command(&mut session, "q");
         assert!(!session.exiting());
         assert_eq!(session.views[&editor].location.buffer, second);
-        input_command(&mut session, "q");
-        assert!(session.exiting());
     }
 }

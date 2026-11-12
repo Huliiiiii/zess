@@ -1,4 +1,5 @@
 use super::*;
+use std::fs;
 
 fn rendered_text(result: &RenderResult) -> String {
     result
@@ -74,6 +75,40 @@ fn preview_painting_uses_only_the_viewport_and_leaves_editing_views_unallocated(
 }
 
 #[test]
+fn visible_source_fragments_preserve_character_offsets_after_horizontal_scrolling() {
+    let mut buffer = TextBuffer::new("\t界a\u{301}🙂Z0123456789\nsecond");
+    buffer.render(1, 4, 1, true);
+    buffer.scroll_view(1, 5, 0);
+    assert_eq!(
+        buffer.visible_source_lines(1),
+        vec![(0, 1, "界a\u{301}🙂".into())]
+    );
+
+    let mut viewport = PreviewViewport {
+        horizontal_scroll: 5,
+        ..PreviewViewport::default()
+    };
+    buffer.render_preview(&mut viewport, 4, 1, false);
+    assert_eq!(
+        buffer.preview_visible_source_lines(&viewport, false),
+        vec![(0, 1, "界a\u{301}🙂".into())]
+    );
+}
+
+#[test]
+fn visible_source_fragments_bound_large_lines_to_the_viewport() {
+    let mut buffer = TextBuffer::new(&"a".repeat(20 * 1024 * 1024));
+    buffer.render(1, 80, 2, true);
+    assert_eq!(buffer.visible_source_lines(1), vec![(0, 0, "a".repeat(80))]);
+    let mut viewport = PreviewViewport::default();
+    buffer.render_preview(&mut viewport, 80, 2, true);
+    assert_eq!(
+        buffer.preview_visible_source_lines(&viewport, true),
+        vec![(0, 0, "a".repeat(160))]
+    );
+}
+
+#[test]
 fn wrapped_previews_scroll_through_visual_lines_and_reflow_after_resize() {
     let mut buffer = TextBuffer::new("abcdefghijklmnopqrstuvwx\ntail");
     buffer.set_readonly(true);
@@ -95,6 +130,10 @@ fn wrapped_previews_scroll_through_visual_lines_and_reflow_after_resize() {
     let layout = buffer.preview_wrap.as_ref().unwrap();
     assert_eq!(layout.rows.len(), 3);
     assert!(!layout.complete);
+    assert_eq!(
+        buffer.preview_visible_source_lines(&viewport, true),
+        vec![(0, 0, "abcdefghijklmnop".into())]
+    );
     viewport.scroll = 99;
     viewport.horizontal_scroll = 99;
     assert_eq!(
@@ -103,6 +142,10 @@ fn wrapped_previews_scroll_through_visual_lines_and_reflow_after_resize() {
     );
     assert_eq!(viewport.scroll, 2);
     assert_eq!(viewport.horizontal_scroll, 0);
+    assert_eq!(
+        buffer.preview_visible_source_lines(&viewport, true),
+        vec![(0, 16, "qrstuvwx\n".into()), (1, 25, "tail".into())]
+    );
     assert_eq!(
         text(buffer.render_preview(&mut viewport, 24, 2, true)),
         ["abcdefghijklmnopqrstuvwx", "tail"]
@@ -1050,6 +1093,81 @@ fn unfinished_insertions_and_other_views_do_not_replace_the_completed_history() 
 }
 
 #[test]
+fn readonly_discards_the_unfinished_insertion_but_preserves_repeat_history() {
+    let mut buffer = TextBuffer::new("");
+    buffer.execute_command(1, "text.insert").unwrap();
+    buffer.input_text(1, "A").unwrap();
+    buffer.execute_command(1, "text.escape").unwrap();
+    buffer.execute_command(1, "text.append").unwrap();
+    buffer.input_text(1, "B").unwrap();
+    buffer.set_readonly(true);
+    assert_eq!(buffer.text(), "AB");
+    assert_eq!(buffer.view(1).mode(), "normal");
+    assert!(matches!(
+        buffer.views[&1].insert_recording,
+        InsertRecording::Idle
+    ));
+
+    buffer.set_readonly(false);
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "A");
+    buffer.execute_command(1, "text.repeat-insert").unwrap();
+    assert_eq!(buffer.text(), "AA");
+}
+
+#[test]
+fn readonly_discards_unfinished_insertions_in_all_views() {
+    let history = InsertHistory::default();
+    let mut completed = TextBuffer::new("");
+    completed.set_insert_history(history.clone());
+    completed.execute_command(1, "text.insert").unwrap();
+    completed.input_text(1, "A").unwrap();
+    completed.execute_command(1, "text.escape").unwrap();
+
+    let mut buffer = TextBuffer::new("");
+    buffer.set_insert_history(history.clone());
+    buffer.execute_command(1, "text.insert").unwrap();
+    buffer.input_text(1, "B").unwrap();
+    buffer.execute_command(2, "text.insert").unwrap();
+    buffer.input_text(2, "C").unwrap();
+    buffer.set_readonly(true);
+    assert_eq!(buffer.text(), "CB");
+    for id in [1, 2] {
+        assert_eq!(buffer.view(id).mode(), "normal");
+        assert!(matches!(
+            buffer.views[&id].insert_recording,
+            InsertRecording::Idle
+        ));
+    }
+    buffer.set_readonly(false);
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "B");
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "");
+    buffer.execute_command(1, "text.repeat-insert").unwrap();
+    assert_eq!(buffer.text(), "A");
+}
+
+#[test]
+fn insertions_in_different_views_have_separate_undo_transactions() {
+    let mut buffer = TextBuffer::new("");
+    buffer.execute_command(1, "text.insert").unwrap();
+    buffer.input_text(1, "A").unwrap();
+    buffer.execute_command(2, "text.insert").unwrap();
+    buffer.input_text(2, "B").unwrap();
+    buffer.remove_view(2);
+    buffer.input_text(1, "C").unwrap();
+    buffer.execute_command(1, "text.escape").unwrap();
+    assert_eq!(buffer.text(), "BAC");
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "BA");
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "A");
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "");
+}
+
+#[test]
 fn repeat_insert_rejects_reentry_without_corrupting_the_recording() {
     let mut buffer = TextBuffer::new("");
     buffer.execute_command(1, "text.insert").unwrap();
@@ -1903,13 +2021,10 @@ fn cancelling_a_search_restores_the_selection_mode_and_viewport() {
     assert_eq!(view.selection, original.selection);
     assert_eq!(view.mode, original.mode);
     assert_eq!(
-        (view.scroll, view.horizontal_scroll, view.manual_viewport),
-        (
-            original.scroll,
-            original.horizontal_scroll,
-            original.manual_viewport
-        )
+        (view.scroll, view.horizontal_scroll),
+        (original.scroll, original.horizontal_scroll)
     );
+    assert!(view.scroll_mode == original.scroll_mode);
 }
 
 #[test]
@@ -1963,7 +2078,7 @@ fn selections_crossing_the_viewport_keep_their_styles_and_secondary_cursor() {
         0,
     );
     view.scroll = 2;
-    view.manual_viewport = true;
+    view.scroll_mode = ScrollMode::UserControlled;
 
     let frame = buffer.render(1, 3, 2, true);
 

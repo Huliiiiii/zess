@@ -176,7 +176,7 @@ map-key "minibuffer" "prompt" "Left" "prompt.move-left"
 map-key "minibuffer" "prompt" "Right" "prompt.move-right"
 map-key "minibuffer" "prompt" "Home" "prompt.move-home"
 map-key "minibuffer" "prompt" "End" "prompt.move-end"
-register-statusline "default" default-statusline
+%register-builtin-statusline "default" default-statusline
 set-view-options! "help" : obj 'statusline "" 'gutter #f 'header-style "ui.heading"
 
 define : preview-statusline context
@@ -186,7 +186,7 @@ define : preview-statusline context
       . ""
     status-plugin context
     if (get context 'position #f) (status-text context) ""
-register-statusline "preview" preview-statusline
+%register-builtin-statusline "preview" preview-statusline
 set-view-options! "preview" : obj 'statusline "preview" 'gutter-left-padding 0
 set-view-options! "directory" : obj 'statusline ""
 
@@ -198,5 +198,5 @@ define : diff-statusline context
       array (status-mode-span context) : status-loading context
       status-plugin context
       if (number? line) (to-string line) ""
-register-statusline "diff" diff-statusline
+%register-builtin-statusline "diff" diff-statusline
 set-view-options! "diff" : obj 'statusline "diff" 'gutter-left-padding 0

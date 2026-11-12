@@ -49,7 +49,12 @@ fn filesystem_notifications_reuse_the_running_file_list_query() {
     git.views.insert(
         (1, 1),
         GitView {
-            task: Some(Task::start(&services, QueryRequest::Status {}).unwrap()),
+            load: Some(GitLoad {
+                epoch: 0,
+                task: Task::start(&services, QueryRequest::Status {}).unwrap(),
+                generation: 0,
+                published_revision: 0,
+            }),
             ..GitView::default()
         },
     );
