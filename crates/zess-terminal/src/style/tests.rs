@@ -1,6 +1,92 @@
 use super::*;
 
 #[test]
+fn selected_rows_keep_semantic_foregrounds_and_attributes() {
+    use std::collections::HashMap;
+    use zess_ui::{FrameRow, Span};
+
+    crossterm::style::force_color_output(true);
+    let styles = HashMap::from([
+        (
+            "custom".into(),
+            TextStyle {
+                foreground: Some(StyleColor::Indexed(6)),
+                background: Some(StyleColor::Indexed(52)),
+                attributes: vec![StyleAttribute::Underline],
+                removed_attributes: vec![StyleAttribute::Italic],
+            },
+        ),
+        (
+            "base".into(),
+            TextStyle {
+                foreground: Some(StyleColor::Indexed(9)),
+                attributes: vec![StyleAttribute::Bold, StyleAttribute::Italic],
+                ..TextStyle::default()
+            },
+        ),
+    ]);
+    let row = FrameRow {
+        spans: vec![
+            Span {
+                text: "dir".into(),
+                style: "selection.directory".into(),
+                base_style: None,
+            },
+            Span {
+                text: "cell".into(),
+                style: "selection.custom".into(),
+                base_style: Some("base".into()),
+            },
+            Span {
+                text: "plain".into(),
+                style: "selection.".into(),
+                base_style: Some("base".into()),
+            },
+        ],
+    };
+    let mut output = Vec::new();
+    super::super::render_row(&mut output, &row, 12, &styles).unwrap();
+    assert_eq!(
+        output,
+        concat!(
+            "\x1b[0m\x1b[38;5;12m\x1b[48;5;8m\x1b[1mdir",
+            "\x1b[0m\x1b[38;5;6m\x1b[48;5;8m\x1b[1m\x1b[4mcell",
+            "\x1b[0m\x1b[38;5;9m\x1b[48;5;8m\x1b[1m\x1b[3mplain\x1b[0m\x1b[0m"
+        )
+        .as_bytes()
+    );
+    let custom = resolve_in("custom", &styles);
+    assert_eq!(custom.background, Some(StyleColor::Indexed(52)));
+    assert_eq!(custom.attributes, [StyleAttribute::Underline]);
+}
+
+#[test]
+fn explicit_selected_styles_override_the_composed_default() {
+    let styles = std::collections::HashMap::from([
+        (
+            "git.added".into(),
+            TextStyle {
+                foreground: Some(StyleColor::Indexed(2)),
+                ..TextStyle::default()
+            },
+        ),
+        (
+            "selection.git.added".into(),
+            TextStyle {
+                foreground: Some(StyleColor::Indexed(3)),
+                background: Some(StyleColor::Indexed(4)),
+                attributes: vec![StyleAttribute::Italic],
+                ..TextStyle::default()
+            },
+        ),
+    ]);
+    assert_eq!(
+        resolve_in("selection.git.added", &styles),
+        styles["selection.git.added"]
+    );
+}
+
+#[test]
 fn headings_use_readable_upright_text() {
     let style = resolve("ui.heading");
     assert_eq!(style.foreground, Some(StyleColor::Indexed(15)));
@@ -103,6 +189,7 @@ fn popup_secondary_text_and_selected_matches_keep_their_backgrounds() {
     let popup = resolve("popup");
     let secondary = resolve("popup.secondary");
     let selection = resolve("selection");
+    assert_eq!(selection.foreground, Some(StyleColor::Indexed(15)));
     let selected_match = resolve("selection.match");
     assert_eq!(secondary.background, popup.background);
     assert_ne!(secondary.foreground, popup.foreground);
