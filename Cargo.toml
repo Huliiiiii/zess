@@ -43,6 +43,7 @@ helix-stdx = { git = "https://github.com/helix-editor/helix", rev = "ba40e547426
 steel-core = { path = "vendor/steel-core", default-features = false, features = ["std", "modules", "sandbox"] }
 zess-filter = { path = "crates/zess-filter" }
 zess-platform = { path = "crates/zess-platform" }
+zess-remote = { path = "crates/zess-remote" }
 zess-ui = { path = "crates/zess-ui" }
 zess-protocol = { path = "crates/zess-protocol" }
 zess-ipc = { path = "crates/zess-ipc" }
