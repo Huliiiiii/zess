@@ -5,4 +5,11 @@ mod path;
 mod transport;
 
 pub use path::{ServerId, SocketPath};
-pub use transport::{Listener, Stream};
+#[cfg(unix)]
+pub use transport::UnixLocalIpc;
+#[cfg(windows)]
+pub use transport::WindowsLocalIpc;
+pub use transport::{Listener, LocalIpc, NativeLocalIpc, Stream};
+
+#[cfg(windows)]
+mod windows;

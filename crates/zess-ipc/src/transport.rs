@@ -1,106 +1,67 @@
 use std::{
-    fs,
-    io::{self, Read, Write},
-    net::Shutdown,
-    os::unix::{
-        fs::{FileTypeExt, PermissionsExt},
-        net::{UnixListener, UnixStream},
-    },
-    time::Duration,
+    io,
+    path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 
-use crate::SocketPath;
+use crate::{ServerId, SocketPath};
 
-pub struct Stream(pub(crate) UnixStream);
+#[cfg(unix)]
+#[path = "unix/transport.rs"]
+mod backend;
+#[cfg(windows)]
+#[path = "windows/transport.rs"]
+mod backend;
 
-impl Stream {
-    pub fn connect(socket: &SocketPath) -> io::Result<Self> {
-        UnixStream::connect(socket.as_path()).map(Self)
+pub use backend::{Listener, Stream};
+
+pub trait LocalIpc: Send + Sync {
+    fn discover(&self) -> Result<Vec<SocketPath>> {
+        SocketPath::discover()
     }
 
-    pub fn try_clone(&self) -> io::Result<Self> {
-        self.0.try_clone().map(Self)
+    fn by_id(&self, id: ServerId) -> SocketPath {
+        SocketPath::by_id(id)
     }
 
-    pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
-        self.0.shutdown(how)
+    fn for_workspace(&self, workspace: &Path) -> Result<SocketPath> {
+        SocketPath::for_workspace(workspace)
     }
 
-    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.0.set_nonblocking(nonblocking)
+    fn is_present(&self, endpoint: &SocketPath) -> io::Result<bool> {
+        endpoint.is_present()
     }
 
-    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.0.set_read_timeout(timeout)
+    fn log_path(&self, endpoint: &SocketPath) -> PathBuf {
+        endpoint.log_path()
     }
 
-    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.0.set_write_timeout(timeout)
-    }
+    fn prepare(&self, endpoint: &SocketPath) -> Result<()>;
+    fn connect(&self, endpoint: &SocketPath) -> io::Result<Stream>;
+    fn bind(&self, endpoint: &SocketPath) -> Result<Listener>;
 }
 
-impl Read for Stream {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buffer)
-    }
-}
+#[cfg(unix)]
+pub struct UnixLocalIpc;
+#[cfg(windows)]
+pub struct WindowsLocalIpc;
 
-impl Write for Stream {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.0.write(buffer)
-    }
+#[cfg(unix)]
+pub use UnixLocalIpc as NativeLocalIpc;
+#[cfg(windows)]
+pub use WindowsLocalIpc as NativeLocalIpc;
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
-    }
-}
-
-pub struct Listener {
-    listener: UnixListener,
-    socket: SocketPath,
-}
-
-impl Listener {
-    pub fn bind(socket: &SocketPath) -> Result<Self> {
-        match fs::symlink_metadata(socket.as_path()) {
-            Ok(metadata) => {
-                if !metadata.file_type().is_socket() {
-                    bail!("socket path is occupied: {}", socket.display());
-                }
-                match Stream::connect(socket) {
-                    Ok(_) => bail!("a server is already listening at {}", socket.display()),
-                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                        fs::remove_file(socket.as_path())?;
-                    }
-                    Err(error) => return Err(error).context("check existing server socket"),
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("check server socket path"),
-        }
-        let listener = UnixListener::bind(socket.as_path())
-            .with_context(|| format!("bind {}", socket.display()))?;
-        let listener = Self {
-            listener,
-            socket: socket.clone(),
-        };
-        fs::set_permissions(socket.as_path(), fs::Permissions::from_mode(0o600))?;
-        Ok(listener)
+impl LocalIpc for NativeLocalIpc {
+    fn prepare(&self, endpoint: &SocketPath) -> Result<()> {
+        endpoint.prepare_parent()
     }
 
-    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.listener.set_nonblocking(nonblocking)
+    fn connect(&self, endpoint: &SocketPath) -> io::Result<Stream> {
+        Stream::connect(endpoint)
     }
 
-    pub fn accept(&self) -> io::Result<Stream> {
-        self.listener.accept().map(|(stream, _)| Stream(stream))
-    }
-}
-
-impl Drop for Listener {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.socket.as_path());
+    fn bind(&self, endpoint: &SocketPath) -> Result<Listener> {
+        Listener::bind(endpoint)
     }
 }
