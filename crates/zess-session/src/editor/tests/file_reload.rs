@@ -29,6 +29,11 @@ fn external_changes_refresh_clean_files_without_changing_the_view() {
     };
     assert!(!text.modified());
     assert_eq!(text.view(view).cursor(), (2, 0));
+    session.command("w").unwrap();
+    assert_eq!(
+        fs::read_to_string(path).unwrap(),
+        "new\nfirst\nunchanged\nlast\n"
+    );
 }
 
 #[test]
@@ -103,6 +108,89 @@ fn separate_file_layers_keep_local_edits_when_the_same_file_changes() {
     wait_until(&mut session, |session| {
         contents(session, copy) == "external\n"
     });
+}
+
+#[test]
+fn write_quit_retains_edits_when_the_file_has_changed_on_disk() {
+    let fixture = Fixture::new();
+    let path = fixture.write("note.txt", "original\n");
+    let mut session = fixture.session(&[path.clone()]);
+    let view = session.focus;
+    let buffer = session.views[&view].location.buffer;
+    session.execute_command("text.insert", Value::Null).unwrap();
+    session.input("!");
+    session.execute_command("text.escape", Value::Null).unwrap();
+
+    let modified_at = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, "external\n").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(modified_at)
+        .unwrap();
+
+    let error = session.command("wq").unwrap_err();
+    assert!(format!("{error:#}").contains("file changed on disk"));
+    assert_eq!(fs::read_to_string(path).unwrap(), "external\n");
+    assert_eq!(session.focus, view);
+    assert_eq!(session.views[&view].location.buffer, buffer);
+    assert_eq!(contents(&session, buffer), "!original\n");
+    assert!(session.modified());
+}
+
+#[test]
+fn saving_a_stale_file_layer_preserves_the_other_buffers_write() {
+    let fixture = Fixture::new();
+    let path = fixture.write("note.txt", "original\n");
+    let mut session = fixture.session(&[path.clone()]);
+    let parent = session.focus;
+    let buffer_id = session.views[&parent].location.buffer;
+    session.execute_command("text.insert", Value::Null).unwrap();
+    session.input("a");
+    session.execute_command("text.escape", Value::Null).unwrap();
+    session.open_file_layer(parent, "note.txt", 0).unwrap();
+    let layer_buffer = session.views[&session.focus].location.buffer;
+    assert_ne!(buffer_id, layer_buffer);
+    session.execute_command("text.insert", Value::Null).unwrap();
+    session.input("b");
+    session.execute_command("text.escape", Value::Null).unwrap();
+
+    let Buffer::Text(text) = &session.buffers[&buffer_id] else {
+        unreachable!()
+    };
+    let version = text.version();
+    assert_eq!(
+        session.begin_operation(
+            "save-original",
+            &zess_protocol::CommandAction::Save { buffer_id, version },
+        ),
+        Some(zess_protocol::CommandOutcome::Saved { buffer_id, version })
+    );
+
+    let error = session.command("w").unwrap_err();
+    assert!(format!("{error:#}").contains("file changed on disk"));
+    assert_eq!(fs::read_to_string(path).unwrap(), "aoriginal\n");
+    assert_eq!(contents(&session, layer_buffer), "boriginal\n");
+}
+
+#[test]
+fn writing_a_new_file_preserves_contents_created_after_opening() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("new.txt");
+    let mut session = fixture.session(&[path.clone()]);
+    session.execute_command("text.insert", Value::Null).unwrap();
+    session.input("!");
+    session.execute_command("text.escape", Value::Null).unwrap();
+    fs::write(&path, "external\n").unwrap();
+
+    let error = session.command("w").unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), "external\n");
+    assert!(session.modified());
 }
 
 #[test]

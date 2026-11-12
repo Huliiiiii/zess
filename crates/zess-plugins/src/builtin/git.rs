@@ -4,23 +4,26 @@ use std::{
     time::Instant,
 };
 use zess_filter::{Case, Filter};
+use zess_git::SelectedPath;
+use zess_git::ignore::{IgnoreDestination, IgnoreRequest};
 use zess_git::mutation::{FileMutation, FileMutationRequest};
 
 use anyhow::{Context, Result, bail};
-use serde_json::json;
+use serde_json::{Value, json};
 use zess_git::{
-    Commit, CommitFile, DiffRenderOptions, DiffSide, DiffSource, DiffTarget, FileStatus, GitEntry,
-    LineStats, StagingStatus,
+    Commit, CommitFile, CommitFileList, DiffRenderOptions, DiffSide, DiffSource, DiffTarget,
+    FileStatus, GitEntry, LineStats, PagerCommand, StagingStatus,
 };
 use zess_plugin::{
-    BufferId, HostRequest, Navigation, PluginInput, PluginOutput, PreviewContent, PreviewLayout,
-    PreviewPane, QueryWatch, SnapshotPresentation, ViewId,
+    BufferId, HostRequest, Navigation, OperationCompletion, OperationResult, PluginInput,
+    PluginOutput, PreviewContent, PreviewLayout, PreviewPane, QueryWatch, SnapshotPresentation,
+    ViewId,
 };
 use zess_services::{QueryRequest, QueryResult};
 use zess_ui::{ColumnAlignment, Display, DisplayRow};
 
 use super::{
-    Event, Services,
+    Event, Services, ViewOptions,
     browser::{self, Browser, PreviewQuery, Task},
     file_actions::{Source, Target, TargetKind, Yanks},
     schedule::QueryState,
@@ -51,7 +54,7 @@ enum GitTreeMode {
 }
 
 impl GitTreeMode {
-    fn parse(options: &serde_json::Value) -> Result<Self> {
+    fn parse(options: &Value) -> Result<Self> {
         match options.get("git-view") {
             None => Ok(Self::Tree),
             Some(value) => match value.as_str() {
@@ -63,15 +66,61 @@ impl GitTreeMode {
     }
 }
 
-fn column_alignment(options: &serde_json::Value) -> Result<ColumnAlignment> {
-    match options.get("stats-alignment") {
-        None => Ok(ColumnAlignment::All),
-        Some(value) => match value.as_str() {
-            Some("none") => Ok(ColumnAlignment::None),
-            Some("consecutive") => Ok(ColumnAlignment::Consecutive),
-            Some("all") => Ok(ColumnAlignment::All),
-            _ => bail!("stats-alignment must be \"none\", \"consecutive\", or \"all\""),
-        },
+struct GitOptions {
+    diff_pager: Option<PagerCommand>,
+    diff_file_header: bool,
+    tree_mode: GitTreeMode,
+    column_alignment: ColumnAlignment,
+}
+
+impl GitOptions {
+    fn parse(page: Page, options: &Value) -> Result<Self> {
+        let diff_pager = options
+            .get("diff-pager")
+            .map(|value| {
+                let pager: PagerCommand = serde_json::from_value(value.clone())
+                    .context("diff-pager must be an object with a program string and an args array of strings")?;
+                anyhow::ensure!(
+                    !pager.program.trim().is_empty(),
+                    "diff-pager program must not be empty"
+                );
+                anyhow::ensure!(
+                    !pager.program.contains('\0')
+                        && pager.args.iter().all(|arg| !arg.contains('\0')),
+                    "diff-pager program and arguments must not contain NUL"
+                );
+                Ok(pager)
+            })
+            .transpose()?;
+        let diff_file_header = options
+            .get("diff-file-header")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .context("diff-file-header must be a boolean")
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let tree_mode = if page == Page::History {
+            GitTreeMode::Tree
+        } else {
+            GitTreeMode::parse(options)?
+        };
+        let column_alignment = match options.get("stats-alignment") {
+            None => ColumnAlignment::All,
+            Some(value) => match value.as_str() {
+                Some("none") => ColumnAlignment::None,
+                Some("consecutive") => ColumnAlignment::Consecutive,
+                Some("all") => ColumnAlignment::All,
+                _ => bail!("stats-alignment must be \"none\", \"consecutive\", or \"all\""),
+            },
+        };
+        Ok(Self {
+            diff_pager,
+            diff_file_header,
+            tree_mode,
+            column_alignment,
+        })
     }
 }
 
@@ -207,6 +256,27 @@ struct GitTree {
 }
 
 impl GitTree {
+    fn selected_paths(&self, selection: &zess_plugin::ItemSelection) -> Vec<SelectedPath> {
+        let ids = if selection.selected.is_empty() {
+            selection.primary.as_slice()
+        } else {
+            selection.selected.as_slice()
+        };
+        ids.iter()
+            .filter_map(|id| self.nodes.get(id))
+            .map(|node| match &node.kind {
+                TreeNodeKind::Directory { path, .. } => SelectedPath {
+                    path: path.clone(),
+                    directory: true,
+                },
+                TreeNodeKind::File(file) => SelectedPath {
+                    path: file.path().into(),
+                    directory: false,
+                },
+            })
+            .collect()
+    }
+
     fn rebuild(
         &mut self,
         files: Vec<TreeFile>,
@@ -456,13 +526,20 @@ impl GitTree {
 
 #[derive(Default)]
 struct HistoryPreview {
+    column_alignment: ColumnAlignment,
+    published_alignment: ColumnAlignment,
     state: QueryState<String>,
     navigation: super::schedule::NavigationDebounce,
-    commit: Option<String>,
-    info: Vec<DisplayRow>,
-    summary: Vec<DisplayRow>,
+    published: Option<HistorySummary>,
     totals: ChangeTotals,
     source_loading: bool,
+}
+
+struct HistorySummary {
+    commit: String,
+    info: Vec<DisplayRow>,
+    summary: Vec<DisplayRow>,
+    files: Option<CommitFileList>,
 }
 
 impl HistoryPreview {
@@ -520,9 +597,7 @@ impl HistoryPreview {
             };
         }
         if selected.is_none() && !loading {
-            if self.commit.take().is_some() {
-                self.info.clear();
-                self.summary.clear();
+            if self.published.take().is_some() {
                 changed = true;
             }
             self.totals = ChangeTotals::from_files(std::iter::empty());
@@ -559,40 +634,52 @@ impl HistoryPreview {
             changed = true;
         }
         if let QueryState::Running { query, task } = &mut self.state {
-            let completed = match task.poll() {
-                Ok(Some(QueryResult::CommitFiles { files })) => {
-                    self.totals = ChangeTotals::from_files(
-                        files
-                            .iter()
-                            .map(|file| (file.path.as_str(), file.line_stats())),
-                    );
-                    let ChangeTotals::Ready(counts) = &self.totals else {
-                        unreachable!()
-                    };
+            let summary = match task.poll() {
+                Ok(Some(QueryResult::CommitFiles(list))) => {
+                    self.totals = ChangeTotals::from_commit(&list);
+                    let files = &list.files;
                     let label = if files.len() == 1 { "file" } else { "files" };
-                    let mut cells = vec![zess_ui::DisplayCell { spans: Vec::new() }];
-                    cells.extend(line_stats_cells(LineStats {
-                        additions: counts.additions,
-                        deletions: counts.deletions,
-                    }));
                     let mut summary = DisplayRow {
                         text: format!("{} {label}", files.len()),
-                        cells,
                         ..DisplayRow::default()
                     };
-                    if counts.unknown_files > 0 {
-                        let label = if counts.unknown_files == 1 {
-                            "file"
-                        } else {
-                            "files"
-                        };
+                    if let ChangeTotals::Ready(counts) = &self.totals {
                         summary
-                            .text
-                            .push_str(&format!(", {} binary {label}", counts.unknown_files));
+                            .cells
+                            .push(zess_ui::DisplayCell { spans: Vec::new() });
+                        summary.cells.extend(line_stats_cells(LineStats {
+                            additions: counts.additions,
+                            deletions: counts.deletions,
+                        }));
+                        if counts.unknown_files > 0 {
+                            let label = if counts.unknown_files == 1 {
+                                "file"
+                            } else {
+                                "files"
+                            };
+                            summary
+                                .text
+                                .push_str(&format!(", {} binary {label}", counts.unknown_files));
+                        }
                     }
-                    self.summary = vec![summary, DisplayRow::default()];
+                    let mut summary_rows = vec![summary];
+                    if let Some(warning) = &list.path_warning {
+                        summary_rows.push(DisplayRow {
+                            text: warning.clone(),
+                            style: "warning".into(),
+                            ..DisplayRow::default()
+                        });
+                    }
+                    if let Some(error) = &list.line_count_error {
+                        summary_rows.push(DisplayRow {
+                            text: error.clone(),
+                            style: "error".into(),
+                            ..DisplayRow::default()
+                        });
+                    }
+                    summary_rows.push(DisplayRow::default());
                     for file in files {
-                        let file = TreeFile::Committed(file);
+                        let file = TreeFile::Committed(file.clone());
                         let path = match file.original_path() {
                             Some(original) => format!("{original} → {}", file.path()),
                             None => file.path().to_owned(),
@@ -603,35 +690,40 @@ impl HistoryPreview {
                             None => vec![zess_ui::DisplayCell {
                                 spans: vec![zess_ui::Span {
                                     base_style: None,
-                                    text: "binary".into(),
+                                    text: if list.line_count_error.is_some() {
+                                        "count failed"
+                                    } else {
+                                        "binary"
+                                    }
+                                    .into(),
                                     style: "comment".into(),
                                 }],
                             }],
                         });
-                        self.summary.push(DisplayRow {
+                        summary_rows.push(DisplayRow {
+                            id: file.path().to_owned(),
                             text: path,
                             cells,
                             style: file.style().into(),
                             ..DisplayRow::default()
                         });
                     }
-                    true
+                    Some((summary_rows, Some(list)))
                 }
                 Ok(Some(_)) => bail!("commit summary query returned another kind of result"),
-                Ok(None) => false,
+                Ok(None) => None,
                 Err(error) => {
-                    self.summary = vec![DisplayRow {
+                    let summary = vec![DisplayRow {
                         text: format!("{error:#}"),
                         style: "error".into(),
                         ..DisplayRow::default()
                     }];
-                    self.totals = ChangeTotals::Failed;
-                    true
+                    self.totals = ChangeTotals::Unavailable;
+                    Some((summary, None))
                 }
             };
-            if completed {
-                self.commit = Some(query.clone());
-                self.info = commit
+            if let Some((summary, files)) = summary {
+                let info = commit
                     .map(|commit| {
                         let mut rows = vec![
                             DisplayRow {
@@ -656,6 +748,12 @@ impl HistoryPreview {
                         rows
                     })
                     .unwrap_or_default();
+                self.published = Some(HistorySummary {
+                    commit: query.clone(),
+                    info,
+                    summary,
+                    files,
+                });
                 self.state = QueryState::Idle {
                     query: Some(query.clone()),
                 };
@@ -663,12 +761,18 @@ impl HistoryPreview {
             }
         }
         if changed
+            || self.column_alignment != self.published_alignment
             || matches!(
                 event,
                 Event::Init | Event::ViewEntered | Event::ViewCloned | Event::Preview
             )
         {
-            let path = self.commit.clone().unwrap_or_default();
+            self.published_alignment = self.column_alignment;
+            let path = self
+                .published
+                .as_ref()
+                .map(|summary| summary.commit.clone())
+                .unwrap_or_default();
             output.requests.push(HostRequest::PreviewGroup {
                 panes: vec![
                     PreviewPane::View {
@@ -678,7 +782,11 @@ impl HistoryPreview {
                         key_scope: Some("git-history-preview".into()),
                         loading,
                         content: PreviewContent::Rows {
-                            rows: self.info.clone(),
+                            rows: self
+                                .published
+                                .as_ref()
+                                .map(|summary| summary.info.clone())
+                                .unwrap_or_default(),
                             column_alignment: ColumnAlignment::None,
                         },
                     },
@@ -688,9 +796,13 @@ impl HistoryPreview {
                         header: "Files changed".into(),
                         key_scope: Some("git-history-preview".into()),
                         loading: !matches!(self.state, QueryState::Idle { .. }) || loading,
-                        content: PreviewContent::Rows {
-                            rows: self.summary.clone(),
-                            column_alignment: column_alignment(&input.options)?,
+                        content: PreviewContent::Items {
+                            rows: self
+                                .published
+                                .as_ref()
+                                .map(|summary| summary.summary.clone())
+                                .unwrap_or_default(),
+                            column_alignment: self.column_alignment,
                         },
                     },
                 ],
@@ -714,6 +826,7 @@ impl HistoryPreview {
 }
 
 struct PendingSnapshot {
+    operation_id: Option<String>,
     commit: String,
     path: String,
     presentation: SnapshotPresentation,
@@ -726,7 +839,8 @@ enum ChangeTotals {
     Loading,
     Refreshing(Counts),
     Ready(Counts),
-    Failed,
+    Failed(String),
+    Unavailable,
 }
 
 struct Counts {
@@ -766,6 +880,17 @@ impl ChangeTotals {
         })
     }
 
+    fn from_commit(list: &CommitFileList) -> Self {
+        match &list.line_count_error {
+            Some(error) => Self::Failed(format!("git.commit-files: {error}")),
+            None => Self::from_files(
+                list.files
+                    .iter()
+                    .map(|file| (file.path.as_str(), file.line_stats())),
+            ),
+        }
+    }
+
     fn status(&self) -> serde_json::Value {
         match self {
             Self::Loading => json!({"git": {"state": "loading"}}),
@@ -784,7 +909,7 @@ impl ChangeTotals {
                 "deletions": deletions,
                 "unknown_files": unknown_files,
             }}),
-            Self::Failed => json!({"git": {"state": "failed"}}),
+            Self::Failed(_) | Self::Unavailable => json!({"git": {"state": "failed"}}),
         }
     }
 }
@@ -798,43 +923,260 @@ enum LoadResult {
     Failed(String),
 }
 
+fn complete_operation(
+    operation_id: Option<String>,
+    result: OperationResult,
+    output: &mut PluginOutput,
+) {
+    if let Some(operation_id) = operation_id {
+        output.completed_operations.push(OperationCompletion {
+            operation_id,
+            result,
+        });
+    }
+}
+
+fn operation_failed(operation_id: Option<String>, message: String, output: &mut PluginOutput) {
+    complete_operation(
+        operation_id,
+        OperationResult::Failed {
+            message: message.clone(),
+        },
+        output,
+    );
+    output.requests.push(HostRequest::Message { text: message });
+}
+
+enum MutationOperation {
+    Files,
+    Ignore(IgnoreDestination),
+}
+
+struct RunningMutation {
+    task: zess_services::FileMutationTask,
+    operation: MutationOperation,
+    operation_id: Option<String>,
+}
+
+impl RunningMutation {
+    fn poll(&mut self, services: &Services) -> Option<PluginOutput> {
+        let result = self.task.poll()?;
+        let operation_id = self.operation_id.take();
+        services.borrow_mut().invalidate_fs();
+        let mut output = PluginOutput {
+            changed: true,
+            ..PluginOutput::default()
+        };
+        match result {
+            Ok(()) => {
+                complete_operation(operation_id, OperationResult::Completed, &mut output);
+                if let MutationOperation::Ignore(destination) = &self.operation {
+                    let text = match destination {
+                        IgnoreDestination::Repository => "Ignore rules added to .gitignore",
+                        IgnoreDestination::Local => {
+                            "Ignore rules added to repository-local info/exclude"
+                        }
+                    };
+                    output
+                        .requests
+                        .push(HostRequest::Message { text: text.into() });
+                }
+            }
+            Err(message) => operation_failed(operation_id, message.clone(), &mut output),
+        }
+        Some(output)
+    }
+}
+
+enum MutationState {
+    Idle {
+        epoch: u64,
+    },
+    Writing {
+        epoch: u64,
+        mutation: RunningMutation,
+    },
+    RefreshingStatus {
+        epoch: u64,
+    },
+}
+
+impl Default for MutationState {
+    fn default() -> Self {
+        Self::Idle { epoch: 0 }
+    }
+}
+
+impl MutationState {
+    fn epoch(&self) -> u64 {
+        match self {
+            Self::Idle { epoch }
+            | Self::Writing { epoch, .. }
+            | Self::RefreshingStatus { epoch } => *epoch,
+        }
+    }
+
+    fn start(
+        &mut self,
+        task: Result<zess_services::FileMutationTask>,
+        operation: MutationOperation,
+        operation_id: Option<String>,
+        output: &mut PluginOutput,
+    ) {
+        let Self::Idle { epoch } = self else {
+            unreachable!("a mutation starts only from a settled status snapshot");
+        };
+        match task {
+            Ok(task) => {
+                *self = Self::Writing {
+                    epoch: *epoch,
+                    mutation: RunningMutation {
+                        task,
+                        operation,
+                        operation_id,
+                    },
+                }
+            }
+            Err(error) => operation_failed(operation_id, format!("{error:#}"), output),
+        }
+    }
+
+    fn poll(&mut self, services: &Services) -> Option<PluginOutput> {
+        let Self::Writing { epoch, mutation } = self else {
+            return None;
+        };
+        let output = mutation.poll(services)?;
+        *self = Self::RefreshingStatus { epoch: *epoch + 1 };
+        Some(output)
+    }
+
+    fn status_settled(&mut self) {
+        if let Self::RefreshingStatus { epoch } = self {
+            *self = Self::Idle { epoch: *epoch };
+        }
+    }
+}
+
 #[derive(Default)]
 struct Model {
     entries: Vec<GitEntry>,
     commits: Vec<Commit>,
     files: Vec<CommitFile>,
     commit: String,
+    path_warning: Option<String>,
     result: LoadResult,
     revision: u64,
+    load_generation: u64,
+    published_generation: u64,
     totals: ChangeTotals,
-    mutation: Option<zess_services::FileMutationTask>,
+    mutation: MutationState,
 }
 
 #[derive(Default)]
 struct GitView {
+    options: ViewOptions<GitOptions>,
     filter: Filter,
     tree: GitTree,
-    task: Option<Task>,
-    started_at_revision: u64,
+    load: Option<GitLoad>,
     browser: Browser,
     diffs: [Browser; 2],
     history: HistoryPreview,
     snapshot: Option<PendingSnapshot>,
     yanks: Yanks,
-    discard: Option<DiscardConfirmation>,
-    refresh_diffs: bool,
-    pending_open: Option<String>,
-    pending_mutation: Option<PendingFileMutation>,
+    mutation: MutationIntent,
+    diff_refresh: DiffRefresh,
 }
 
-struct PendingFileMutation {
-    operation: FileMutation,
-    paths: BTreeSet<String>,
+impl GitView {
+    fn cancel_operations(&mut self) -> Vec<OperationCompletion> {
+        let mut completions = self.yanks.cancel();
+        completions.extend(std::mem::take(&mut self.mutation).cancel());
+        if let Some(pending) = self.snapshot.take()
+            && let Some(operation_id) = pending.operation_id
+        {
+            completions.push(OperationCompletion {
+                operation_id,
+                result: OperationResult::Cancelled,
+            });
+        }
+        completions
+    }
+}
+
+struct GitLoad {
+    task: Task,
+    epoch: u64,
+    generation: u64,
+    published_revision: u64,
+}
+
+#[derive(Default)]
+enum MutationIntent {
+    #[default]
+    Idle,
+    WaitingForStatus {
+        pending: PendingMutation,
+        operation_id: Option<String>,
+    },
+    ConfirmingDiscard(DiscardConfirmation),
+}
+
+impl MutationIntent {
+    fn cancel(self) -> Option<OperationCompletion> {
+        let operation_id = match self {
+            Self::Idle => None,
+            Self::WaitingForStatus { operation_id, .. } => operation_id,
+            Self::ConfirmingDiscard(pending) => pending.operation_id,
+        }?;
+        Some(OperationCompletion {
+            operation_id,
+            result: OperationResult::Cancelled,
+        })
+    }
+}
+
+enum DiffRefresh {
+    Current { epoch: u64 },
+    WaitingForStatus { epoch: u64, focus: Option<String> },
+    LoadingDiffs { epoch: u64, focus: Option<String> },
+}
+
+impl Default for DiffRefresh {
+    fn default() -> Self {
+        Self::Current { epoch: 0 }
+    }
+}
+
+impl DiffRefresh {
+    fn epoch(&self) -> u64 {
+        match self {
+            Self::Current { epoch }
+            | Self::WaitingForStatus { epoch, .. }
+            | Self::LoadingDiffs { epoch, .. } => *epoch,
+        }
+    }
+}
+
+enum PendingMutation {
+    Files {
+        operation: FileMutation,
+        paths: Vec<SelectedPath>,
+    },
+    Ignore(IgnoreRequest),
 }
 
 struct DiscardConfirmation {
+    operation_id: Option<String>,
     purpose: String,
+    epoch: u64,
     request: FileMutationRequest,
+}
+
+fn cancelled_operation(operation_id: Option<String>) -> Option<OperationCompletion> {
+    operation_id.map(|operation_id| OperationCompletion {
+        operation_id,
+        result: OperationResult::Cancelled,
+    })
 }
 
 pub(super) struct Git {
@@ -842,6 +1184,9 @@ pub(super) struct Git {
     page: Page,
     models: BTreeMap<BufferId, Model>,
     views: BTreeMap<(BufferId, ViewId), GitView>,
+    detached_mutations: Vec<RunningMutation>,
+    completed_mutations: Vec<PluginOutput>,
+    operation_completions: Vec<OperationCompletion>,
 }
 
 impl Git {
@@ -851,51 +1196,51 @@ impl Git {
             page,
             models: BTreeMap::new(),
             views: BTreeMap::new(),
+            detached_mutations: Vec::new(),
+            completed_mutations: Vec::new(),
+            operation_completions: Vec::new(),
         }
     }
 }
 
+impl Git {
+    pub(super) fn poll_operations(&mut self) -> Vec<PluginOutput> {
+        let mut outputs = std::mem::take(&mut self.completed_mutations);
+        outputs.extend(
+            self.models
+                .values_mut()
+                .filter_map(|model| model.mutation.poll(&self.services)),
+        );
+        self.detached_mutations.retain_mut(|mutation| {
+            if let Some(output) = mutation.poll(&self.services) {
+                outputs.push(output);
+                false
+            } else {
+                true
+            }
+        });
+        outputs.extend(
+            self.operation_completions
+                .drain(..)
+                .map(|completion| PluginOutput {
+                    completed_operations: vec![completion],
+                    ..PluginOutput::default()
+                }),
+        );
+        for view in self.views.values_mut() {
+            outputs.extend(view.yanks.poll(&self.services));
+        }
+        outputs
+    }
+}
+
 impl BufferPlugin for Git {
+    fn validate_view_options(&self, options: &Value) -> Result<()> {
+        GitOptions::parse(self.page, options).map(|_| ())
+    }
+
     fn update(&mut self, input: &PluginInput) -> Result<PluginOutput> {
         let event = Event::parse(&input.event);
-        let diff_pager = input
-            .options
-            .get("diff-pager")
-            .map(|value| {
-                let pager: zess_git::PagerCommand = serde_json::from_value(value.clone())
-                    .context("diff-pager must be an object with a program string and an args array of strings")?;
-                anyhow::ensure!(
-                    !pager.program.trim().is_empty(),
-                    "diff-pager program must not be empty"
-                );
-                anyhow::ensure!(
-                    !pager.program.contains('\0')
-                        && pager.args.iter().all(|arg| !arg.contains('\0')),
-                    "diff-pager program and arguments must not contain NUL"
-                );
-                Ok(pager)
-            })
-            .transpose()?;
-        let diff_file_header = input
-            .options
-            .get("diff-file-header")
-            .map(|value| {
-                value
-                    .as_bool()
-                    .context("diff-file-header must be a boolean")
-            })
-            .transpose()?
-            .unwrap_or(false);
-        let mut tree_mode = if self.page == Page::History {
-            GitTreeMode::Tree
-        } else {
-            GitTreeMode::parse(&input.options)?
-        };
-        let column_alignment = if self.page == Page::History {
-            ColumnAlignment::All
-        } else {
-            column_alignment(&input.options)?
-        };
         let key = (input.buffer_id, input.view_id);
         if event == Event::ViewCloned
             && let Some(source) = input.argument["source_view"].as_u64()
@@ -915,45 +1260,54 @@ impl BufferPlugin for Git {
                 },
             );
         }
-        let model = self.models.entry(input.buffer_id).or_default();
         let view = self.views.entry(key).or_default();
+        let options = view.options.resolve(&input.options, |options| {
+            GitOptions::parse(self.page, options)
+        })?;
+        let mut tree_mode = options.tree_mode;
+        let model = self.models.entry(input.buffer_id).or_default();
         let mut output = PluginOutput::default();
-        let mutation_completed = if let Some(result) = model
-            .mutation
-            .as_mut()
-            .and_then(|task| task.poll())
-            .cloned()
-        {
-            model.mutation = None;
-            self.services.borrow_mut().invalidate_fs();
-            if let Err(text) = result {
-                output.requests.push(HostRequest::Message { text });
-            }
-            view.task = None;
-            view.refresh_diffs = true;
+        if let Some(completion) = model.mutation.poll(&self.services) {
+            // View requests can fail independently of the completed write.
+            self.completed_mutations.push(completion);
             output.changed = true;
-            true
-        } else {
-            false
-        };
-        if event == Event::LayerResult
-            && view
-                .discard
-                .as_ref()
-                .is_some_and(|pending| input.argument["purpose"] == pending.purpose)
-        {
-            let pending = view.discard.take().unwrap();
+        }
+        let epoch = model.mutation.epoch();
+        if view.diff_refresh.epoch() != epoch {
+            view.diff_refresh = DiffRefresh::WaitingForStatus { epoch, focus: None };
+        }
+        if event == Event::LayerResult && self.page == Page::Changes {
+            anyhow::ensure!(
+                matches!(&view.mutation, MutationIntent::ConfirmingDiscard(pending)
+                    if input.argument["purpose"] == pending.purpose),
+                "Git discard confirmation expired; run discard again"
+            );
+            let MutationIntent::ConfirmingDiscard(pending) = std::mem::take(&mut view.mutation)
+            else {
+                unreachable!();
+            };
             if input.argument["cancelled"] != true
                 && input.argument["text"]
                     .as_str()
                     .is_some_and(|text| text.trim() == "yes")
-                && model.mutation.is_none()
             {
-                model.mutation = Some(
-                    self.services
-                        .borrow()
-                        .start_file_mutation(pending.request)?,
-                );
+                if matches!(model.mutation, MutationState::Idle { .. }) && pending.epoch == epoch {
+                    model.mutation.start(
+                        self.services.borrow().start_file_mutation(pending.request),
+                        MutationOperation::Files,
+                        pending.operation_id,
+                        &mut output,
+                    );
+                } else {
+                    operation_failed(
+                        pending.operation_id,
+                        "Git status changed; retry the file operation".into(),
+                        &mut output,
+                    );
+                }
+            } else {
+                self.operation_completions
+                    .extend(cancelled_operation(pending.operation_id));
             }
         }
         if event == Event::ToggleView && self.page != Page::History {
@@ -969,12 +1323,27 @@ impl BufferPlugin for Git {
                 options: json!({"git-view": mode}),
             });
         }
+        let mut received_files = false;
         let request = match self.page {
             Page::Changes => QueryRequest::Status {},
             Page::History => QueryRequest::Log {},
             Page::CommitFiles => {
                 if let Some(commit) = input.argument["commit"].as_str() {
                     model.commit = commit.into();
+                    if matches!(event, Event::Init | Event::ViewEntered)
+                        && input
+                            .argument
+                            .get("files")
+                            .is_some_and(|files| !files.is_null())
+                    {
+                        let list = serde_json::from_value(input.argument.clone())?;
+                        model.totals = ChangeTotals::from_commit(&list);
+                        model.files = list.files;
+                        model.path_warning = list.path_warning;
+                        received_files = true;
+                        model.result = LoadResult::Ready;
+                        model.revision += 1;
+                    }
                 }
                 QueryRequest::CommitFiles {
                     commit: model.commit.clone(),
@@ -988,94 +1357,129 @@ impl BufferPlugin for Git {
             )?;
         }
         if event == Event::ViewLeaving {
-            view.pending_mutation = None;
-            view.pending_open = None;
-            view.discard = None;
-            view.task = None;
+            self.operation_completions.extend(view.cancel_operations());
+            view.diff_refresh = match std::mem::take(&mut view.diff_refresh) {
+                DiffRefresh::Current { epoch } => DiffRefresh::Current { epoch },
+                DiffRefresh::WaitingForStatus { epoch, .. }
+                | DiffRefresh::LoadingDiffs { epoch, .. } => {
+                    DiffRefresh::WaitingForStatus { epoch, focus: None }
+                }
+            };
+            view.load = None;
             view.browser.leave();
-            view.snapshot = None;
             for browser in &mut view.diffs {
                 browser.leave();
             }
         } else {
-            if mutation_completed
-                || matches!(
-                    event,
-                    Event::Refresh | Event::Init | Event::ViewEntered | Event::ViewCloned
-                )
-                || (view.task.is_none()
-                    && browser::changed(event, input, request.operation(), None))
-                || (matches!(model.result, LoadResult::Unloaded) && view.task.is_none())
+            if view.load.as_ref().is_some_and(|load| {
+                load.epoch != epoch
+                    || load.generation < model.published_generation
+                    || (load.generation == model.published_generation
+                        && load.published_revision != model.revision)
+            }) {
+                view.load = None;
+            }
+            if matches!(
+                event,
+                Event::Refresh | Event::Init | Event::ViewEntered | Event::ViewCloned
+            ) || (view.load.is_none()
+                && browser::changed(event, input, request.operation(), None))
+                || (matches!(model.result, LoadResult::Unloaded) && view.load.is_none())
+                || (matches!(model.mutation, MutationState::RefreshingStatus { .. })
+                    && view.load.is_none())
             {
+                model.load_generation += 1;
                 match Task::start(&self.services, request.clone()) {
                     Ok(task) => {
-                        view.task = Some(task);
-                        view.started_at_revision = model.revision;
-                        model.totals.start_loading();
+                        view.load = Some(GitLoad {
+                            task,
+                            epoch,
+                            generation: model.load_generation,
+                            published_revision: model.revision,
+                        });
+                        if !received_files {
+                            model.totals.start_loading();
+                        }
                     }
                     Err(error) => {
-                        view.task = None;
+                        view.load = None;
+                        model.published_generation = model.load_generation;
                         model.result =
                             LoadResult::Failed(format!("{}: {error:#}", request.operation()));
-                        model.totals = ChangeTotals::Failed;
+                        model.totals = ChangeTotals::Unavailable;
+                        model.mutation.status_settled();
                         model.revision += 1;
                         output.changed = true;
                     }
                 }
             }
-            if let Some(task) = &mut view.task {
-                let result = task.poll();
+            if let Some(load) = &mut view.load {
+                let result = load.task.poll();
                 match result {
                     Ok(Some(result)) => {
-                        match (self.page, result) {
-                            (Page::Changes, QueryResult::Status { entries }) => {
-                                model.entries = entries
+                        model.totals = match (self.page, result) {
+                            (
+                                Page::Changes,
+                                QueryResult::Status {
+                                    entries,
+                                    path_warning,
+                                    line_count_error,
+                                },
+                            ) => {
+                                model.entries = entries;
+                                model.path_warning = path_warning;
+                                match line_count_error {
+                                    Some(error) => ChangeTotals::Failed(format!(
+                                        "{}: {error}",
+                                        request.operation()
+                                    )),
+                                    None => ChangeTotals::from_files(
+                                        model
+                                            .entries
+                                            .iter()
+                                            .map(|entry| (entry.path.as_str(), entry.line_stats)),
+                                    ),
+                                }
                             }
                             (Page::History, QueryResult::Log { commits }) => {
-                                model.commits = commits
+                                model.commits = commits;
+                                ChangeTotals::default()
                             }
-                            (Page::CommitFiles, QueryResult::CommitFiles { files }) => {
-                                model.files = files
+                            (Page::CommitFiles, QueryResult::CommitFiles(list)) => {
+                                let totals = ChangeTotals::from_commit(&list);
+                                model.files = list.files;
+                                model.path_warning = list.path_warning;
+                                totals
                             }
                             _ => bail!("Git query returned another kind of result"),
-                        }
-                        model.totals = match self.page {
-                            Page::Changes => ChangeTotals::from_files(
-                                model
-                                    .entries
-                                    .iter()
-                                    .map(|entry| (entry.path.as_str(), entry.line_stats)),
-                            ),
-                            Page::CommitFiles => ChangeTotals::from_files(
-                                model
-                                    .files
-                                    .iter()
-                                    .map(|file| (file.path.as_str(), file.line_stats())),
-                            ),
-                            Page::History => ChangeTotals::default(),
                         };
-                        view.task = None;
+                        model.published_generation = load.generation;
+                        view.load = None;
                         model.result = LoadResult::Ready;
+                        model.mutation.status_settled();
                         model.revision += 1;
                         output.changed = true;
                     }
                     Ok(None) => {
                         if self.page == Page::Changes
-                            && let Some(entries) = task.status_progress()?
-                            && (!matches!(model.result, LoadResult::Ready)
-                                || model.revision == view.started_at_revision)
+                            && let Some(progress) = load.task.status_progress()?
                         {
-                            model.entries = entries;
+                            model.entries = progress.entries;
+                            model.path_warning = progress.path_warning;
+                            model.published_generation = load.generation;
                             model.result = LoadResult::Partial;
                             model.revision += 1;
+                            load.published_revision = model.revision;
                             output.changed = true;
                         }
                     }
                     Err(error) => {
-                        view.task = None;
+                        model.published_generation = load.generation;
+                        view.load = None;
                         model.result =
                             LoadResult::Failed(format!("{}: {error:#}", request.operation()));
-                        model.totals = ChangeTotals::Failed;
+                        model.totals = ChangeTotals::Unavailable;
+                        model.mutation.status_settled();
                         model.revision += 1;
                         output.changed = true;
                     }
@@ -1123,10 +1527,12 @@ impl BufferPlugin for Git {
                     mode,
                     model.revision,
                     &view.filter,
-                    match model.result {
-                        LoadResult::Ready => LineCountState::Ready,
-                        LoadResult::Failed(_) => LineCountState::Failed,
-                        LoadResult::Partial | LoadResult::Unloaded => LineCountState::Loading,
+                    match (&model.result, &model.totals) {
+                        (_, ChangeTotals::Failed(_)) | (LoadResult::Failed(_), _) => {
+                            LineCountState::Failed
+                        }
+                        (LoadResult::Ready, _) => LineCountState::Ready,
+                        (LoadResult::Partial | LoadResult::Unloaded, _) => LineCountState::Loading,
                     },
                 );
             }
@@ -1139,22 +1545,25 @@ impl BufferPlugin for Git {
             Page::Changes | Page::History => String::new(),
             Page::CommitFiles => format!("Commit › {}", &model.commit[..8.min(model.commit.len())]),
         };
-        let header = if view.filter.is_empty() || input.mode == "filter" {
+        let mut header = if view.filter.is_empty() || input.mode == "filter" {
             header
         } else {
             format!("{header}  /{}", view.filter.source())
         };
-        let header = if let LoadResult::Failed(error) = &model.result {
-            if header.is_empty() {
-                error.clone()
-            } else {
-                format!("{header}  {error}")
-            }
-        } else {
-            header
+        let error = match (&model.result, &model.totals) {
+            (LoadResult::Failed(error), _) | (_, ChangeTotals::Failed(error)) => Some(error),
+            _ => None,
         };
+        for diagnostic in [error, model.path_warning.as_ref()].into_iter().flatten() {
+            if header.is_empty() {
+                header = diagnostic.clone();
+            } else {
+                header.push_str("  ");
+                header.push_str(diagnostic);
+            }
+        }
         let mut status = model.totals.status();
-        if let LoadResult::Failed(error) = &model.result {
+        if let Some(error) = error {
             status["error"] = error.clone().into();
         }
         output.display = Some(Display {
@@ -1180,9 +1589,13 @@ impl BufferPlugin for Git {
             header,
             rows,
             rows_revision: (self.page != Page::History).then_some(view.tree.rows_revision),
-            column_alignment,
+            column_alignment: if self.page == Page::History {
+                ColumnAlignment::All
+            } else {
+                options.column_alignment
+            },
             status,
-            loading: view.task.is_some() && !matches!(model.result, LoadResult::Partial),
+            loading: view.load.is_some() && !matches!(model.result, LoadResult::Partial),
             ..Display::default()
         });
         output.watches = Some(if event == Event::ViewLeaving {
@@ -1210,118 +1623,181 @@ impl BufferPlugin for Git {
                 }
             }
         }
-        if self.page == Page::Changes
-            && matches!(event, Event::Stage | Event::Unstage | Event::Discard)
-        {
-            if model.mutation.is_some() || view.pending_mutation.is_some() {
-                output.requests.push(HostRequest::Message {
-                    text: "Git file operation is running".into(),
-                });
-            } else {
-                let operation = match event {
-                    Event::Stage => FileMutation::Stage,
-                    Event::Unstage => FileMutation::Unstage,
-                    Event::Discard => FileMutation::Discard,
-                    _ => unreachable!(),
-                };
-                let ids = if input.selection.selected.is_empty() {
-                    input.selection.primary.iter().collect::<Vec<_>>()
-                } else {
-                    input.selection.selected.iter().collect()
-                };
-                let mut paths = BTreeSet::new();
-                for id in ids {
-                    if view.tree.nodes.contains_key(id) {
-                        paths.extend(
-                            view.tree
-                                .file_targets(id, None)
-                                .into_iter()
-                                .map(|target| target.path),
+        if self.page == Page::Changes {
+            let pending = match event {
+                Event::Ignore | Event::Exclude => Some(PendingMutation::Ignore(IgnoreRequest {
+                    destination: match event {
+                        Event::Ignore => IgnoreDestination::Repository,
+                        Event::Exclude => IgnoreDestination::Local,
+                        _ => unreachable!(),
+                    },
+                    paths: view.tree.selected_paths(&input.selection),
+                })),
+                Event::Stage | Event::Unstage | Event::Discard => Some(PendingMutation::Files {
+                    operation: match event {
+                        Event::Stage => FileMutation::Stage,
+                        Event::Unstage => FileMutation::Unstage,
+                        Event::Discard => FileMutation::Discard,
+                        _ => unreachable!(),
+                    },
+                    paths: view.tree.selected_paths(&input.selection),
+                }),
+                _ => None,
+            };
+            if let Some(pending) = pending {
+                match (&model.mutation, &view.mutation) {
+                    (MutationState::Writing { .. }, _)
+                    | (
+                        _,
+                        MutationIntent::WaitingForStatus { .. }
+                        | MutationIntent::ConfirmingDiscard(_),
+                    ) => {
+                        let text = match &pending {
+                            PendingMutation::Ignore(_) => {
+                                "Wait for the current Git file operation to finish"
+                            }
+                            PendingMutation::Files { .. } => "Git file operation is running",
+                        };
+                        operation_failed(
+                            input.context.operation_id.clone(),
+                            text.into(),
+                            &mut output,
                         );
                     }
+                    _ => {
+                        if let Some(operation_id) = &input.context.operation_id {
+                            output.pending_operations.push(operation_id.clone());
+                        }
+                        view.mutation = MutationIntent::WaitingForStatus {
+                            pending,
+                            operation_id: input.context.operation_id.clone(),
+                        };
+                    }
                 }
-                view.pending_mutation = Some(PendingFileMutation { operation, paths });
             }
         }
-        if view.task.is_none()
-            && let Some(pending) = view.pending_mutation.take()
+        if view.load.is_none()
+            && matches!(model.mutation, MutationState::Idle { .. })
+            && matches!(view.mutation, MutationIntent::WaitingForStatus { .. })
         {
-            if !matches!(model.result, LoadResult::Ready) {
-                output.requests.push(HostRequest::Message {
-                    text: "Cannot change files while Git status is unavailable".into(),
-                });
-            } else {
-                let entries = model
-                    .entries
-                    .iter()
-                    .filter(|entry| pending.paths.contains(&entry.path))
-                    .collect::<Vec<_>>();
-                if entries
-                    .iter()
-                    .any(|entry| entry.staging_status() == StagingStatus::Conflict)
-                {
-                    output.requests.push(HostRequest::Message {
-                        text: "Cannot change a selection containing unresolved conflicts".into(),
-                    });
-                } else {
-                    let entries = entries
-                        .into_iter()
-                        .filter(|entry| match pending.operation {
-                            FileMutation::Stage | FileMutation::Discard => {
-                                entry.untracked || entry.worktree != " "
-                            }
-                            FileMutation::Unstage => !entry.untracked && entry.index != " ",
+            let MutationIntent::WaitingForStatus {
+                pending,
+                operation_id,
+            } = std::mem::take(&mut view.mutation)
+            else {
+                unreachable!();
+            };
+            match (&model.result, pending) {
+                (LoadResult::Ready, PendingMutation::Ignore(request)) => {
+                    let operation = MutationOperation::Ignore(request.destination);
+                    model.mutation.start(
+                        self.services.borrow().start_ignore(request),
+                        operation,
+                        operation_id,
+                        &mut output,
+                    );
+                }
+                (LoadResult::Ready, PendingMutation::Files { operation, paths }) => {
+                    let entries = model
+                        .entries
+                        .iter()
+                        .filter(|entry| {
+                            paths.iter().any(|path| {
+                                if path.directory {
+                                    entry
+                                        .path
+                                        .strip_prefix(&path.path)
+                                        .is_some_and(|suffix| suffix.starts_with('/'))
+                                } else {
+                                    entry.path == path.path
+                                }
+                            })
                         })
-                        .cloned()
                         .collect::<Vec<_>>();
-                    if entries.is_empty() {
-                        output.requests.push(HostRequest::Message {
-                            text: "No changes on the selected side".into(),
-                        });
+                    if entries
+                        .iter()
+                        .any(|entry| entry.staging_status() == StagingStatus::Conflict)
+                    {
+                        operation_failed(
+                            operation_id,
+                            "Cannot change a selection containing unresolved conflicts".into(),
+                            &mut output,
+                        );
                     } else {
-                        let request = FileMutationRequest {
-                            operation: pending.operation,
-                            entries,
-                        };
-                        if pending.operation == FileMutation::Discard {
-                            let tracked = request
-                                .entries
-                                .iter()
-                                .filter(|entry| !entry.untracked)
-                                .map(|entry| format!("{:?}", entry.path))
-                                .collect::<Vec<_>>();
-                            let untracked = request
-                                .entries
-                                .iter()
-                                .filter(|entry| entry.untracked)
-                                .map(|entry| format!("{:?}", entry.path))
-                                .collect::<Vec<_>>();
-                            let mut actions = Vec::new();
-                            if !tracked.is_empty() {
-                                actions.push(format!(
-                                    "Restore working tree from index: {}",
-                                    tracked.join(", ")
-                                ));
-                            }
-                            if !untracked.is_empty() {
-                                actions.push(format!(
-                                    "Delete untracked files: {}",
-                                    untracked.join(", ")
-                                ));
-                            }
-                            let purpose = format!("{}. Type yes to confirm", actions.join("; "));
-                            output.requests.push(HostRequest::MiniBuffer {
-                                purpose: purpose.clone(),
-                                text: String::new(),
-                                key_scope: None,
-                            });
-                            view.discard = Some(DiscardConfirmation { purpose, request });
+                        let entries = entries
+                            .into_iter()
+                            .filter(|entry| match operation {
+                                FileMutation::Stage | FileMutation::Discard => {
+                                    entry.untracked || entry.worktree != " "
+                                }
+                                FileMutation::Unstage => !entry.untracked && entry.index != " ",
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if entries.is_empty() {
+                            operation_failed(
+                                operation_id,
+                                "No changes on the selected side".into(),
+                                &mut output,
+                            );
                         } else {
-                            model.mutation =
-                                Some(self.services.borrow().start_file_mutation(request)?);
+                            let request = FileMutationRequest { operation, entries };
+                            if operation == FileMutation::Discard {
+                                let tracked = request
+                                    .entries
+                                    .iter()
+                                    .filter(|entry| !entry.untracked)
+                                    .map(|entry| format!("{:?}", entry.path))
+                                    .collect::<Vec<_>>();
+                                let untracked = request
+                                    .entries
+                                    .iter()
+                                    .filter(|entry| entry.untracked)
+                                    .map(|entry| format!("{:?}", entry.path))
+                                    .collect::<Vec<_>>();
+                                let mut actions = Vec::new();
+                                if !tracked.is_empty() {
+                                    actions.push(format!(
+                                        "Restore working tree from index: {}",
+                                        tracked.join(", ")
+                                    ));
+                                }
+                                if !untracked.is_empty() {
+                                    actions.push(format!(
+                                        "Delete untracked files: {}",
+                                        untracked.join(", ")
+                                    ));
+                                }
+                                let purpose =
+                                    format!("{}. Type yes to confirm", actions.join("; "));
+                                output.requests.push(HostRequest::MiniBuffer {
+                                    purpose: purpose.clone(),
+                                    text: String::new(),
+                                    key_scope: None,
+                                });
+                                view.mutation =
+                                    MutationIntent::ConfirmingDiscard(DiscardConfirmation {
+                                        operation_id,
+                                        purpose,
+                                        epoch,
+                                        request,
+                                    });
+                            } else {
+                                model.mutation.start(
+                                    self.services.borrow().start_file_mutation(request),
+                                    MutationOperation::Files,
+                                    operation_id,
+                                    &mut output,
+                                );
+                            }
                         }
                     }
                 }
+                (_, _) => operation_failed(
+                    operation_id,
+                    "Cannot change files while Git status is unavailable".into(),
+                    &mut output,
+                ),
             }
         }
         let primary_id = output
@@ -1372,24 +1848,37 @@ impl BufferPlugin for Git {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            view.yanks.queue(&self.services, event, input, targets)?;
+            view.yanks
+                .queue(&self.services, event, input, targets, &mut output)?;
         }
         let primary = primary_id.as_deref();
         let selected = primary
             .and_then(|id| view.tree.nodes.get(id))
             .map(|node| &node.kind);
-        if view.refresh_diffs && matches!(event, Event::Open | Event::Preview) {
-            view.pending_open = primary.map(str::to_owned);
+        match &mut view.diff_refresh {
+            DiffRefresh::WaitingForStatus { focus, .. }
+            | DiffRefresh::LoadingDiffs { focus, .. } => {
+                if matches!(event, Event::Open | Event::Preview) {
+                    *focus = primary.map(str::to_owned);
+                }
+                if focus.as_deref() != primary || event == Event::ViewLeaving {
+                    *focus = None;
+                }
+            }
+            DiffRefresh::Current { .. } => {}
         }
-        if view.pending_open.as_deref() != primary || event == Event::ViewLeaving {
-            view.pending_open = None;
-        }
-        let refresh_diffs = view.refresh_diffs
+        let refresh_diffs = matches!(view.diff_refresh, DiffRefresh::WaitingForStatus { .. })
             && event != Event::ViewLeaving
-            && view.task.is_none()
+            && view.load.is_none()
+            && matches!(model.mutation, MutationState::Idle { .. })
             && matches!(model.result, LoadResult::Ready);
         if refresh_diffs {
-            view.refresh_diffs = false;
+            let DiffRefresh::WaitingForStatus { epoch, focus } =
+                std::mem::take(&mut view.diff_refresh)
+            else {
+                unreachable!();
+            };
+            view.diff_refresh = DiffRefresh::LoadingDiffs { epoch, focus };
         }
         let preview_event = if event == Event::Open && selected.is_some() {
             Event::Preview
@@ -1402,6 +1891,7 @@ impl BufferPlugin for Git {
                     .commits
                     .iter()
                     .find(|commit| Some(commit.oid.as_str()) == primary);
+                view.history.column_alignment = options.column_alignment;
                 view.history
                     .update(&self.services, event, input, commit, &mut output)?;
                 if !matches!(model.result, LoadResult::Failed(_)) {
@@ -1410,10 +1900,21 @@ impl BufferPlugin for Git {
                 if matches!(event, Event::Open | Event::Edit)
                     && let Some(oid) = primary
                 {
+                    let files = view
+                        .history
+                        .published
+                        .as_ref()
+                        .filter(|summary| summary.commit == oid)
+                        .and_then(|summary| summary.files.as_ref());
                     output.requests.push(HostRequest::Navigate {
                         navigation: Navigation::Push {
                             kind: "git-commit-files".into(),
-                            argument: json!({"commit":oid}),
+                            argument: json!({
+                                "commit": oid,
+                                "files": files.map(|list| &list.files),
+                                "path_warning": files.and_then(|list| list.path_warning.as_ref()),
+                                "line_count_error": files.and_then(|list| list.line_count_error.as_ref()),
+                            }),
                         },
                     });
                 }
@@ -1449,7 +1950,7 @@ impl BufferPlugin for Git {
                     .into_iter();
                 let mut panes = Vec::new();
                 for (browser, (side, id, header, files)) in view.diffs.iter_mut().zip(sides) {
-                    if view.refresh_diffs {
+                    if matches!(view.diff_refresh, DiffRefresh::WaitingForStatus { .. }) {
                         browser.defer(preview_event, input)?;
                         continue;
                     }
@@ -1459,12 +1960,12 @@ impl BufferPlugin for Git {
                             source: DiffSource::Changes { side },
                             files,
                             render: DiffRenderOptions {
-                                file_header: diff_file_header,
+                                file_header: options.diff_file_header,
                                 width: areas
                                     .next()
                                     .map(|area| area.width)
                                     .filter(|width| *width > 0),
-                                pager: diff_pager.clone(),
+                                pager: options.diff_pager.clone(),
                             },
                         },
                         path: path.into(),
@@ -1498,8 +1999,13 @@ impl BufferPlugin for Git {
                     for browser in &mut view.diffs {
                         focus |= browser.take_focus_request();
                     }
-                    if !view.refresh_diffs {
-                        focus |= view.pending_open.take().is_some();
+                    if let DiffRefresh::LoadingDiffs {
+                        epoch,
+                        focus: requested_focus,
+                    } = &mut view.diff_refresh
+                    {
+                        focus |= requested_focus.take().is_some();
+                        view.diff_refresh = DiffRefresh::Current { epoch: *epoch };
                     }
                     output.requests.push(HostRequest::PreviewGroup {
                         panes,
@@ -1535,12 +2041,12 @@ impl BufferPlugin for Git {
                         },
                         files: view.tree.file_targets(primary.unwrap(), None),
                         render: DiffRenderOptions {
-                            file_header: diff_file_header,
+                            file_header: options.diff_file_header,
                             width: input
                                 .preview_area
                                 .map(|area| area.width)
                                 .filter(|width| *width > 0),
-                            pager: diff_pager,
+                            pager: options.diff_pager.clone(),
                         },
                     },
                     path: path.into(),
@@ -1551,13 +2057,18 @@ impl BufferPlugin for Git {
                     output.requests.push(HostRequest::PreviewPending);
                 }
             }
-            (Page::Changes, None) if view.refresh_diffs => {
+            (Page::Changes, None)
+                if matches!(view.diff_refresh, DiffRefresh::WaitingForStatus { .. }) =>
+            {
                 for browser in &mut view.diffs {
                     browser.defer(preview_event, input)?;
                 }
                 output.requests.push(HostRequest::PreviewPending);
             }
             (Page::Changes | Page::CommitFiles, None) => {
+                if matches!(view.diff_refresh, DiffRefresh::LoadingDiffs { .. }) {
+                    view.diff_refresh = DiffRefresh::Current { epoch };
+                }
                 for browser in &mut view.diffs {
                     browser.idle(&self.services, event, input, &mut output)?;
                 }
@@ -1593,33 +2104,62 @@ impl BufferPlugin for Git {
             let stale = view.snapshot.as_ref().is_some_and(|pending| {
                 Some(pending.path.as_str()) != path || pending.commit != model.commit
             });
-            if stale || event == Event::ViewLeaving {
-                view.snapshot = None;
+            if (stale || event == Event::ViewLeaving)
+                && let Some(pending) = view.snapshot.take()
+            {
+                self.operation_completions
+                    .extend(cancelled_operation(pending.operation_id));
             }
             if matches!(event, Event::Edit | Event::EditLayer)
                 && let Some(path) = path
             {
+                if let Some(pending) = view.snapshot.take() {
+                    self.operation_completions
+                        .extend(cancelled_operation(pending.operation_id));
+                }
                 let task = Task::start(
                     &self.services,
                     QueryRequest::Blob {
                         commit: model.commit.clone(),
                         path: path.into(),
                     },
-                )?;
-                view.snapshot = Some(PendingSnapshot {
-                    commit: model.commit.clone(),
-                    path: path.into(),
-                    task,
-                    presentation: if event == Event::EditLayer {
-                        SnapshotPresentation::Fullscreen
-                    } else {
-                        SnapshotPresentation::Editor
-                    },
-                });
+                );
+                let task = match task {
+                    Ok(task) => Some(task),
+                    Err(error) => {
+                        operation_failed(
+                            input.context.operation_id.clone(),
+                            format!("{error:#}"),
+                            &mut output,
+                        );
+                        None
+                    }
+                };
+                if let Some(task) = task {
+                    if let Some(operation_id) = &input.context.operation_id {
+                        output.pending_operations.push(operation_id.clone());
+                    }
+                    view.snapshot = Some(PendingSnapshot {
+                        operation_id: input.context.operation_id.clone(),
+                        commit: model.commit.clone(),
+                        path: path.into(),
+                        task,
+                        presentation: if event == Event::EditLayer {
+                            SnapshotPresentation::Fullscreen
+                        } else {
+                            SnapshotPresentation::Editor
+                        },
+                    });
+                }
             }
             if let Some(pending) = &mut view.snapshot {
                 match pending.task.poll() {
                     Ok(Some(QueryResult::Snapshot { snapshot })) => {
+                        complete_operation(
+                            pending.operation_id.take(),
+                            OperationResult::Completed,
+                            &mut output,
+                        );
                         output.requests.push(HostRequest::OpenSnapshot {
                             snapshot,
                             presentation: pending.presentation,
@@ -1627,17 +2167,24 @@ impl BufferPlugin for Git {
                         view.snapshot = None;
                     }
                     Ok(Some(QueryResult::Unsupported { message })) => {
-                        output.requests.push(HostRequest::Message { text: message });
+                        operation_failed(pending.operation_id.take(), message, &mut output);
                         view.snapshot = None;
                     }
                     Ok(Some(_)) => {
-                        bail!("historical file query returned another kind of result")
+                        operation_failed(
+                            pending.operation_id.take(),
+                            "historical file query returned another kind of result".into(),
+                            &mut output,
+                        );
+                        view.snapshot = None;
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        output.requests.push(HostRequest::Message {
-                            text: format!("{error:#}"),
-                        });
+                        operation_failed(
+                            pending.operation_id.take(),
+                            format!("{error:#}"),
+                            &mut output,
+                        );
                         view.snapshot = None;
                     }
                 }
@@ -1687,26 +2234,50 @@ impl BufferPlugin for Git {
             });
         }
         view.yanks.advance(&self.services, event, &mut output);
-        if model.mutation.is_some() {
+        if matches!(model.mutation, MutationState::Writing { .. }) {
             let display = output.display.as_mut().unwrap();
             display.loading = true;
             display.header = "Git file operation is running…".into();
         }
-        if view.task.is_some() || model.mutation.is_some() {
+        if view.load.is_some() || matches!(model.mutation, MutationState::Writing { .. }) {
             output.requests.push(HostRequest::Schedule { after_ms: 50 });
         }
         Ok(output)
     }
 
+    fn poll_operations(&mut self) -> Vec<PluginOutput> {
+        Git::poll_operations(self)
+    }
+
     fn remove_buffer_view(&mut self, buffer: BufferId, view: ViewId) {
-        self.views.remove(&(buffer, view));
+        if let Some(mut view) = self.views.remove(&(buffer, view)) {
+            self.operation_completions.extend(view.cancel_operations());
+        }
     }
 
     fn remove_view(&mut self, id: ViewId) {
-        self.views.retain(|(_, view), _| *view != id);
+        self.views.retain(|(_, view_id), view| {
+            if *view_id == id {
+                self.operation_completions.extend(view.cancel_operations());
+                false
+            } else {
+                true
+            }
+        });
     }
     fn remove_buffer(&mut self, id: BufferId) {
-        self.models.remove(&id);
-        self.views.retain(|(buffer, _), _| *buffer != id);
+        if let Some(model) = self.models.remove(&id)
+            && let MutationState::Writing { mutation, .. } = model.mutation
+        {
+            self.detached_mutations.push(mutation);
+        }
+        self.views.retain(|(buffer, _), view| {
+            if *buffer == id {
+                self.operation_completions.extend(view.cancel_operations());
+                false
+            } else {
+                true
+            }
+        });
     }
 }

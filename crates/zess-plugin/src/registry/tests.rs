@@ -1,13 +1,65 @@
 use super::*;
 
 #[test]
+fn status_formats_report_unknown_names_fields_and_wrong_types() {
+    let registry = Registry::<()>::default();
+    for (formats, expected) in [
+        (serde_json::json!(false), "status-formats must be an object"),
+        (
+            serde_json::json!({"unknown": ""}),
+            "unknown status format unknown",
+        ),
+        (
+            serde_json::json!({"pending": 2}),
+            "status format pending must be a string",
+        ),
+        (
+            serde_json::json!({"pending": "{items}"}),
+            "unknown field {items} in status format pending",
+        ),
+        (
+            serde_json::json!({"pending": "{count"}),
+            "unmatched brace in status format pending",
+        ),
+        (
+            serde_json::json!({"pending": "count}"}),
+            "unmatched brace in status format pending",
+        ),
+    ] {
+        assert_eq!(
+            registry
+                .validate_view_options_value(None, &serde_json::json!({"status-formats": formats}))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+    for formats in [
+        serde_json::json!({"pending": "待处理 {count}", "items": "{items}/{selected}", "loading": ""}),
+        serde_json::Value::Object(
+            crate::DEFAULT_STATUS_FORMATS
+                .iter()
+                .map(|(name, template)| ((*name).into(), serde_json::json!(template)))
+                .collect(),
+        ),
+    ] {
+        registry
+            .validate_view_options_value(None, &serde_json::json!({"status-formats": formats}))
+            .unwrap();
+    }
+}
+
+#[test]
 fn default_yank_register_requires_one_writable_character() {
     let registry = Registry::<()>::default();
     for register in ["+", "*", "\"", "a", "_"] {
         registry
-            .validate_view_options_value(&serde_json::json!({
-                "default-yank-register": register,
-            }))
+            .validate_view_options_value(
+                None,
+                &serde_json::json!({
+                    "default-yank-register": register,
+                }),
+            )
             .unwrap();
     }
     for register in [
@@ -18,9 +70,12 @@ fn default_yank_register_requires_one_writable_character() {
     ] {
         assert!(
             registry
-                .validate_view_options_value(&serde_json::json!({
-                    "default-yank-register": register,
-                }))
+                .validate_view_options_value(
+                    None,
+                    &serde_json::json!({
+                        "default-yank-register": register,
+                    })
+                )
                 .is_err()
         );
     }

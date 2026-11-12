@@ -11,3 +11,6 @@ serde_json.workspace = true
 zess-plugin.workspace = true
 zess-ui.workspace = true
 zess-services.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

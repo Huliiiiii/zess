@@ -329,7 +329,7 @@ fn git_decorations_report_staging_from_a_background_query() {
         match services.poll_query(handle).unwrap() {
             QueryPoll::Pending => {}
             QueryPoll::Ready(result) => {
-                let QueryResult::GitDecorations { entries } = result.unwrap() else {
+                let QueryResult::GitDecorations { entries, .. } = result.unwrap() else {
                     panic!("wrong result kind");
                 };
                 break entries;
@@ -1169,17 +1169,18 @@ fn directory_entries_use_workspace_relative_paths() {
 
 #[cfg(unix)]
 #[test]
-fn directory_listing_rejects_non_utf8_filenames() {
+fn directory_listing_reports_omitted_non_utf8_filenames() {
     use std::os::unix::ffi::OsStrExt;
 
     let fixture = Fixture::new();
     fs::write(fixture.0.join(std::ffi::OsStr::from_bytes(b"\xff")), "").unwrap();
+    fs::write(fixture.0.join("note.txt"), "").unwrap();
     let result = fixture.services().call("fs.list", json!({}));
-    assert!(
-        result["error"]
-            .as_str()
-            .unwrap()
-            .contains("filename that is not UTF-8")
+    assert_eq!(result["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(result["entries"][0]["path"], "note.txt");
+    assert_eq!(
+        result["path_warning"],
+        "Skipped 1 directory entry with a non-UTF-8 name"
     );
 }
 
@@ -1512,11 +1513,22 @@ fn status_lists_changed_files_before_counting_their_lines() {
     git(&fixture.0, &["add", "."]);
     git(&fixture.0, &["commit", "--quiet", "-m", "baseline"]);
     fs::write(fixture.0.join("note.txt"), "new\nextra\n").unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+        fs::write(fixture.0.join(OsStr::from_bytes(b"raw-\xff")), "raw\n").unwrap();
+    }
     let mut services = fixture.services();
     let mut probe = ReadProbe::install(&mut services, 1);
     let handle = start(&mut services, "git.status", json!({}));
     assert_eq!(probe.wait_for_read(&mut services, handle), "git.status");
-    let entries = services.status_progress(handle).unwrap().unwrap();
+    let progress = services.status_progress(handle).unwrap().unwrap();
+    let entries = progress.entries;
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        progress.path_warning.as_deref(),
+        Some("Skipped 1 Git entry with a non-UTF-8 path")
+    );
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path, "note.txt");
     assert_eq!(entries[0].worktree, "M");
@@ -1528,6 +1540,7 @@ fn status_lists_changed_files_before_counting_their_lines() {
     ));
     probe.release();
     let result = ready(&mut services, handle);
+    assert_eq!(result["path_warning"], json!(progress.path_warning));
     assert_eq!(result["entries"].as_array().unwrap().len(), 1);
     assert_eq!(result["entries"][0]["path"], entries[0].path);
     assert_eq!(result["entries"][0]["worktree"], entries[0].worktree);
@@ -2888,6 +2901,33 @@ fn root_commit_files_distinguish_text_line_counts_from_binary_files() {
     assert_eq!(files["files"][1]["path"], "text.txt");
     assert_eq!(files["files"][1]["additions"], 2);
     assert_eq!(files["files"][1]["deletions"], 0);
+}
+
+#[test]
+fn commit_files_remain_available_when_line_counts_fail() {
+    let fixture = Fixture::new();
+    git(&fixture.0, &["init", "--quiet"]);
+    fs::write(fixture.0.join("note.txt"), "historical\n").unwrap();
+    git(&fixture.0, &["add", "."]);
+    git(&fixture.0, &["commit", "--quiet", "-m", "root"]);
+    // Git and gix can read the local objects. libgit2 rejects this repository extension.
+    git(&fixture.0, &["config", "core.repositoryformatversion", "1"]);
+    git(&fixture.0, &["config", "extensions.partialClone", "origin"]);
+    let mut services = fixture.services();
+    let oid = services.call("git.log", json!({}))["commits"][0]["oid"].clone();
+    let files = services.call("git.commit-files", json!({"commit":oid}));
+    assert_eq!(files["files"][0]["path"], "note.txt", "{files}");
+    assert_eq!(files["files"][0]["status"], "A");
+    assert!(files["files"][0]["additions"].is_null());
+    assert!(
+        files["line_count_error"]
+            .as_str()
+            .unwrap()
+            .contains("extensions.partialclone"),
+        "{files}"
+    );
+    let blob = services.call("git.blob", json!({"commit":oid, "path":"note.txt"}));
+    assert_eq!(blob["snapshot"]["text"], "historical\n", "{blob}");
 }
 
 #[test]

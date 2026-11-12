@@ -263,8 +263,9 @@ fn opening_and_clicking_a_whole_file_diff_keeps_its_entire_block_selected_for_st
         view.location.diff_selection.rows(&diff.index).unwrap(),
         rows
     );
-    session.input("space");
-    session.input("s");
+    session
+        .execute_command("diff.apply-selection", json!({}))
+        .unwrap();
     wait_until(&mut session, |session| session.git_patch.is_none());
     settle(&mut session);
     assert_eq!(session.message, "Git index updated");
@@ -288,7 +289,7 @@ fn changing_the_diff_pager_preserves_the_preview_view_and_buffer() {
     let config = fixture.0.join(".git/pager-config.w");
     fs::write(
         &config,
-        "set-view-options! 'git : obj 'diff-pager \"printf 'first\\n'; cat\"\n",
+        "set-view-options! 'git : obj 'diff-pager : obj 'program \"sh\" 'args : list \"-c\" \"printf 'first\\n'; cat\"\n",
     )
     .unwrap();
     let mut session = Session::new(fixture.0.clone(), &[], Some(config.clone())).unwrap();
@@ -307,7 +308,7 @@ fn changing_the_diff_pager_preserves_the_preview_view_and_buffer() {
     );
     fs::write(
         &config,
-        "set-view-options! 'git : obj 'diff-pager \"printf 'second\\n'; cat\"\n",
+        "set-view-options! 'git : obj 'diff-pager : obj 'program \"sh\" 'args : list \"-c\" \"printf 'second\\n'; cat\"\n",
     )
     .unwrap();
     session.command("config-reload").unwrap();
@@ -341,7 +342,7 @@ fn historical_diffs_use_the_configured_pager_and_file_headers() {
     let config = fixture.0.join(".git/pager-config.w");
     fs::write(
         &config,
-        "set-view-options! 'git-commit-files : obj 'diff-file-header #t 'diff-pager \"printf 'historical\\n'; cat\"\n",
+        "set-view-options! 'git-commit-files : obj 'diff-file-header #t 'diff-pager : obj 'program \"sh\" 'args : list \"-c\" \"printf 'historical\\n'; cat\"\n",
     )
     .unwrap();
     let mut session = Session::new(fixture.0.clone(), &[], Some(config)).unwrap();
@@ -398,7 +399,7 @@ fn a_compact_diff_without_context_keeps_navigation_and_partial_staging() {
     fs::write(
         &config,
         format!(
-            "set-view-options! 'git : obj 'diff-pager \"sh {}\"\n",
+            "set-view-options! 'git : obj 'diff-pager : obj 'program \"sh\" 'args : list \"{}\"\n",
             script.display()
         ),
     )
@@ -487,7 +488,7 @@ fn clicking_a_mapped_change_keeps_its_rendered_block_for_staging() {
     fs::write(
         &config,
         format!(
-            "set-view-options! 'git : obj 'diff-pager \"sh {}\"\n",
+            "set-view-options! 'git : obj 'diff-pager : obj 'program \"sh\" 'args : list \"{}\"\n",
             script.display()
         ),
     )
@@ -599,8 +600,9 @@ fn a_mapped_line_stages_its_original_changes_without_the_next_addition() {
     assert!(rows.iter().flat_map(|row| &row.spans).any(|span| {
         span.text.trim_end() == "historical => working" && span.style == "diff.selection"
     }));
-    session.input("space");
-    session.input("s");
+    session
+        .execute_command("diff.apply-selection", json!({}))
+        .unwrap();
     wait_until(&mut session, |session| session.git_patch.is_none());
     settle(&mut session);
     assert_eq!(session.message, "Git index updated");
@@ -689,8 +691,9 @@ fn mapped_navigation_and_search_select_the_original_change_block_for_staging() {
     session
         .execute_command("diff.select-hunk", json!({}))
         .unwrap();
-    session.input("space");
-    session.input("s");
+    session
+        .execute_command("diff.apply-selection", json!({}))
+        .unwrap();
     wait_until(&mut session, |session| session.git_patch.is_none());
     settle(&mut session);
     assert_eq!(session.message, "Git index updated");
@@ -723,7 +726,7 @@ fn separate_display_segments_highlight_and_stage_only_their_original_change_bloc
     fs::write(
         &config,
         format!(
-            "set-view-options! 'git : obj 'diff-pager \"sh {}\"\n",
+            "set-view-options! 'git : obj 'diff-pager : obj 'program \"sh\" 'args : list \"{}\"\n",
             script.display()
         ),
     )
@@ -810,7 +813,7 @@ fn an_unresolved_reference_inside_a_range_rejects_the_entire_index_update() {
     fs::write(
         &config,
         format!(
-            "set-view-options! 'git : obj 'diff-pager \"sh {}\"\n",
+            "set-view-options! 'git : obj 'diff-pager : obj 'program \"sh\" 'args : list \"{}\"\n",
             script.display()
         ),
     )
@@ -833,7 +836,10 @@ fn an_unresolved_reference_inside_a_range_rejects_the_entire_index_update() {
     );
     let before = git(&fixture, &["write-tree"]);
     assert_eq!(
-        session.apply_diff_selection().unwrap_err().to_string(),
+        session
+            .apply_diff_selection(session.focus)
+            .unwrap_err()
+            .to_string(),
         "selected row has no reliable original patch mapping"
     );
     assert!(session.git_patch.is_none());
@@ -879,7 +885,7 @@ fn unresolved_rendered_references_cannot_stage_the_previous_selection() {
     fs::write(
         &config,
         format!(
-            "set-view-options! 'git : obj 'diff-pager \"sh {}\"\n",
+            "set-view-options! 'git : obj 'diff-pager : obj 'program \"sh\" 'args : list \"{}\"\n",
             script.display()
         ),
     )
@@ -907,7 +913,10 @@ fn unresolved_rendered_references_cannot_stage_the_previous_selection() {
         .execute_command("diff.goto-first", json!({}))
         .unwrap();
     assert_eq!(
-        session.apply_diff_selection().unwrap_err().to_string(),
+        session
+            .apply_diff_selection(session.focus)
+            .unwrap_err()
+            .to_string(),
         "selected row has no reliable original patch mapping"
     );
     assert!(session.git_patch.is_none());
@@ -1003,8 +1012,9 @@ fn staging_after_external_browsing_uses_the_original_patch() {
     session
         .execute_command("diff.select-hunk", json!({}))
         .unwrap();
-    session.input("space");
-    session.input("s");
+    session
+        .execute_command("diff.apply-selection", json!({}))
+        .unwrap();
     wait_until(&mut session, |session| session.git_patch.is_none());
     settle(&mut session);
     assert_eq!(session.message, "Git index updated");
@@ -1114,8 +1124,12 @@ fn browsing_scrolls_the_external_output_before_opening_its_current_file() {
     assert_eq!(selected_row(&session, source).id, "directory:dir");
     let preview = session.preview_target(source).unwrap();
     for _ in 0..200 {
-        session.move_preview(ViewDirection::Down).unwrap();
-        session.move_preview(ViewDirection::Right).unwrap();
+        session
+            .move_preview(session.focus, ViewDirection::Down)
+            .unwrap();
+        session
+            .move_preview(session.focus, ViewDirection::Right)
+            .unwrap();
     }
     let view = &session.views[&preview];
     let Buffer::PreviewDiff { diff, .. } = &session.buffers[&view.location.buffer] else {
@@ -1248,7 +1262,9 @@ fn browsing_mapped_output_keeps_its_scroll_and_focuses_the_visible_change_block(
     let preview = session.preview_target(source).unwrap();
     let selected = session.views[&preview].location.diff_selection.row();
     for _ in 0..50 {
-        session.move_preview(ViewDirection::Down).unwrap();
+        session
+            .move_preview(session.focus, ViewDirection::Down)
+            .unwrap();
     }
     let scroll = session.views[&preview].location.scroll;
     assert!(scroll > 9);
@@ -1441,7 +1457,7 @@ fn changing_pager_arguments_and_file_headers_preserves_the_mapped_selection() {
     fs::write(
         &config,
         format!(
-            "set-view-options! 'git : obj 'diff-pager \"sh {} initial\"\n",
+            "set-view-options! 'git : obj 'diff-pager : obj 'program \"sh\" 'args : list \"{}\" \"initial\"\n",
             script.display()
         ),
     )
@@ -1460,7 +1476,7 @@ fn changing_pager_arguments_and_file_headers_preserves_the_mapped_selection() {
     fs::write(
         &config,
         format!(
-            "set-view-options! 'git : obj 'diff-file-header #t 'diff-pager \"sh {} changed\"\n",
+            "set-view-options! 'git : obj 'diff-file-header #t 'diff-pager : obj 'program \"sh\" 'args : list \"{}\" \"changed\"\n",
             script.display()
         ),
     )
@@ -1527,7 +1543,7 @@ fn a_mapped_change_block_can_be_unstaged_without_the_next_block() {
     fs::write(
         &config,
         format!(
-            "set-view-options! 'git : obj 'diff-file-header #t 'diff-pager \"sh {}\"\n",
+            "set-view-options! 'git : obj 'diff-file-header #t 'diff-pager : obj 'program \"sh\" 'args : list \"{}\"\n",
             script.display()
         ),
     )
@@ -1608,7 +1624,7 @@ fn refreshing_a_shared_diff_cancels_search_before_remapping_its_original_selecti
     for key in ["w", "o", "r", "k", "i", "n", "g"] {
         session.input(key);
     }
-    assert_eq!(session.prompt.as_ref().unwrap().view, split);
+    assert_eq!(session.prompt.as_ref().unwrap().target.view, split);
     assert_eq!(
         session.views[&split].location.diff_selection.row(),
         Some(41)

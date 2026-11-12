@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::query::{QueryRequest, QueryResult};
+use crate::query::{QueryRequest, QueryResult, StatusProgress};
 use anyhow::{Context, Result, bail};
 use zess_platform::{ProcessRunner, ProcessSpec, SystemProcessRunner};
 
@@ -87,7 +87,7 @@ enum TaskKind {
     Background {
         request: QueryRequest,
         result: mpsc::Sender<Result<QueryResult, String>>,
-        status_progress: Option<mpsc::Sender<Vec<zess_git::GitEntry>>>,
+        status_progress: Option<mpsc::Sender<StatusProgress>>,
     },
     Filesystem {
         path: String,
@@ -178,7 +178,7 @@ impl JobScheduler {
     pub(crate) fn try_start(
         &self,
         request: QueryRequest,
-        status_progress: Option<mpsc::Sender<Vec<zess_git::GitEntry>>>,
+        status_progress: Option<mpsc::Sender<StatusProgress>>,
     ) -> Result<Option<Job<Result<QueryResult, String>>>> {
         self.enqueue(|result| TaskKind::Background {
             request,

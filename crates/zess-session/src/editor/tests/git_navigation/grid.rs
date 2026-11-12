@@ -144,7 +144,7 @@ fn reloading_alignment_updates_the_tree_without_rebuilding_rows() {
 }
 
 #[test]
-fn invalid_alignment_is_rejected_before_starting_queries() {
+fn invalid_alignment_keeps_the_builtin_configuration_at_startup() {
     let fixture = counted_files();
     let config = fixture.0.join(".git/grid-config.w");
     fs::write(
@@ -153,17 +153,72 @@ fn invalid_alignment_is_rejected_before_starting_queries() {
     )
     .unwrap();
     let mut session = Session::new(fixture.0.clone(), &[], Some(config)).unwrap();
-    let error = session.command("git").unwrap_err();
-
     assert_eq!(
-        error.root_cause().to_string(),
-        "stats-alignment must be \"none\", \"consecutive\", or \"all\""
+        session.message,
+        "reload failed: view options for git: stats-alignment must be \"none\", \"consecutive\", or \"all\""
     );
-    let stats = session
-        .services
-        .borrow_mut()
-        .call("service.stats", json!({}));
-    assert_eq!(stats["jobs"], 0);
+    session.command("git").unwrap();
+    settle(&mut session);
+    let source = session.focus;
+    assert_eq!(addition_columns(&mut session, source), [39, 37, 39, 38]);
+}
+
+#[test]
+fn invalid_reload_preserves_the_open_views_and_their_alignment() {
+    use zess_ui::ColumnAlignment;
+
+    let fixture = counted_files();
+    let config = fixture.0.join(".git/grid-config.w");
+    fs::write(
+        &config,
+        "set-view-options! \"git\" : obj 'stats-alignment \"consecutive\"\n",
+    )
+    .unwrap();
+    let mut session = Session::new(fixture.0.clone(), &[], Some(config.clone())).unwrap();
+    session.command("git").unwrap();
+    settle(&mut session);
+    let source = session.focus;
+    session.command("vsplit").unwrap();
+    let split = session.focus;
+    session
+        .request(
+            split,
+            HostRequest::ConfigureView {
+                options: json!({"stats-alignment": "none"}),
+            },
+        )
+        .unwrap();
+    session.command("git.refresh").unwrap();
+    settle(&mut session);
+    let selection = session.views[&split].location.selection.clone();
+    let preview = session.preview_target(split).unwrap();
+
+    fs::write(
+        config,
+        "set-view-options! \"git\" : obj 'stats-alignment #f\n",
+    )
+    .unwrap();
+    let error = session.command("config-reload").unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("reload failed: view options for git"));
+    assert!(error.contains("stats-alignment must be"));
+    assert_eq!(session.focus, split);
+    assert_eq!(session.preview_target(split), Some(preview));
+    let actual = &session.views[&split].location.selection;
+    assert_eq!(actual.primary, selection.primary);
+    assert_eq!(actual.selected, selection.selected);
+    assert_eq!(actual.anchor, selection.anchor);
+
+    session.command("git.refresh").unwrap();
+    settle(&mut session);
+    assert_eq!(
+        session.views[&source].location.display.column_alignment,
+        ColumnAlignment::Consecutive
+    );
+    assert_eq!(
+        session.views[&split].location.display.column_alignment,
+        ColumnAlignment::None
+    );
 }
 
 #[test]

@@ -19,7 +19,7 @@ pub use mutations::FileMutationTask;
 mod patches;
 pub use patches::PatchTask;
 mod query;
-pub use query::{QueryPoll, QueryRequest, QueryResult};
+pub use query::{QueryPoll, QueryRequest, QueryResult, StatusProgress};
 mod jobs;
 mod watcher;
 mod workspace;
@@ -309,7 +309,7 @@ impl NativeServices {
         }
     }
 
-    pub fn status_progress(&mut self, handle: u64) -> Result<Option<Vec<zess_git::GitEntry>>> {
+    pub fn status_progress(&mut self, handle: u64) -> Result<Option<StatusProgress>> {
         let state = self
             .jobs
             .get_mut(&handle)
@@ -330,7 +330,7 @@ impl NativeServices {
             return Ok(None);
         };
         match progress.try_recv() {
-            Ok(entries) => Ok(Some(entries)),
+            Ok(progress) => Ok(Some(progress)),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(None),
         }
     }
@@ -455,7 +455,7 @@ enum BackgroundState {
         registration: Arc<Registration>,
         revision: u64,
         job: Job<Result<QueryResult, String>>,
-        status_progress: Option<std::sync::mpsc::Receiver<Vec<zess_git::GitEntry>>>,
+        status_progress: Option<std::sync::mpsc::Receiver<StatusProgress>>,
     },
 }
 

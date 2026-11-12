@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,13 +20,15 @@ use zess_plugin::{
     SnapshotPresentation, TextContext, ViewId,
 };
 use zess_plugins::builtin::BuiltinPlugins;
-use zess_script::{CommandOutput, KeyResolution, ScriptRuntime};
+use zess_script::{
+    CommandOutput, KeyResolution, NativeSteelCompiler, ScriptCompiler, ScriptRuntime,
+};
 use zess_services::{NativeServices, Observation};
 use zess_text::{
-    ClipboardRead, InsertHistory, Registers, TEXT_COMMANDS, TextBuffer, TextCommand, TextEffect,
-    TextMode, TextPromptKind,
+    ClipboardRead, HelixSyntaxProvider, InsertHistory, Registers, SyntaxProvider, TEXT_COMMANDS,
+    TextBuffer, TextCommand, TextEffect, TextMode, TextPromptKind,
 };
-use zess_ui::{CursorShape, Display, DisplayRow, Frame, FrameRow, Span};
+use zess_ui::{CursorShape, Display, DisplayRow, Frame, FrameRow, ScrollMode, Span};
 
 mod commands;
 mod context;
@@ -35,8 +38,10 @@ mod items;
 mod mouse;
 mod navigation;
 mod pages;
+mod presentation;
 mod preview;
 mod render;
+mod snapshot;
 mod status;
 #[cfg(test)]
 mod tests;
@@ -49,6 +54,7 @@ enum Buffer {
     Text(TextBuffer),
     Data {
         kind: String,
+        argument: Value,
         modified: bool,
         text_source: Option<BufferId>,
     },
@@ -71,11 +77,18 @@ enum Buffer {
         display: Display,
     },
     Items {
+        role: ItemsRole,
         kind: String,
         path: String,
         display: Display,
         help_context: Option<ui::HelpContext>,
     },
+}
+
+#[derive(PartialEq)]
+enum ItemsRole {
+    Standalone,
+    Preview,
 }
 
 #[derive(PartialEq)]
@@ -95,9 +108,22 @@ impl PreviewRowKind {
 }
 
 impl Buffer {
+    fn plugin_kind(&self) -> Option<&str> {
+        match self {
+            Self::Data { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
     fn is_preview(&self) -> bool {
         match self {
-            Self::PreviewText { .. } | Self::PreviewDiff { .. } | Self::PreviewRows { .. } => true,
+            Self::PreviewText { .. }
+            | Self::PreviewDiff { .. }
+            | Self::PreviewRows { .. }
+            | Self::Items {
+                role: ItemsRole::Preview,
+                ..
+            } => true,
             _ => false,
         }
     }
@@ -120,7 +146,13 @@ enum LayerContent {
     File,
 }
 
-#[derive(PartialEq)]
+struct LayerAttachment {
+    parent: ViewId,
+    content: LayerContent,
+    presentation: LayerPresentation,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum LayerPresentation {
     Inline,
     Pane,
@@ -158,6 +190,7 @@ impl ViewMode {
 #[derive(Clone)]
 struct ViewLocation {
     buffer: BufferId,
+    config_generation: Option<u64>,
     mode: ViewMode,
     memories: HashMap<String, Value>,
     filter: zess_filter::Filter,
@@ -170,7 +203,7 @@ struct ViewLocation {
     statusline: Vec<Span>,
     scroll: usize,
     horizontal_scroll: usize,
-    manual_viewport: bool,
+    scroll_mode: ScrollMode,
 }
 
 impl ViewLocation {
@@ -187,6 +220,7 @@ impl ViewLocation {
     fn new(buffer: BufferId) -> Self {
         Self {
             buffer,
+            config_generation: None,
             mode: ViewMode::Normal,
             memories: HashMap::new(),
             filter: zess_filter::Filter::default(),
@@ -199,9 +233,75 @@ impl ViewLocation {
             statusline: Vec::new(),
             scroll: 0,
             horizontal_scroll: 0,
-            manual_viewport: false,
+            scroll_mode: ScrollMode::FollowSelection,
         }
     }
+}
+
+#[derive(Default)]
+enum KeySequence {
+    #[default]
+    Idle,
+    Prefix {
+        keys: Vec<String>,
+        matching: KeyState,
+    },
+}
+
+impl KeySequence {
+    fn keys(&self) -> &[String] {
+        match self {
+            Self::Idle => &[],
+            Self::Prefix { keys, .. } => keys,
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::Idle;
+    }
+
+    fn synchronize(&mut self, runtime: &ScriptRuntime, scopes: &[&str], mode: &str) {
+        if let Self::Prefix { matching, .. } = self
+            && runtime.with_keymap(|keymap| keymap.synchronize(matching, scopes, mode))
+        {
+            self.clear();
+        }
+    }
+
+    fn advance(
+        &mut self,
+        runtime: &ScriptRuntime,
+        scopes: &[&str],
+        mode: &str,
+        key: &str,
+    ) -> (KeyResolution, Self) {
+        let previous = std::mem::take(self);
+        let mut matching = match &previous {
+            Self::Idle => KeyState::default(),
+            Self::Prefix { matching, .. } => matching.clone(),
+        };
+        let context = matching.clone();
+        let resolution = runtime.advance_key(&mut matching, scopes, mode, key);
+        let previous = if matching.shares_context(&context) {
+            previous
+        } else {
+            Self::Idle
+        };
+        if matches!(resolution, KeyResolution::Prefix) {
+            let mut keys = previous.keys().to_vec();
+            keys.push(key.into());
+            *self = Self::Prefix { keys, matching };
+        }
+        (resolution, previous)
+    }
+}
+
+struct ClipboardReadRequest {
+    id: u64,
+    view: ViewId,
+    buffer: BufferId,
+    operation: ClipboardRead,
+    operation_id: Option<String>,
 }
 
 enum RegisterInput {
@@ -218,11 +318,7 @@ struct View {
     count: CommandCount,
     register: RegisterInput,
     jump: Option<items::ItemJump>,
-    parent: Option<ViewId>,
     return_to: Option<pages::FocusTarget>,
-    layer: Option<ViewId>,
-    layer_content: Option<LayerContent>,
-    presentation: LayerPresentation,
     wake_at: Option<Instant>,
     preview_area: Option<Rect>,
     observations: Vec<(QueryWatch, Observation)>,
@@ -238,11 +334,7 @@ impl View {
             count: CommandCount::default(),
             register: RegisterInput::None,
             jump: None,
-            parent: None,
             return_to: None,
-            layer: None,
-            layer_content: None,
-            presentation: LayerPresentation::Pane,
             wake_at: None,
             preview_area: None,
             observations: Vec::new(),
@@ -379,6 +471,11 @@ impl Layout {
     }
 }
 
+enum MiniBufferInput {
+    Text,
+    Query(QueryKind),
+}
+
 enum PromptKind {
     Command,
     Text(TextPromptKind),
@@ -387,14 +484,19 @@ enum PromptKind {
     MiniBuffer {
         purpose: String,
         key_scope: Option<String>,
-        query_kind: Option<QueryKind>,
+        input: MiniBufferInput,
     },
+}
+
+struct PromptTarget {
+    view: ViewId,
+    buffer: BufferId,
 }
 
 struct Prompt {
     kind: PromptKind,
     text: String,
-    view: ViewId,
+    target: PromptTarget,
     completion: Option<Completion>,
     cursor: usize,
     error: Option<String>,
@@ -405,7 +507,7 @@ impl Prompt {
         match &self.kind {
             PromptKind::Filter(kind)
             | PromptKind::MiniBuffer {
-                query_kind: Some(kind),
+                input: MiniBufferInput::Query(kind),
                 ..
             } => Some((*kind, &self.text)),
             _ => None,
@@ -456,6 +558,8 @@ impl Drop for RuntimeHost {
 
 /// A session belongs to the server, independently of its terminal connection.
 pub struct Session {
+    syntax_provider: Arc<dyn SyntaxProvider>,
+    script_compiler: Arc<dyn ScriptCompiler>,
     file_watches: BTreeMap<BufferId, files::FileWatch>,
     workspace: PathBuf,
     config: Option<PathBuf>,
@@ -468,6 +572,8 @@ pub struct Session {
     builtins: BuiltinPlugins,
     generation: u64,
     buffers: BTreeMap<BufferId, Buffer>,
+    client_workspace: zess_protocol::ClientWorkspace,
+    client_actions: Vec<zess_protocol::ClientAction>,
     views: pages::Store,
     layout: Option<Layout>,
     focus: ViewId,
@@ -477,16 +583,20 @@ pub struct Session {
     pending_diff_source: Option<preview::PendingDiffSource>,
     prompt: Option<Prompt>,
     help: Option<Help>,
-    pending: Vec<String>,
-    key_state: KeyState,
+    key_sequence: KeySequence,
     clipboard_writes: Vec<String>,
     primary_clipboard_writes: Vec<String>,
-    clipboard_read: Option<(u64, ViewId, BufferId, ClipboardRead)>,
+    clipboard_read: Option<ClipboardReadRequest>,
     message: String,
     width: u16,
     height: u16,
     exiting: bool,
+    current_operation: Option<String>,
+    pending_operations: HashSet<String>,
+    operation_outcome: Option<zess_protocol::CommandOutcome>,
+    operation_completions: Vec<(String, zess_protocol::CommandOutcome)>,
     mouse_regions: Vec<mouse::Region>,
+    presentation_regions: Vec<mouse::Region>,
     command_mouse: Option<ui::CommandGrid>,
     mouse_context: zess_ui::MouseContext,
     mouse_drag: Option<ViewId>,
@@ -494,9 +604,46 @@ pub struct Session {
 
 impl Session {
     pub fn new(workspace: PathBuf, files: &[PathBuf], config: Option<PathBuf>) -> Result<Self> {
-        let workspace = workspace.canonicalize().context("open workspace")?;
-        let services = Rc::new(RefCell::new(NativeServices::new(workspace.clone())?));
+        let services = NativeServices::new(workspace.clone())?;
+        Self::with_services(workspace, files, config, services)
+    }
+
+    pub fn with_services(
+        workspace: PathBuf,
+        files: &[PathBuf],
+        config: Option<PathBuf>,
+        services: NativeServices,
+    ) -> Result<Self> {
+        let syntax_provider = Arc::new(HelixSyntaxProvider::with_platform(
+            Arc::new(zess_platform::NativePlatform),
+            services.file_system(),
+        ));
+        Self::with_capabilities(
+            workspace,
+            files,
+            config,
+            services,
+            syntax_provider,
+            Arc::new(NativeSteelCompiler),
+        )
+    }
+
+    pub fn with_capabilities(
+        workspace: PathBuf,
+        files: &[PathBuf],
+        config: Option<PathBuf>,
+        services: NativeServices,
+        syntax_provider: Arc<dyn SyntaxProvider>,
+        script_compiler: Arc<dyn ScriptCompiler>,
+    ) -> Result<Self> {
+        let filesystem = services.file_system();
+        let workspace = filesystem
+            .canonicalize(&workspace)
+            .context("open workspace")?;
+        let services = Rc::new(RefCell::new(services));
         let mut session = Self {
+            syntax_provider,
+            script_compiler,
             file_watches: BTreeMap::new(),
             workspace,
             config,
@@ -509,6 +656,8 @@ impl Session {
             identities: IdentityRegistry::default(),
             generation: 0,
             buffers: BTreeMap::new(),
+            client_workspace: zess_protocol::ClientWorkspace::default(),
+            client_actions: Vec::new(),
             views: pages::Store::default(),
             layout: None,
             focus: 0,
@@ -518,8 +667,7 @@ impl Session {
             pending_diff_source: None,
             prompt: None,
             help: None,
-            pending: Vec::new(),
-            key_state: KeyState::default(),
+            key_sequence: KeySequence::default(),
             clipboard_writes: Vec::new(),
             primary_clipboard_writes: Vec::new(),
             clipboard_read: None,
@@ -527,22 +675,43 @@ impl Session {
             width: 80,
             height: 24,
             exiting: false,
+            current_operation: None,
+            pending_operations: HashSet::new(),
+            operation_outcome: None,
+            operation_completions: Vec::new(),
             mouse_regions: Vec::new(),
+            presentation_regions: Vec::new(),
             command_mouse: None,
             mouse_context: zess_ui::MouseContext::default(),
             mouse_drag: None,
         };
 
-        if session.reload() {
-            session.message.clear();
+        if let Err(error) = session.reload() {
+            session.message = match session.build_runtime(false) {
+                Ok(runtime) => {
+                    session.scripts = Some(runtime);
+                    format!("{error:#}")
+                }
+                Err(default_error) => format!("defaults failed: {default_error:#}; {error:#}"),
+            };
         }
 
         let (directory, files) = match files.split_first() {
-            Some((path, files)) if session.absolute(path).is_dir() => (Some(path), files),
+            Some((path, files))
+                if filesystem
+                    .metadata(&session.absolute(path))
+                    .is_ok_and(|entry| entry.is_dir()) =>
+            {
+                (Some(path), files)
+            }
             _ => (None, files),
         };
         if files.is_empty() {
-            let buffer = session.add_buffer(Buffer::Text(TextBuffer::new("")));
+            let buffer = session.add_buffer(Buffer::Text(TextBuffer::with_capabilities(
+                "",
+                filesystem,
+                session.syntax_provider.clone(),
+            )));
             session.add_initial_view(buffer);
         } else {
             for path in files {
@@ -552,6 +721,13 @@ impl Session {
                 }
             }
         }
+        session.client_workspace.buffers = session
+            .buffers
+            .iter()
+            .filter_map(|(&id, buffer)| matches!(buffer, Buffer::Text(_)).then_some(id))
+            .collect();
+        session.client_workspace.current = Some(session.views[&session.focus].location.buffer);
+
         if let Some(path) = directory {
             session.open_directory(path)?;
         }
@@ -573,6 +749,15 @@ impl Session {
         self.exiting
     }
 
+    fn request_stop(&mut self, force: bool) -> Result<()> {
+        anyhow::ensure!(
+            force || !self.modified(),
+            "unsaved buffers; save them first or stop with force"
+        );
+        self.exiting = true;
+        Ok(())
+    }
+
     pub fn workspace(&self) -> &Path {
         &self.workspace
     }
@@ -589,7 +774,45 @@ impl Session {
         })
     }
 
+    pub fn on_client_exit(&self) -> zess_plugin::OnClientExit {
+        self.scripts
+            .as_ref()
+            .map(|scripts| scripts.on_client_exit())
+            .unwrap_or_default()
+    }
+
     pub fn tick(&mut self) -> bool {
+        let outputs = self
+            .scripts
+            .as_mut()
+            .map(|scripts| scripts.poll_operations())
+            .unwrap_or_default();
+        let operations_changed = !outputs.is_empty();
+        for output in outputs {
+            let mut completions = output.completed_operations;
+            for request in output.requests {
+                let result = match request {
+                    HostRequest::Message { text } => {
+                        self.message = text;
+                        Ok(())
+                    }
+                    HostRequest::Yank { values, register } => {
+                        self.yank(values, register.unwrap_or('"'))
+                    }
+                    _ => Err(anyhow::anyhow!("background operation requires a view")),
+                };
+                if let Err(error) = result {
+                    for completion in &mut completions {
+                        completion.result = zess_plugin::OperationResult::Failed {
+                            message: format!("{error:#}"),
+                        };
+                    }
+                    self.message = format!("operation: {error:#}");
+                    break;
+                }
+            }
+            self.complete_operations(completions);
+        }
         let geometry_changed = self.update_plugin_geometry();
         let patch_changed = self.poll_git_patch();
         let source_changed = self.poll_diff_source();
@@ -670,7 +893,8 @@ impl Session {
                 self.message = format!("plugin task: {error:#}");
             }
         }
-        geometry_changed
+        operations_changed
+            || geometry_changed
             || patch_changed
             || source_changed
             || syntax_changed
@@ -682,18 +906,28 @@ impl Session {
     }
 
     pub fn open_paths(&mut self, paths: &[String]) {
+        let filesystem = self.services.borrow().file_system();
         let (directory, paths) = match paths.split_first() {
-            Some((path, paths)) if self.absolute(Path::new(path)).is_dir() => (Some(path), paths),
+            Some((path, paths))
+                if filesystem
+                    .metadata(&self.absolute(Path::new(path)))
+                    .is_ok_and(|entry| entry.is_dir()) =>
+            {
+                (Some(path), paths)
+            }
             _ => (None, paths),
         };
         // Keep the tree focused after loading any accompanying files.
         for path in paths.iter().chain(directory) {
             let result = (|| -> Result<()> {
                 let path = Path::new(path);
-                if self.absolute(path).is_dir() {
+                if filesystem
+                    .metadata(&self.absolute(path))
+                    .is_ok_and(|entry| entry.is_dir())
+                {
                     self.open_directory(path)
                 } else {
-                    while self.views[&self.focus].parent.is_some() {
+                    while self.views.parent(self.focus).is_some() {
                         self.close_view(false)?;
                     }
                     let buffer = self.load_file(path)?;
@@ -732,7 +966,7 @@ impl Session {
     fn remember_text(&mut self) {
         let previous = self.last_text;
         if let Some(view) = self.views.get(&self.focus)
-            && view.layer_content.is_none()
+            && self.views.layer_content(view.id).is_none()
             && matches!(
                 self.buffers.get(&view.location.buffer),
                 Some(Buffer::Text(_))
@@ -759,22 +993,29 @@ impl Session {
         self.buffers
             .get(&id)
             .is_some_and(|buffer| !buffer.is_preview())
-            && !self
-                .views
-                .values()
-                .any(|view| view.location.buffer == id && view.layer_content.is_some())
+            && !self.views.values().any(|view| {
+                view.location.buffer == id && self.views.layer_content(view.id).is_some()
+            })
             && !self.views.pages().any(|page| {
                 page.navigation.plugin.as_ref().is_some_and(|plugin| {
                     plugin.buffers.contains(&id)
                         || (plugin.origin.buffer == id
-                            && matches!(page.main.layer_content, Some(LayerContent::File)))
+                            && matches!(
+                                self.views.layer_content(page.main.id),
+                                Some(LayerContent::File)
+                            ))
                 })
             })
     }
 
     fn load_file(&mut self, path: &Path) -> Result<BufferId> {
         let path = self.absolute(path);
-        let path = path.canonicalize().unwrap_or(path);
+        let path = self
+            .services
+            .borrow()
+            .file_system()
+            .canonicalize(&path)
+            .unwrap_or(path);
         for (id, buffer) in &self.buffers {
             if let Buffer::Text(text) = buffer
                 && self.is_switchable_buffer(*id)
@@ -788,21 +1029,23 @@ impl Session {
 
     fn open_directory(&mut self, path: &Path) -> Result<()> {
         let path = self
-            .absolute(path)
-            .canonicalize()
+            .services
+            .borrow()
+            .file_system()
+            .canonicalize(&self.absolute(path))
             .context("open directory")?;
         let path = path
             .strip_prefix(&self.workspace)
             .context("directory must remain within the session workspace")?;
         let argument = json!({"path":path.to_string_lossy()});
-        while self.views[&self.focus].parent.is_some() {
+        while self.views.parent(self.focus).is_some() {
             self.close_view(false)?;
         }
-        self.open_plugin("files", argument)
+        self.open_plugin(self.focus, "files", argument)
     }
 
     fn switch_buffer(&mut self, buffer: BufferId) -> Result<()> {
-        self.switch_buffer_with(buffer, Value::Null)
+        self.switch_buffer_with(self.focus, buffer, Value::Null)
     }
 
     fn ensure_buffer_switch_allowed(&self, view: ViewId) -> Result<()> {
@@ -814,29 +1057,32 @@ impl Session {
             _ => view,
         };
         let source = self.preview_source(source).unwrap_or(source);
-        if self.views[&source].parent.is_some() {
+        if self.views.parent(source).is_some() {
             bail!("close the current layer before switching buffers");
         }
         Ok(())
     }
 
-    fn switch_buffer_with(&mut self, buffer: BufferId, argument: Value) -> Result<()> {
-        self.ensure_buffer_switch_allowed(self.focus)?;
+    fn switch_buffer_with(
+        &mut self,
+        origin: ViewId,
+        buffer: BufferId,
+        argument: Value,
+    ) -> Result<()> {
+        self.ensure_buffer_switch_allowed(origin)?;
         if !self.is_switchable_buffer(buffer) {
             bail!("buffer {buffer} is not a selectable editor buffer");
         }
-        self.cancel_input_context()?;
-        let origin = self.focus;
-        if self.buffers[&self.views[&origin].location.buffer].is_preview()
-            && let Some(source) = self.preview_source(origin)
-        {
+        let target = self.preview_source(origin).unwrap_or(origin);
+        if origin == self.focus && target != origin {
+            let source = target;
             self.focus_view(source)?;
         }
-        self.close_plugin_navigation(self.views.page_id(self.focus), false)?;
-        self.leave_page(self.views.page_id(self.focus))?;
-        *self.views.navigation_mut(self.focus) = navigation::History::default();
+        self.close_plugin_navigation(self.views.page_id(target), false)?;
+        self.leave_page(self.views.page_id(target))?;
+        *self.views.navigation_mut(target) = navigation::History::default();
         let retain_text = matches!(self.buffers[&buffer], Buffer::Data { .. });
-        let view = self.views.get_mut(&self.focus).context("no active view")?;
+        let view = self.views.get_mut(&target).context("no active view")?;
         let previous = view.location.buffer;
 
         if let Some(text) = self
@@ -845,9 +1091,9 @@ impl Session {
             .and_then(Buffer::text)
         {
             if retain_text {
-                text.set_text_mode(self.focus, TextMode::Normal)?;
+                text.set_text_mode(target, TextMode::Normal)?;
             } else {
-                text.remove_view(self.focus);
+                text.remove_view(target);
             }
         }
         view.replace_location(ViewLocation::new(buffer));
@@ -857,21 +1103,62 @@ impl Session {
             view.location.set_display(display.clone());
         }
         if let Some(text) = self.buffers.get_mut(&buffer).and_then(Buffer::text) {
-            text.ensure_view(self.focus);
+            text.ensure_view(target);
         }
         self.remove_unused_preview_buffer(previous);
+        if matches!(
+            self.buffers.get(&buffer),
+            Some(Buffer::Text(_) | Buffer::Data { .. })
+        ) {
+            let workspace = self.projected_client_workspace();
+            if !workspace.buffers.contains(&buffer) {
+                let id = self.id();
+                self.client_actions.push(zess_protocol::ClientAction {
+                    id,
+                    kind: zess_protocol::ClientActionKind::Open { buffer_id: buffer },
+                });
+            }
+            if target == self.focus && workspace.current != Some(buffer) {
+                let id = self.id();
+                self.client_actions.push(zess_protocol::ClientAction {
+                    id,
+                    kind: zess_protocol::ClientActionKind::Activate { buffer_id: buffer },
+                });
+            }
+            if previous != buffer
+                && matches!(self.buffers.get(&previous), Some(Buffer::Text(text)) if text.path().is_none() && !text.modified())
+                && !self.views.references_buffer(previous)
+            {
+                self.buffers.remove(&previous);
+                let id = self.id();
+                self.client_actions.push(zess_protocol::ClientAction {
+                    id,
+                    kind: zess_protocol::ClientActionKind::Forget {
+                        buffer_id: previous,
+                    },
+                });
+            }
+        }
         self.remember_text();
-        self.dispatch(self.focus, "init", argument)?;
+        self.dispatch(target, "init", argument)?;
         Ok(())
     }
 
     pub fn input(&mut self, key: &str) {
+        let _ = self.input_result(key);
+    }
+
+    fn input_result(&mut self, key: &str) -> Result<()> {
         self.mouse_drag = None;
-        self.invalidate_text_prompt();
-        self.clipboard_read = None;
         self.message.clear();
+        if let Err(error) = self.invalidate_prompt() {
+            self.message = format!("prompt: {error:#}");
+            return Err(error);
+        }
+        self.cancel_clipboard_read("clipboard read cancelled by later input");
         let before = self.selection_snapshot();
-        if let Err(error) = self.handle_input(key) {
+        let result = self.handle_input(key);
+        if let Err(error) = &result {
             if self.active_prompt().is_none() {
                 self.cancel_text_command();
             }
@@ -895,8 +1182,10 @@ impl Session {
             })();
             if let Err(error) = result {
                 self.message = format!("event: {error:#}");
+                return Err(error);
             }
         }
+        result
     }
 
     fn selection_snapshot(&mut self) -> Value {
@@ -938,13 +1227,16 @@ impl Session {
     }
 
     fn cancel_input_context(&mut self) -> Result<()> {
+        self.cancel_suspended_prompt()?;
+        self.cancel_clipboard_read("clipboard input context changed");
+        self.prompt_command(PromptCommand::Cancel)?;
         self.cancel_text_command();
         self.views.get_mut(&self.focus).unwrap().register = RegisterInput::None;
         self.views.get_mut(&self.focus).unwrap().jump = None;
         self.views.get_mut(&self.focus).unwrap().count.clear();
-        self.pending.clear();
-        self.close_help_overlay();
-        self.prompt_command(PromptCommand::Cancel)
+        self.key_sequence.clear();
+        self.close_help_overlay()?;
+        self.cancel_prompt()
     }
 
     fn fullscreen_layer(&self) -> Option<ViewId> {
@@ -955,10 +1247,10 @@ impl Session {
         id = self.preview_source(id).unwrap_or(id);
         loop {
             let view = self.views.get(&id)?;
-            if view.presentation == LayerPresentation::Fullscreen {
+            if self.views.presentation(view.id) == LayerPresentation::Fullscreen {
                 return Some(id);
             }
-            id = view.parent?;
+            id = self.views.parent(view.id)?;
         }
     }
 
@@ -1019,7 +1311,7 @@ impl Session {
                 if target == layer {
                     break;
                 }
-                let Some(parent) = self.views[&target].parent else {
+                let Some(parent) = self.views.parent(target) else {
                     bail!("close the fullscreen layer before switching views");
                 };
                 target = parent;
@@ -1034,61 +1326,184 @@ impl Session {
             self.cancel_input_context()?;
             self.blur_diff(self.focus);
         }
+        anyhow::ensure!(self.views.contains_key(&view), "view no longer exists");
         self.activate_view(view);
         Ok(())
     }
 
     fn activate_view(&mut self, view: ViewId) {
+        if self.focus != view {
+            self.key_sequence.clear();
+        }
         self.focus = view;
+        let buffer = self.views[&view].location.buffer;
+        let workspace = self.projected_client_workspace();
+        if workspace.buffers.contains(&buffer) && workspace.current != Some(buffer) {
+            let id = self.id();
+            self.client_actions.push(zess_protocol::ClientAction {
+                id,
+                kind: zess_protocol::ClientActionKind::Activate { buffer_id: buffer },
+            });
+        }
         self.focus_diff(view);
         self.views.activate_preview(view);
     }
 
-    fn invalidate_text_prompt(&mut self) {
-        if let Some(prompt) = &self.prompt
-            && matches!(prompt.kind, PromptKind::DiffSearch(_))
-            && self.views.get(&prompt.view).is_none_or(|view| {
-                !matches!(
-                    self.buffers[&view.location.buffer],
-                    Buffer::PreviewDiff { .. }
-                )
-            })
-        {
-            self.prompt = None;
-            self.pending.clear();
-            return;
-        }
+    fn prompts(&self) -> impl Iterator<Item = &Prompt> {
+        self.prompt
+            .iter()
+            .chain(self.help.iter().flat_map(|help| &help.suspended))
+    }
 
-        let Some(Prompt {
-            kind: PromptKind::Text(kind),
-            view: id,
-            ..
-        }) = &self.prompt
-        else {
-            return;
+    fn prompt_target_is_valid(&self, prompt: &Prompt) -> bool {
+        if !self.prompt_target_exists(prompt) {
+            return false;
+        }
+        match &prompt.kind {
+            PromptKind::Text(kind) => match self.buffers.get(&prompt.target.buffer) {
+                Some(
+                    Buffer::Text(text)
+                    | Buffer::Snapshot { text, .. }
+                    | Buffer::PreviewText { text, .. },
+                ) => text.pending_prompt(prompt.target.view) == Some(*kind),
+                _ => false,
+            },
+            PromptKind::DiffSearch(_) => matches!(
+                self.buffers.get(&prompt.target.buffer),
+                Some(Buffer::PreviewDiff { .. })
+            ),
+            PromptKind::Command | PromptKind::Filter(_) | PromptKind::MiniBuffer { .. } => true,
+        }
+    }
+
+    fn invalidate_prompt(&mut self) -> Result<()> {
+        if self.prompt.as_ref().is_some_and(|prompt| {
+            self.focus != prompt.target.view || !self.prompt_target_is_valid(prompt)
+        }) {
+            self.cancel_prompt()?;
+        }
+        if self
+            .help
+            .as_ref()
+            .and_then(|help| help.suspended.as_ref())
+            .is_some_and(|prompt| !self.prompt_target_is_valid(prompt))
+        {
+            self.cancel_suspended_prompt()?;
+        }
+        Ok(())
+    }
+
+    fn cancel_prompt(&mut self) -> Result<()> {
+        let Some(mut prompt) = self.prompt.take() else {
+            return Ok(());
         };
-        let Some(view) = self.views.get(id) else {
-            self.prompt = None;
-            self.pending.clear();
-            return;
+        let result = self.cancel_prompt_effects(&prompt);
+        if let Err(error) = &result
+            && self.prompt_target_exists(&prompt)
+        {
+            prompt.error = Some(format!("{error:#}"));
+            self.prompt = Some(prompt);
+        }
+        result
+    }
+
+    fn prompt_target_exists(&self, prompt: &Prompt) -> bool {
+        self.views
+            .get(&prompt.target.view)
+            .is_some_and(|view| view.location.buffer == prompt.target.buffer)
+    }
+
+    fn cancel_prompt_effects(&mut self, prompt: &Prompt) -> Result<()> {
+        self.key_sequence.clear();
+        self.restore_prompt(prompt);
+        if !self.prompt_target_exists(prompt) {
+            return Ok(());
+        }
+        match &prompt.kind {
+            PromptKind::Filter(_) => {
+                let previous = self.views[&prompt.target.view].location.mode.clone();
+                let result = self.set_mode(prompt.target.view, "normal");
+                if result.is_err()
+                    && let Some(view) = self.views.get_mut(&prompt.target.view)
+                    && view.location.buffer == prompt.target.buffer
+                {
+                    view.location.mode = previous;
+                }
+                result
+            }
+            PromptKind::MiniBuffer { purpose, .. } => self.dispatch(
+                prompt.target.view,
+                "layer_result",
+                json!({"purpose":purpose,"text":prompt.text,"cancelled":true}),
+            ),
+            PromptKind::Command | PromptKind::Text(_) | PromptKind::DiffSearch(_) => Ok(()),
+        }
+    }
+
+    fn cancel_suspended_prompt(&mut self) -> Result<()> {
+        let Some(mut prompt) = self.help.as_mut().and_then(|help| help.suspended.take()) else {
+            return Ok(());
         };
-        let buffer = &self.buffers[&view.location.buffer];
-        let pending = match buffer {
-            Buffer::Text(text)
-            | Buffer::Snapshot { text, .. }
-            | Buffer::PreviewText { text, .. } => text.pending_prompt(*id),
-            _ => None,
-        };
-        if pending != Some(*kind) {
-            self.prompt = None;
-            self.pending.clear();
+        let result = self.cancel_prompt_effects(&prompt);
+        if let Err(error) = &result
+            && self.prompt_target_exists(&prompt)
+        {
+            prompt.error = Some(format!("{error:#}"));
+            if let Some(help) = &mut self.help {
+                help.suspended = Some(prompt);
+            } else {
+                self.prompt = Some(prompt);
+            }
+        }
+        result
+    }
+
+    fn cancel_prompt_for_view(&mut self, view: ViewId) -> Result<()> {
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.target.view == view)
+        {
+            self.cancel_prompt()?;
+        }
+        if self
+            .help
+            .as_ref()
+            .and_then(|help| help.suspended.as_ref())
+            .is_some_and(|prompt| prompt.target.view == view)
+        {
+            self.cancel_suspended_prompt()?;
+        }
+        Ok(())
+    }
+
+    fn restore_prompt(&mut self, prompt: &Prompt) {
+        match &prompt.kind {
+            PromptKind::Text(kind) => {
+                if let Some(text) = self
+                    .buffers
+                    .get_mut(&prompt.target.buffer)
+                    .and_then(Buffer::text)
+                    && text.pending_prompt(prompt.target.view) == Some(*kind)
+                {
+                    text.cancel_pending_command(prompt.target.view);
+                }
+            }
+            PromptKind::DiffSearch(search) => {
+                if let Some(view) = self.views.get_mut(&prompt.target.view)
+                    && view.location.buffer == prompt.target.buffer
+                {
+                    search.restore(view);
+                }
+            }
+            PromptKind::Command | PromptKind::Filter(_) | PromptKind::MiniBuffer { .. } => {}
         }
     }
 
     fn active_prompt(&self) -> Option<&Prompt> {
         self.prompt
             .as_ref()
-            .filter(|prompt| prompt.view == self.focus)
+            .filter(|prompt| prompt.target.view == self.focus)
     }
 
     fn key_context(&self) -> (SmallVec<[&str; 4]>, &str) {
@@ -1146,6 +1561,22 @@ impl Session {
         }
     }
 
+    fn synchronize_key_sequence(&mut self) {
+        if self.key_sequence.keys().is_empty() {
+            return;
+        }
+        let mut sequence = std::mem::take(&mut self.key_sequence);
+        {
+            let (scopes, mode) = self.key_context();
+            if let Some(runtime) = &self.scripts {
+                sequence.synchronize(runtime, &scopes, mode);
+            } else {
+                sequence.clear();
+            }
+        }
+        self.key_sequence = sequence;
+    }
+
     fn handle_input(&mut self, key: &str) -> Result<()> {
         if matches!(self.views[&self.focus].register, RegisterInput::Selecting) {
             let key = if matches!(key, "space" | "Space") {
@@ -1178,9 +1609,6 @@ impl Session {
                 return self.text_input(key);
             }
         }
-        if self.pending.is_empty() {
-            self.key_state.reset();
-        }
         let digit = key
             .as_bytes()
             .first()
@@ -1188,30 +1616,27 @@ impl Session {
             .filter(|_| key.len() == 1)
             .filter(u8::is_ascii_digit)
             .map(|digit| digit - b'0');
-        let mut previous_state = self.key_state.clone();
         let match_key = if key == " " { "space" } else { key };
-        let mut key_state = std::mem::take(&mut self.key_state);
-        let (allows_count, resolution) = {
+        let mut sequence = std::mem::take(&mut self.key_sequence);
+        let (allows_count, resolution, previous_state) = {
             let (scopes, mode) = self.key_context();
-            let resolution = self
-                .scripts
-                .as_ref()
-                .context("plugin runtime unavailable")?
-                .advance_key(&mut key_state, &scopes, mode, match_key);
-            (matches!(mode, "normal" | "select"), resolution)
+            let (resolution, previous) = sequence.advance(
+                self.scripts
+                    .as_ref()
+                    .context("plugin runtime unavailable")?,
+                &scopes,
+                mode,
+                match_key,
+            );
+            (matches!(mode, "normal" | "select"), resolution, previous)
         };
-        self.key_state = key_state;
-        if !self.key_state.shares_context(&previous_state) {
-            self.pending.clear();
-            previous_state = self.key_state.clone();
-            previous_state.reset();
-        }
+        self.key_sequence = sequence;
         if self.help.is_none() && self.active_prompt().is_none() && allows_count {
             if let Some(digit) = digit {
                 let continuation = !self.command_count().is_empty();
                 let starts_count = digit != 0 && matches!(&resolution, KeyResolution::Unbound);
                 if continuation || starts_count {
-                    self.key_state = previous_state;
+                    self.key_sequence = previous_state;
                     let buffer = self.views[&self.focus].location.buffer;
                     if let Some(text) = self.buffers.get_mut(&buffer).and_then(Buffer::text) {
                         text.push_command_count(self.focus, digit);
@@ -1224,18 +1649,15 @@ impl Session {
         }
         match resolution {
             KeyResolution::Command(command) => {
-                self.pending.clear();
+                self.key_sequence.clear();
                 self.execute_command(&command, json!({}))
             }
-            KeyResolution::Prefix => {
-                self.pending.push(match_key.to_owned());
-                Ok(())
-            }
+            KeyResolution::Prefix => Ok(()),
             KeyResolution::Unbound => {
-                let was_pending = !self.pending.is_empty();
+                let was_pending = !previous_state.keys().is_empty();
                 self.views.get_mut(&self.focus).unwrap().register = RegisterInput::None;
                 self.views.get_mut(&self.focus).unwrap().count.clear();
-                self.pending.clear();
+                self.key_sequence.clear();
                 if was_pending {
                     self.cancel_text_command();
                     return Ok(());
@@ -1270,6 +1692,10 @@ impl Session {
     }
 
     fn text_effect(&mut self, effect: TextEffect) -> Result<()> {
+        self.text_effect_for(self.focus, effect)
+    }
+
+    fn text_effect_for(&mut self, origin: ViewId, effect: TextEffect) -> Result<()> {
         if let Some(text) = effect.clipboard {
             self.clipboard_writes.push(text);
         }
@@ -1277,13 +1703,19 @@ impl Session {
             self.primary_clipboard_writes.push(text);
         }
         if let Some(read) = effect.clipboard_read {
+            self.cancel_clipboard_read("clipboard read superseded");
             let id = self.id();
-            self.clipboard_read = Some((
+            let operation_id = self.current_operation.clone();
+            if let Some(operation_id) = &operation_id {
+                self.pending_operations.insert(operation_id.clone());
+            }
+            self.clipboard_read = Some(ClipboardReadRequest {
                 id,
-                self.focus,
-                self.views[&self.focus].location.buffer,
-                read,
-            ));
+                view: origin,
+                buffer: self.views[&origin].location.buffer,
+                operation: read,
+                operation_id,
+            });
         }
         if let Some(message) = effect.message {
             self.message = message;
@@ -1292,7 +1724,10 @@ impl Session {
             self.prompt = Some(Prompt {
                 kind: PromptKind::Text(prompt),
                 text: String::new(),
-                view: self.focus,
+                target: PromptTarget {
+                    view: origin,
+                    buffer: self.views[&origin].location.buffer,
+                },
                 completion: None,
                 error: None,
                 cursor: 0,
@@ -1302,6 +1737,21 @@ impl Session {
             self.refresh_context_plugins()?;
         }
         Ok(())
+    }
+
+    fn yank(&mut self, values: Vec<String>, register: char) -> Result<()> {
+        let count = values.len();
+        let clipboard = self.registers.write(register, values)?;
+        let mut effect = TextEffect {
+            message: Some(format!("yanked {count} selection(s)")),
+            ..TextEffect::default()
+        };
+        if register == '*' {
+            effect.primary_clipboard = clipboard;
+        } else {
+            effect.clipboard = clipboard;
+        }
+        self.text_effect(effect)
     }
 
     pub(crate) fn flush_clipboard_writes(
@@ -1335,7 +1785,7 @@ impl Session {
     pub(crate) fn clipboard_request(&self) -> Option<(u64, bool)> {
         self.clipboard_read
             .as_ref()
-            .map(|(id, _, _, read)| (*id, read.register == '*'))
+            .map(|request| (request.id, request.operation.register == '*'))
     }
 
     pub(crate) fn complete_clipboard_read(
@@ -1344,51 +1794,76 @@ impl Session {
         text: Option<String>,
         error: Option<String>,
     ) {
-        let Some((request, view, buffer, read)) = self.clipboard_read.take() else {
+        let Some(request) = self.clipboard_read.take() else {
             return;
         };
-        if request != id {
-            self.clipboard_read = Some((request, view, buffer, read));
+        if request.id != id {
+            self.clipboard_read = Some(request);
             return;
         }
-        if let Some(error) = error {
-            self.message = format!("clipboard: {error}");
-            return;
-        }
-        let Some(text) = text else {
-            self.message = "clipboard: no data returned".into();
-            return;
-        };
-        if self.focus != view
-            || self
-                .views
-                .get(&view)
-                .is_none_or(|current| current.location.buffer != buffer)
-        {
-            return;
-        }
-        let before = self.selection_snapshot();
-        let result = self
-            .buffers
-            .get_mut(&buffer)
-            .and_then(Buffer::text)
-            .context("clipboard buffer no longer exists")
-            .and_then(|buffer| buffer.complete_clipboard_read(view, read, text))
-            .and_then(|effect| self.text_effect(effect));
-        if let Err(error) = result {
-            self.message = format!("clipboard: {error:#}");
-        } else {
+        let ClipboardReadRequest {
+            view,
+            buffer,
+            operation: read,
+            operation_id,
+            ..
+        } = request;
+        let result = (|| -> Result<()> {
+            if let Some(error) = error {
+                bail!(error);
+            }
+            let text = text.context("no data returned")?;
+            anyhow::ensure!(
+                self.focus == view
+                    && self
+                        .views
+                        .get(&view)
+                        .is_some_and(|current| current.location.buffer == buffer),
+                "clipboard input context changed"
+            );
+            let before = self.selection_snapshot();
+            let effect = self
+                .buffers
+                .get_mut(&buffer)
+                .and_then(Buffer::text)
+                .context("clipboard buffer no longer exists")?
+                .complete_clipboard_read(view, read, text)?;
+            if let Err(error) = self.text_effect(effect) {
+                self.message = format!("clipboard applied; refresh: {error:#}");
+            }
             let after = self.selection_snapshot();
             if before != after
                 && let Err(error) = self.emit_event("selection-changed", after)
             {
                 self.message = format!("event: {error:#}");
             }
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            self.message = format!("clipboard: {error:#}");
+        }
+        if let Some(operation_id) = operation_id {
+            let outcome = match result {
+                Ok(()) => zess_protocol::CommandOutcome::Applied,
+                Err(error) => zess_protocol::CommandOutcome::Failed {
+                    message: format!("{error:#}"),
+                },
+            };
+            self.finish_operation(operation_id, outcome);
         }
     }
 
-    fn diff_hunk(&mut self, forward: bool) -> Result<()> {
-        self.move_diff(forward, true)
+    fn cancel_clipboard_read(&mut self, reason: &str) {
+        if let Some(request) = self.clipboard_read.take()
+            && let Some(operation_id) = request.operation_id
+        {
+            self.finish_operation(
+                operation_id,
+                zess_protocol::CommandOutcome::Failed {
+                    message: reason.into(),
+                },
+            );
+        }
     }
 
     fn prompt_input(&mut self, key: &str) -> Result<()> {
@@ -1409,7 +1884,7 @@ impl Session {
         {
             let query = prompt.query().is_some();
             let result = self.dispatch(
-                prompt.view,
+                prompt.target.view,
                 "minibuffer_changed",
                 json!({"purpose":purpose,"text":prompt.text}),
             );
@@ -1423,19 +1898,19 @@ impl Session {
         if let Some(prompt) = &self.prompt
             && let PromptKind::Text(kind) = &prompt.kind
         {
-            let buffer = self.views[&prompt.view].location.buffer;
+            let buffer = prompt.target.buffer;
             let effect = self
                 .buffers
                 .get_mut(&buffer)
                 .and_then(Buffer::text)
                 .context("prompt has no text buffer")?
-                .preview_prompt(prompt.view, *kind, &prompt.text)?;
+                .preview_prompt(prompt.target.view, *kind, &prompt.text)?;
             return self.text_effect(effect);
         }
         if let Some(prompt) = &self.prompt
             && let PromptKind::DiffSearch(search) = &prompt.kind
         {
-            let view = self.views.get_mut(&prompt.view).unwrap();
+            let view = self.views.get_mut(&prompt.target.view).unwrap();
             search.restore(view);
             if !prompt.text.is_empty() {
                 let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer] else {
@@ -1448,7 +1923,7 @@ impl Session {
                     search.forward,
                 )? {
                     view.location.diff_selection.set_head(Some(row));
-                    view.location.manual_viewport = false;
+                    view.location.scroll_mode = ScrollMode::FollowSelection;
                 }
             }
             return Ok(());
@@ -1456,7 +1931,7 @@ impl Session {
         if let Some(prompt) = &self.prompt
             && let PromptKind::Filter(kind) = prompt.kind
         {
-            let view = prompt.view;
+            let view = prompt.target.view;
             let query = Query {
                 kind,
                 text: prompt.text.clone(),
@@ -1497,6 +1972,9 @@ impl Session {
     }
 
     fn prompt_command(&mut self, command: PromptCommand) -> Result<()> {
+        if matches!(command, PromptCommand::Cancel) {
+            return self.cancel_prompt();
+        }
         let Some(mut prompt) = self.prompt.take() else {
             return Ok(());
         };
@@ -1511,34 +1989,12 @@ impl Session {
         };
         match command {
             PromptCommand::Cancel => {
-                if let PromptKind::MiniBuffer { purpose, .. } = &prompt.kind {
-                    return self.dispatch(
-                        prompt.view,
-                        "layer_result",
-                        json!({"purpose":purpose,"text":prompt.text,"cancelled":true}),
-                    );
-                }
-                if let PromptKind::DiffSearch(search) = &prompt.kind {
-                    if let Some(view) = self.views.get_mut(&prompt.view) {
-                        search.restore(view);
-                    }
-                } else if matches!(prompt.kind, PromptKind::Filter(_)) {
-                    self.set_mode(prompt.view, "normal")?;
-                } else if matches!(prompt.kind, PromptKind::Text(_)) {
-                    let buffer = self.views[&prompt.view].location.buffer;
-                    let text = self
-                        .buffers
-                        .get_mut(&buffer)
-                        .and_then(Buffer::text)
-                        .context("prompt has no text buffer")?;
-                    text.cancel_pending_command(prompt.view);
-                }
-                return Ok(());
+                unreachable!("cancellation is handled before taking the prompt")
             }
             PromptCommand::Submit => {
                 if let PromptKind::MiniBuffer { purpose, .. } = &prompt.kind {
                     let result = self.dispatch(
-                        prompt.view,
+                        prompt.target.view,
                         "layer_result",
                         json!({"purpose":purpose,"text":prompt.text,"cancelled":false}),
                     );
@@ -1564,13 +2020,13 @@ impl Session {
                         self.command(&command)?;
                     }
                     PromptKind::Text(kind) => {
-                        let buffer = self.views[&prompt.view].location.buffer;
+                        let buffer = prompt.target.buffer;
                         let effect = self
                             .buffers
                             .get_mut(&buffer)
                             .and_then(Buffer::text)
                             .context("prompt has no text buffer")?
-                            .submit_prompt(prompt.view, *kind, &prompt.text);
+                            .submit_prompt(prompt.target.view, *kind, &prompt.text);
                         let effect = match effect {
                             Ok(effect) => effect,
                             Err(error) => {
@@ -1582,7 +2038,7 @@ impl Session {
                         self.text_effect(effect)?;
                     }
                     PromptKind::DiffSearch(search) => {
-                        let view = self.views.get_mut(&prompt.view).unwrap();
+                        let view = self.views.get_mut(&prompt.target.view).unwrap();
                         let Buffer::PreviewDiff { diff, .. } = &self.buffers[&view.location.buffer]
                         else {
                             bail!("search requires a diff")
@@ -1596,7 +2052,7 @@ impl Session {
                             ) {
                                 Ok(Some(row)) => {
                                     view.location.diff_selection.set_head(Some(row));
-                                    view.location.manual_viewport = false;
+                                    view.location.scroll_mode = ScrollMode::FollowSelection;
                                 }
                                 Ok(None) => {}
                                 Err(error) => {
@@ -1608,7 +2064,7 @@ impl Session {
                         }
                         self.registers.set_search_pattern(prompt.text.clone());
                     }
-                    PromptKind::Filter(_) => self.set_mode(prompt.view, "normal")?,
+                    PromptKind::Filter(_) => self.set_mode(prompt.target.view, "normal")?,
                     PromptKind::MiniBuffer { .. } => unreachable!(),
                 }
                 return Ok(());
@@ -1687,7 +2143,7 @@ impl Session {
                     match &mut prompt.kind {
                         PromptKind::Filter(kind)
                         | PromptKind::MiniBuffer {
-                            query_kind: Some(kind),
+                            input: MiniBufferInput::Query(kind),
                             ..
                         } => *kind = next,
                         _ => unreachable!(),
@@ -1703,13 +2159,8 @@ impl Session {
     }
 
     fn set_mode(&mut self, view: ViewId, mode: &str) -> Result<()> {
-        if self
-            .prompt
-            .as_ref()
-            .is_some_and(|prompt| prompt.view == view)
-        {
-            self.cancel_input_context()?;
-        }
+        self.key_sequence.clear();
+        self.cancel_prompt_for_view(view)?;
         let buffer = self.views[&view].location.buffer;
         if let Some(text) = self.buffers.get_mut(&buffer).and_then(Buffer::text) {
             text.set_mode(view, mode)?;
@@ -1732,7 +2183,7 @@ impl Session {
                 kind: PromptKind::Filter(query.kind),
                 cursor: text.len(),
                 text,
-                view,
+                target: PromptTarget { view, buffer },
                 completion: None,
                 error: None,
             });
@@ -1744,17 +2195,11 @@ impl Session {
     }
 
     fn effective_view_options(&self, id: ViewId, kind: &str) -> Value {
-        let mut options = self
-            .scripts
-            .as_ref()
-            .map(|runtime| runtime.view_options(kind))
-            .unwrap_or_else(|| json!({}));
-        if let Some(local) = self.views[&id].location.options.as_object() {
-            for (name, value) in local {
-                options[name] = value.clone();
-            }
-        }
-        options
+        let overrides = &self.views[&id].location.options;
+        self.scripts.as_ref().map_or_else(
+            || Value::Object(overrides.as_object().cloned().unwrap_or_default()),
+            |runtime| runtime.view_options_with_overrides(kind, overrides.as_object()),
+        )
     }
 
     fn dispatch(&mut self, id: ViewId, event: &str, argument: Value) -> Result<()> {
@@ -1830,13 +2275,15 @@ impl Session {
             event: event.into(),
             argument,
             query: self
-                .prompt
-                .as_ref()
-                .filter(|prompt| prompt.view == id)
+                .prompts()
+                .find(|prompt| prompt.target.view == id && prompt.target.buffer == buffer)
                 .and_then(Prompt::query)
                 .map(|(kind, text)| Query {
                     kind,
                     text: text.to_owned(),
+                })
+                .or_else(|| {
+                    (event == "filter_changed").then(|| view.location.filter.query().clone())
                 }),
             options: self.effective_view_options(id, &kind),
             mode: view.location.mode.as_str().into(),
@@ -1858,7 +2305,12 @@ impl Session {
             .as_mut()
             .context("plugin runtime unavailable; fix configuration and :config-reload")?
             .dispatch(&kind, &input)?;
+        self.pending_operations.extend(output.pending_operations);
+        let mut completions = output.completed_operations;
         let view = self.views.get_mut(&id).unwrap();
+        if matches!(event, "init" | "view_entered") {
+            view.location.config_generation = Some(self.generation);
+        }
         let changed = output.changed;
         view.preview_area = preview_area;
         if let Buffer::Data { modified, .. } = self.buffers.get_mut(&buffer).unwrap() {
@@ -1885,7 +2337,15 @@ impl Session {
         }
         view.reconcile_selection();
         if let Some(queries) = output.watches {
-            self.observe_queries(id, queries)?;
+            if let Err(error) = self.observe_queries(id, queries) {
+                for completion in &mut completions {
+                    completion.result = zess_plugin::OperationResult::Failed {
+                        message: format!("{error:#}"),
+                    };
+                }
+                self.complete_operations(completions);
+                return Err(error);
+            }
         }
         for request in output.requests {
             if !self
@@ -1896,8 +2356,17 @@ impl Session {
                 break;
             }
 
-            self.request(id, request)?;
+            if let Err(error) = self.request(id, request) {
+                for completion in &mut completions {
+                    completion.result = zess_plugin::OperationResult::Failed {
+                        message: format!("{error:#}"),
+                    };
+                }
+                self.complete_operations(completions);
+                return Err(error);
+            }
         }
+        self.complete_operations(completions);
         if changed && propagate {
             let mut siblings = Vec::new();
             for (&other, view) in self.views.iter() {
@@ -1910,6 +2379,69 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn reinitialize_plugin_view(&mut self, id: ViewId) -> Result<()> {
+        let Some(view) = self.views.get_mut(&id) else {
+            return Ok(());
+        };
+        let buffer = view.location.buffer;
+        let Buffer::Data { argument, .. } = &self.buffers[&buffer] else {
+            return Ok(());
+        };
+        let argument = argument.clone();
+        let selection = view.location.selection.clone();
+        let filtered = !view.location.filter.is_empty();
+        if self.views.child(id).is_none() {
+            self.views.get_mut(&id).unwrap().location.memories.clear();
+        }
+        self.views.get_mut(&id).unwrap().location.mode = ViewMode::Normal;
+        self.dispatch(id, "init", argument)?;
+        if filtered
+            && self
+                .views
+                .get(&id)
+                .is_some_and(|view| view.location.buffer == buffer)
+        {
+            self.dispatch(id, "filter_changed", Value::Null)?;
+        }
+        if let Some(view) = self.views.get_mut(&id)
+            && view.location.buffer == buffer
+            && selection != view.location.selection
+            && view
+                .location
+                .display
+                .rows
+                .iter()
+                .any(|row| Some(&row.id) == selection.primary.as_ref())
+        {
+            view.location.selection = selection;
+            view.reconcile_selection();
+            self.dispatch(
+                id,
+                "select",
+                json!(SelectionChange {
+                    navigation: Some(ItemNavigation::Jump)
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn enter_plugin_view(&mut self, id: ViewId, argument: Value) -> Result<()> {
+        let location = &self.views[&id].location;
+        if location
+            .config_generation
+            .is_some_and(|generation| generation != self.generation)
+            && let Some(kind) = self.buffers[&location.buffer].plugin_kind()
+            && self
+                .scripts
+                .as_ref()
+                .is_some_and(|runtime| !runtime.is_native_buffer(kind))
+        {
+            return self.reinitialize_plugin_view(id);
+        }
+        self.dispatch(id, "view_entered", argument)
     }
 
     fn request(&mut self, view: ViewId, request: HostRequest) -> Result<()> {
@@ -1977,7 +2509,7 @@ impl Session {
                     bail!("source text buffer no longer exists");
                 }
                 let existing = self.views.iter().find_map(|(&id, view)| {
-                    if view.location.buffer != buffer_id || view.parent.is_some() {
+                    if view.location.buffer != buffer_id || self.views.parent(view.id).is_some() {
                         return None;
                     }
                     Some(id)
@@ -1997,29 +2529,19 @@ impl Session {
             }
             HostRequest::Message { text } => self.message = text,
             HostRequest::Yank { values, register } => {
-                let count = values.len();
                 let register = register.unwrap_or(match &self.views[&view].register {
                     RegisterInput::Selected(register) => *register,
                     RegisterInput::None | RegisterInput::Selecting => '"',
                 });
-                let clipboard = self.registers.write(register, values)?;
-                let mut effect = TextEffect {
-                    message: Some(format!("yanked {count} selection(s)")),
-                    ..TextEffect::default()
-                };
-                if register == '*' {
-                    effect.primary_clipboard = clipboard;
-                } else {
-                    effect.clipboard = clipboard;
-                }
-                self.text_effect(effect)?;
+                self.yank(values, register)?;
             }
             HostRequest::SetMode { mode } => self.set_mode(view, &mode)?,
             HostRequest::ConfigureView { options } => {
+                let kind = self.buffers[&self.views[&view].location.buffer].plugin_kind();
                 self.scripts
                     .as_ref()
                     .context("plugin runtime unavailable")?
-                    .validate_view_options_value(&options)?;
+                    .validate_view_options_value(kind, &options)?;
                 let Value::Object(options) = options else {
                     unreachable!("view options were validated as an object");
                 };
@@ -2035,7 +2557,7 @@ impl Session {
             HostRequest::OpenFile { path, line } => {
                 let path = self.plugin_file_path(&path)?;
                 let existing = self.views.iter().find_map(|(&id, view)| {
-                    if view.parent.is_some() {
+                    if self.views.parent(view.id).is_some() {
                         return None;
                     }
                     match &self.buffers[&view.location.buffer] {
@@ -2064,27 +2586,40 @@ impl Session {
                 presentation,
             } => self.open_worktree_source(view, path, line, presentation)?,
             HostRequest::FileLayer { path, line } => self.open_file_layer(view, &path, line)?,
-            HostRequest::OpenBuffer { kind, argument } => self.open_plugin(&kind, argument)?,
+            HostRequest::OpenBuffer { kind, argument } => {
+                self.open_plugin(view, &kind, argument)?
+            }
             HostRequest::Layer {
                 purpose,
                 text,
                 inline,
             } => {
-                if self.views[&view].layer.is_some() {
+                if self.views.child(view).is_some() {
                     bail!("view already has a layer");
                 }
                 self.focus_view(view)?;
-                let buffer = self.add_buffer(Buffer::Text(TextBuffer::new(&text)));
+                self.cancel_input_context()?;
+                let view = self.focus;
+                anyhow::ensure!(self.views.child(view).is_none(), "view already has a layer");
+                let text = TextBuffer::with_capabilities(
+                    &text,
+                    self.services.borrow().file_system(),
+                    self.syntax_provider.clone(),
+                );
+                let buffer = self.add_buffer(Buffer::Text(text));
                 let child = self.create_page(buffer);
-                let layer = self.views.get_mut(&child).unwrap();
-                layer.parent = Some(view);
-                layer.layer_content = Some(LayerContent::Draft { purpose });
-                layer.presentation = if inline {
-                    LayerPresentation::Inline
-                } else {
-                    LayerPresentation::Pane
-                };
-                self.views.get_mut(&view).unwrap().layer = Some(child);
+                self.views.attach_layer(
+                    child,
+                    LayerAttachment {
+                        parent: view,
+                        content: LayerContent::Draft { purpose },
+                        presentation: if inline {
+                            LayerPresentation::Inline
+                        } else {
+                            LayerPresentation::Pane
+                        },
+                    },
+                );
                 self.focus_view(child)?;
                 self.buffers
                     .get_mut(&buffer)
@@ -2097,24 +2632,31 @@ impl Session {
                 text,
                 key_scope,
             } => {
-                let query_kind = if purpose == "find" {
-                    Some(QueryKind::Plain)
+                anyhow::ensure!(
+                    view == self.focus,
+                    "minibuffer input requires the focused view"
+                );
+                let input = if purpose == "find" {
+                    MiniBufferInput::Query(QueryKind::Plain)
                 } else {
-                    None
+                    MiniBufferInput::Text
                 };
                 self.prompt = Some(Prompt {
                     kind: PromptKind::MiniBuffer {
                         purpose,
                         key_scope,
-                        query_kind,
+                        input,
                     },
                     cursor: text.len(),
                     text,
-                    view,
+                    target: PromptTarget {
+                        view,
+                        buffer: self.views[&view].location.buffer,
+                    },
                     completion: None,
                     error: None,
                 });
-                self.pending.clear();
+                self.key_sequence.clear();
             }
             HostRequest::Preview {
                 path,
@@ -2122,30 +2664,32 @@ impl Session {
                 focus,
             } => self.show_preview(page, path, content, focus)?,
             HostRequest::Close => {
-                self.focus_view(view)?;
-                self.close_view(false)?;
+                self.close_view_from(view, false)?;
             }
         }
         Ok(())
     }
 
-    fn open_plugin(&mut self, kind: &str, argument: Value) -> Result<()> {
-        if self.views.page(self.focus).navigation.root_kind.as_deref() == Some(kind)
+    fn open_plugin(&mut self, origin: ViewId, kind: &str, argument: Value) -> Result<()> {
+        if self.views.page(origin).navigation.root_kind.as_deref() == Some(kind)
             && (argument.is_null() || argument.as_object().is_some_and(serde_json::Map::is_empty))
         {
             return Ok(());
         }
-        let text_source = self.plugin_text_source(kind, self.views[&self.focus].location.buffer)?;
-        let source = self.preview_source(self.focus).unwrap_or(self.focus);
-        self.focus_view(source)?;
-        self.open_plugin_navigation(kind, argument, text_source)
+        let text_source = self.plugin_text_source(kind, self.views[&origin].location.buffer)?;
+        let source = self.preview_source(origin).unwrap_or(origin);
+        if origin == self.focus && source != origin {
+            self.focus_view(source)?;
+        }
+        self.open_plugin_navigation(source, kind, argument, text_source)
     }
 
-    fn split(&mut self, axis: Axis) -> Result<()> {
-        if self.help.is_some() {
+    fn split(&mut self, origin: ViewId, axis: Axis) -> Result<()> {
+        if self.help.as_ref().is_some_and(|help| help.view == origin) {
             return self.help_command(HelpCommand::Pin);
         }
-        let source = self.focus;
+        self.ensure_buffer_switch_allowed(origin)?;
+        let source = origin;
         self.ensure_buffer_switch_allowed(source)?;
         let location = self.views[&source].location.clone();
         let buffer = location.buffer;
@@ -2180,14 +2724,14 @@ impl Session {
             .collect::<Vec<_>>();
         let mut root = self.focus;
         while !leaves.contains(&root)
-            && let Some(parent) = self.views[&root].parent
+            && let Some(parent) = self.views.parent(root)
         {
             root = parent;
         }
         let current = leaves.iter().position(|id| *id == root).unwrap_or(0);
         let mut target =
             leaves[(current as isize + delta).rem_euclid(leaves.len() as isize) as usize];
-        while let Some(layer) = self.views[&target].layer {
+        while let Some(layer) = self.views.child(target) {
             target = layer;
         }
         self.focus_view(target)?;
@@ -2206,7 +2750,7 @@ impl Session {
             .collect::<Vec<_>>();
         let mut root = self.focus;
         while !rectangles.iter().any(|(id, _)| *id == root)
-            && let Some(parent) = self.views[&root].parent
+            && let Some(parent) = self.views.parent(root)
         {
             root = parent;
         }
@@ -2246,7 +2790,7 @@ impl Session {
             })
             .map(|(id, _)| *id);
         if let Some(mut target) = target {
-            while let Some(layer) = self.views[&target].layer {
+            while let Some(layer) = self.views.child(target) {
                 target = layer;
             }
             self.focus_view(target)?;
@@ -2260,52 +2804,62 @@ impl Session {
             return self.help_command(HelpCommand::Close);
         }
         let page = self.views.page_id(self.focus);
+        if let Some(mut child) = self.views.layer_in_page(page) {
+            while let Some(next) = self.views.child(child) {
+                child = next;
+            }
+            self.focus_view(child)?;
+            return self.close_view(force);
+        }
         let id = self.views.main(page);
         if self.close_plugin_navigation(page, force)? {
+            return Ok(());
+        }
+        let buffer = self.views[&id].location.buffer;
+        if self.views.parent(id).is_none()
+            && self.projected_client_workspace().buffers.contains(&buffer)
+        {
+            let action_id = self.id();
+            self.client_actions.push(zess_protocol::ClientAction {
+                id: action_id,
+                kind: zess_protocol::ClientActionKind::Close {
+                    buffer_id: buffer,
+                    force,
+                },
+            });
             return Ok(());
         }
         let return_to = self.views[&id]
             .return_to
             .and_then(|target| self.views.resolve_focus(target))
             .map(|mut target| {
-                while let Some(parent) = self.views.get(&target).and_then(|view| view.parent) {
+                while let Some(parent) = self.views.parent(target) {
                     target = parent;
                 }
                 target
             });
         let view = &self.views[&id];
-        if (view.parent.is_none() || matches!(view.layer_content, Some(LayerContent::File)))
+        if (self.views.parent(view.id).is_none()
+            || matches!(self.views.layer_content(view.id), Some(LayerContent::File)))
             && !force
             && matches!(&self.buffers[&view.location.buffer], Buffer::Text(text) if text.modified())
         {
             bail!("unsaved buffer; :w or :q!");
         }
-        if view.parent.is_none() {
-            let mut leaves = Vec::new();
-            self.layout.as_ref().unwrap().leaves(&mut leaves);
-            if leaves == [page] {
-                if !force && self.modified() {
-                    bail!("unsaved buffers; :w or :q!");
-                }
-                self.leave_page(page)?;
-                self.exiting = true;
-                return Ok(());
-            }
-        }
         self.leave_page(page)?;
         let view = &self.views[&id];
         let buffer = view.location.buffer;
-        if let Some(parent) = view.parent {
-            if matches!(view.layer_content, Some(LayerContent::File)) {
-                self.retire_page(page);
+        if let Some(parent) = self.views.parent(view.id) {
+            if matches!(self.views.layer_content(view.id), Some(LayerContent::File)) {
+                self.views.detach_layer(id);
+                self.retire_page(page)?;
                 self.remove_file_watch(buffer);
                 self.buffers.remove(&buffer);
-                self.views.get_mut(&parent).unwrap().layer = None;
                 self.activate_view(parent);
                 self.remember_text();
                 return Ok(());
             }
-            let purpose = match &view.layer_content {
+            let purpose = match &self.views.layer_content(view.id) {
                 Some(LayerContent::Draft { purpose }) => purpose.clone(),
                 _ => unreachable!("a draft layer must have a purpose"),
             };
@@ -2332,17 +2886,20 @@ impl Session {
                     "plugin runtime unavailable; draft retained in the layer until :config-reload succeeds"
                 );
             }
-            self.retire_page(page);
+            self.views.detach_layer(id);
+            self.retire_page(page)?;
             self.remove_file_watch(buffer);
             self.buffers.remove(&buffer);
-            self.views.get_mut(&parent).unwrap().layer = None;
             self.activate_view(parent);
             return Ok(());
         }
-        self.retire_page(page);
+        self.retire_page(page)?;
         self.layout = self.layout.take().and_then(|layout| layout.remove(page));
         if self.layout.is_none() {
-            let buffer = self.add_buffer(Buffer::Text(TextBuffer::new("")));
+            let buffer = self
+                .projected_client_workspace()
+                .current
+                .context("no workspace buffer to display")?;
             self.add_initial_view(buffer);
         } else {
             let mut leaves = Vec::new();
@@ -2352,12 +2909,147 @@ impl Session {
                     self.views.contains_key(id) && leaves.contains(&self.views.page_id(*id))
                 })
                 .unwrap_or_else(|| self.first_layout_view());
-            while let Some(layer) = self.views[&focus].layer {
+            while let Some(layer) = self.views.child(focus) {
                 focus = layer;
             }
             self.activate_view(focus);
             self.remember_text();
         }
+        Ok(())
+    }
+
+    fn close_view_from(&mut self, origin: ViewId, force: bool) -> Result<()> {
+        if origin == self.focus {
+            return self.close_view(force);
+        }
+        let page = self.views.page_id(origin);
+        if self.close_plugin_navigation(page, force)? {
+            return Ok(());
+        }
+        let buffer = self.views[&origin].location.buffer;
+        anyhow::ensure!(
+            self.projected_client_workspace().buffers.contains(&buffer),
+            "view is not a workspace buffer"
+        );
+        let id = self.id();
+        self.client_actions.push(zess_protocol::ClientAction {
+            id,
+            kind: zess_protocol::ClientActionKind::Close {
+                buffer_id: buffer,
+                force,
+            },
+        });
+        Ok(())
+    }
+
+    fn close_client_buffer(
+        &mut self,
+        action_id: u64,
+        buffer: BufferId,
+        replacement: Option<BufferId>,
+        force: bool,
+    ) -> Result<BufferId> {
+        let index = self
+            .client_actions
+            .iter()
+            .position(|action| {
+                action.id == action_id
+                    && action.kind
+                        == (zess_protocol::ClientActionKind::Close {
+                            buffer_id: buffer,
+                            force,
+                        })
+            })
+            .context("close request is no longer pending")?;
+        self.client_actions.remove(index);
+        anyhow::ensure!(
+            self.client_workspace.buffers.contains(&buffer),
+            "buffer is no longer in the workspace"
+        );
+        if !force
+            && match self.buffers.get(&buffer) {
+                Some(Buffer::Text(text)) => text.modified(),
+                Some(Buffer::Data { modified, .. }) => *modified,
+                _ => false,
+            }
+        {
+            bail!("unsaved buffer; :w or :q!");
+        }
+        let replacement = match replacement {
+            Some(id) => {
+                anyhow::ensure!(
+                    id != buffer && self.client_workspace.buffers.contains(&id),
+                    "replacement buffer is not in the workspace"
+                );
+                id
+            }
+            None => {
+                anyhow::ensure!(
+                    self.client_workspace.buffers.len() == 1,
+                    "replacement buffer is required"
+                );
+                let text = TextBuffer::with_capabilities(
+                    "",
+                    self.services.borrow().file_system(),
+                    self.syntax_provider.clone(),
+                );
+                let id = self.add_buffer(Buffer::Text(text));
+                self.client_workspace.buffers.push(id);
+                id
+            }
+        };
+        let views: Vec<_> = self
+            .views
+            .values()
+            .filter(|view| {
+                view.location.buffer == buffer
+                    && self.views.parent(view.id).is_none()
+                    && self.views.main(self.views.page_id(view.id)) == view.id
+            })
+            .map(|view| view.id)
+            .collect();
+        for view in views {
+            self.focus_view(view)?;
+            self.switch_buffer(replacement)?;
+        }
+        let pages: Vec<_> = self.views.pages().map(|page| page.main.id).collect();
+        for page in pages {
+            self.views
+                .navigation_mut(page)
+                .replace_buffer(buffer, replacement);
+        }
+        let text_replacement =
+            matches!(self.buffers.get(&replacement), Some(Buffer::Text(_))).then_some(replacement);
+        for value in self.buffers.values_mut() {
+            if let Buffer::Data { text_source, .. } = value
+                && *text_source == Some(buffer)
+            {
+                *text_source = text_replacement;
+            }
+        }
+        self.client_workspace.buffers.retain(|id| *id != buffer);
+        self.client_workspace.current = Some(replacement);
+        self.client_actions.retain(|action| !matches!(action.kind, zess_protocol::ClientActionKind::Close { buffer_id, .. } if buffer_id == buffer));
+        if self.last_text == Some(buffer) {
+            self.last_text = text_replacement;
+        }
+        self.remove_file_watch(buffer);
+        self.buffers.remove(&buffer);
+        Ok(replacement)
+    }
+
+    fn projected_client_workspace(&self) -> zess_protocol::ClientWorkspace {
+        let mut workspace = self.client_workspace.clone();
+        for action in &self.client_actions {
+            workspace.apply(&action.kind);
+        }
+        workspace
+    }
+
+    fn client_exit(&mut self, action_id: u64, buffer: BufferId) -> Result<()> {
+        let index = self.client_actions.iter().position(|action| action.id == action_id && matches!(action.kind, zess_protocol::ClientActionKind::Close { buffer_id, .. } if buffer_id == buffer)).context("quit request is no longer pending")?;
+        self.client_actions.remove(index);
+        self.client_actions.retain(|action| !matches!(action.kind, zess_protocol::ClientActionKind::Close { buffer_id, .. } if buffer_id == buffer));
         Ok(())
     }
 
@@ -2381,14 +3073,23 @@ impl Session {
         Ok(())
     }
 
+    fn plugin_buffers(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.buffers.values().filter_map(|buffer| match buffer {
+            Buffer::Data { kind, modified, .. } => Some((kind.as_str(), *modified)),
+            _ => None,
+        })
+    }
+
     fn build_runtime(&self, with_config: bool) -> Result<ScriptRuntime> {
         let host = RuntimeHost {
             services: self.services.clone(),
             jobs: RefCell::new(HashSet::new()),
         };
-        let mut runtime = ScriptRuntime::with_identities(
+        let mut runtime = ScriptRuntime::with_capabilities(
             move |operation, argument| host.call(&operation, argument),
             self.identities.clone(),
+            self.services.borrow().file_system(),
+            self.script_compiler.clone(),
         )?;
         for (id, description) in commands::command_infos() {
             runtime.register_native_action(id, description);
@@ -2409,8 +3110,44 @@ impl Session {
         }
         runtime.validate_bindings()?;
         runtime.validate_view_options()?;
-        for view in self.views.values() {
-            runtime.validate_view_options_value(&view.location.options)?;
+        runtime.validate_statusline_layouts()?;
+        for (kind, modified) in self.plugin_buffers() {
+            if !runtime.has_buffer_kind(kind) {
+                bail!(
+                    "configuration removes the {kind} buffer plugin; close its pages before reloading"
+                );
+            }
+            if let Some(current) = &self.scripts
+                && (current.is_native_buffer(kind) || runtime.is_native_buffer(kind))
+                && !current.shares_native_buffer(&runtime, kind)
+            {
+                if modified {
+                    bail!(
+                        "save or undo pending {kind} buffer changes, then close its pages before switching plugins"
+                    );
+                }
+                bail!(
+                    "configuration changes the {kind} buffer plugin; close its pages before reloading"
+                );
+            }
+        }
+        let locations = self.views.values().map(|view| &view.location).chain(
+            self.views
+                .pages()
+                .flat_map(|page| page.navigation.locations()),
+        );
+        for location in locations {
+            let kind = self.buffers[&location.buffer].plugin_kind();
+            if let Some(kind) = kind {
+                let overrides = location
+                    .options
+                    .as_object()
+                    .context("view options must be an object")?;
+                let options = runtime.view_options_with_overrides(kind, Some(overrides));
+                runtime.validate_view_options_value(Some(kind), &options)?;
+            } else {
+                runtime.validate_view_options_value(None, &location.options)?;
+            }
         }
         let mut modes = vec![
             "normal".to_owned(),
@@ -2439,38 +3176,19 @@ impl Session {
         Ok(runtime)
     }
 
-    fn reload(&mut self) -> bool {
-        match self.build_runtime(true) {
-            Ok(runtime) => {
-                self.invalidate_mouse();
-                self.scripts = Some(runtime);
-                self.generation += 1;
-                self.pending.clear();
-                self.close_help_overlay();
-                self.refresh_help_buffers();
-                for view in self.views.values_mut() {
-                    view.wake_at = None;
-                    view.observations.clear();
-                }
-                self.message = "user plugins reloaded".into();
-                true
-            }
-            Err(error) => {
-                if self.scripts.is_none() {
-                    match self.build_runtime(false) {
-                        Ok(runtime) => self.scripts = Some(runtime),
-                        Err(default_error) => {
-                            self.message = format!(
-                                "defaults failed: {default_error:#}; reload failed: {error:#}"
-                            );
-                            return false;
-                        }
-                    }
-                }
-                self.message = format!("reload failed: {error:#}");
-                false
-            }
+    fn reload(&mut self) -> Result<()> {
+        let runtime = self.build_runtime(true).context("reload failed")?;
+        self.close_help_overlay().context("reload failed")?;
+        self.invalidate_mouse();
+        self.scripts = Some(runtime);
+        self.generation += 1;
+        self.key_sequence.clear();
+        self.refresh_help_buffers();
+        for view in self.views.values_mut() {
+            view.wake_at = None;
+            view.observations.clear();
         }
+        Ok(())
     }
 
     pub fn command(&mut self, command: &str) -> Result<()> {
@@ -2506,7 +3224,12 @@ impl Session {
             Ok(match result {
                 CommandOutput::Request(HostRequest::Action { name, argument }) => {
                     let action = NativeAction::resolve(&name)?;
-                    if !matches!(action, NativeAction::Text(_) | NativeAction::Prompt(_)) {
+                    if !matches!(
+                        action,
+                        NativeAction::Text(_)
+                            | NativeAction::Prompt(_)
+                            | NativeAction::Editor(commands::EditorCommand::Help)
+                    ) {
                         self.cancel_text_command();
                     }
                     self.native_command(self.focus, action, argument)?;
@@ -2539,7 +3262,11 @@ impl Session {
     }
 
     pub fn frame(&mut self) -> Frame {
-        self.invalidate_text_prompt();
+        self.presentation_regions.clear();
+        if let Err(error) = self.invalidate_prompt() {
+            self.message = format!("prompt: {error:#}");
+        }
+        self.synchronize_key_sequence();
         let previous_regions = std::mem::take(&mut self.mouse_regions);
         let previous_command_mouse = self.command_mouse.take();
         let width = usize::from(self.width);
@@ -2597,7 +3324,7 @@ impl Session {
             .active_prompt()
             .is_some_and(|prompt| !matches!(prompt.kind, PromptKind::Command))
         {
-            self.mouse_regions.clear();
+            self.presentation_regions = std::mem::take(&mut self.mouse_regions);
         }
         if self.mouse_regions.len() != previous_regions.len()
             || self
@@ -2645,7 +3372,9 @@ impl Session {
                 style: "error".into(),
             }];
         }
-        if (self.help.is_some() && self.active_prompt().is_none()) || !self.pending.is_empty() {
+        if (self.help.is_some() && self.active_prompt().is_none())
+            || !self.key_sequence.keys().is_empty()
+        {
             cursor = None;
         }
         let mut styles = self.services.borrow().git_styles();

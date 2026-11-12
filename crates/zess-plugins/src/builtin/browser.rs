@@ -11,7 +11,7 @@ use super::{
     schedule::{NavigationDebounce, QueryState},
 };
 use zess_plugin::PluginRegistrar;
-use zess_services::{DirectoryEntryKind, QueryPoll, QueryRequest, QueryResult};
+use zess_services::{DirectoryEntryKind, QueryPoll, QueryRequest, QueryResult, StatusProgress};
 
 #[cfg(test)]
 mod tests;
@@ -41,7 +41,7 @@ impl Task {
         }
     }
 
-    pub(super) fn status_progress(&mut self) -> Result<Option<Vec<zess_git::GitEntry>>> {
+    pub(super) fn status_progress(&mut self) -> Result<Option<StatusProgress>> {
         let Some(handle) = self.handle else {
             return Ok(None);
         };
@@ -497,23 +497,35 @@ impl Browser {
 
 fn decode_preview(value: QueryResult) -> Result<PreviewContent> {
     Ok(match value {
-        QueryResult::Directory { entries, .. } => PreviewContent::Directory {
-            column_alignment: Default::default(),
-            rows: entries
-                .into_iter()
-                .map(|entry| DisplayRow {
-                    id: entry.path,
-                    text: entry.name,
-                    style: if entry.kind == DirectoryEntryKind::Directory {
-                        "directory".into()
-                    } else {
-                        String::new()
-                    },
-                    depth: 0,
+        QueryResult::Directory {
+            entries,
+            path_warning,
+            ..
+        } => {
+            let mut rows = Vec::new();
+            if let Some(text) = path_warning {
+                rows.push(DisplayRow {
+                    text,
+                    style: "warning".into(),
                     ..DisplayRow::default()
-                })
-                .collect(),
-        },
+                });
+            }
+            rows.extend(entries.into_iter().map(|entry| DisplayRow {
+                id: entry.path,
+                text: entry.name,
+                style: if entry.kind == DirectoryEntryKind::Directory {
+                    "directory".into()
+                } else {
+                    String::new()
+                },
+                depth: 0,
+                ..DisplayRow::default()
+            }));
+            PreviewContent::Directory {
+                rows,
+                column_alignment: Default::default(),
+            }
+        }
         QueryResult::Snapshot { snapshot } => PreviewContent::Snapshot { snapshot },
         QueryResult::Unsupported { message } => PreviewContent::Unsupported { message },
         QueryResult::Text {

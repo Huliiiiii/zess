@@ -111,7 +111,11 @@ fn a_digit_in_a_pending_key_sequence_remains_a_binding() {
         "{}",
         input.trace()
     );
-    assert!(input.session.pending.is_empty(), "{}", input.trace());
+    assert!(
+        input.session.key_sequence.keys().is_empty(),
+        "{}",
+        input.trace()
+    );
     input.assert_state(TextState {
         source: "abc".into(),
         mode: TextMode::Normal,

@@ -11,15 +11,6 @@ use super::{Event, Services, Task, browser, message};
 #[cfg(test)]
 mod tests;
 
-pub(super) fn enabled(options: &serde_json::Value) -> Result<bool> {
-    match options.get("git-status") {
-        None => Ok(true),
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| anyhow::anyhow!("git-status must be a boolean")),
-    }
-}
-
 #[derive(Default)]
 enum State {
     #[default]
@@ -75,7 +66,15 @@ impl GitStatus {
         }
         if let State::Loading(task) = &mut self.state {
             match task.poll() {
-                Ok(Some(QueryResult::GitDecorations { entries })) => {
+                Ok(Some(QueryResult::GitDecorations {
+                    entries,
+                    path_warning,
+                })) => {
+                    if let Some(warning) = path_warning {
+                        output
+                            .requests
+                            .push(message(&format!("Git status: {warning}")));
+                    }
                     self.entries.clear();
                     self.directories.clear();
                     for entry in entries {

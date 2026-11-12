@@ -14,13 +14,18 @@ fn pane_rows(session: &Session, source: ViewId, name: &str) -> Vec<DisplayRow> {
         .view()
         .unwrap()
         .id;
-    let Buffer::PreviewRows {
-        kind: PreviewRowKind::Content,
-        display,
-        ..
-    } = &session.buffers[&session.views[&target].location.buffer]
-    else {
-        panic!("expected structured history pane")
+    let display = match &session.buffers[&session.views[&target].location.buffer] {
+        Buffer::PreviewRows {
+            kind: PreviewRowKind::Content,
+            display,
+            ..
+        }
+        | Buffer::Items {
+            role: ItemsRole::Preview,
+            display,
+            ..
+        } => display,
+        _ => panic!("expected structured history pane"),
     };
     display.rows.clone()
 }
@@ -35,6 +40,99 @@ fn commit_info(fixture: &Fixture, oid: &str) -> String {
             oid,
         ],
     )
+}
+
+#[test]
+fn history_file_selection_survives_republication_and_tracks_the_focused_row() {
+    let fixture = Fixture::new();
+    git(&fixture, &["init", "--quiet"]);
+    for name in ["one", "two"] {
+        fs::write(fixture.0.join(name), "content\n").unwrap();
+    }
+    git(&fixture, &["add", "."]);
+    git(&fixture, &["commit", "--quiet", "-m", "files"]);
+    let mut session = fixture.session(&[]);
+    session.command("git").unwrap();
+    session.command("git.page-history").unwrap();
+    settle(&mut session);
+    let source = session.focus;
+    let target = session
+        .views
+        .page(source)
+        .previews
+        .as_ref()
+        .unwrap()
+        .members[1]
+        .view()
+        .unwrap()
+        .id;
+    session.focus_view(target).unwrap();
+    assert_eq!(
+        session.views[&target].location.selection.primary.as_deref(),
+        Some("one")
+    );
+    session.input("j");
+    assert_eq!(
+        session.views[&target].location.selection.primary.as_deref(),
+        Some("two")
+    );
+    session.dispatch(source, "preview", Value::Null).unwrap();
+    settle(&mut session);
+    assert_eq!(session.focus, target);
+    assert_eq!(
+        session.views[&target].location.selection.primary.as_deref(),
+        Some("two")
+    );
+    let (rows, _) = session.render_view(target, 60, 10);
+    assert!(
+        rows.iter()
+            .flat_map(|row| &row.spans)
+            .any(|span| span.text.contains("two") && span.style.starts_with("selection."))
+    );
+}
+
+#[test]
+fn changing_commits_starts_the_file_selection_at_the_first_file() {
+    let fixture = Fixture::new();
+    git(&fixture, &["init", "--quiet"]);
+    for name in ["one", "two"] {
+        fs::write(fixture.0.join(name), "first\n").unwrap();
+    }
+    git(&fixture, &["add", "."]);
+    git(&fixture, &["commit", "--quiet", "-m", "first"]);
+    for name in ["one", "two"] {
+        fs::write(fixture.0.join(name), "second\n").unwrap();
+    }
+    git(&fixture, &["add", "."]);
+    git(&fixture, &["commit", "--quiet", "-m", "second"]);
+    let mut session = fixture.session(&[]);
+    session.command("git").unwrap();
+    session.command("git.page-history").unwrap();
+    settle(&mut session);
+    let source = session.focus;
+    let target = session
+        .views
+        .page(source)
+        .previews
+        .as_ref()
+        .unwrap()
+        .members[1]
+        .view()
+        .unwrap()
+        .id;
+    session.focus_view(target).unwrap();
+    session.input("j");
+    assert_eq!(
+        session.views[&target].location.selection.primary.as_deref(),
+        Some("two")
+    );
+    session.focus_view(source).unwrap();
+    session.input("j");
+    settle(&mut session);
+    assert_eq!(
+        session.views[&target].location.selection.primary.as_deref(),
+        Some("one")
+    );
 }
 
 #[test]

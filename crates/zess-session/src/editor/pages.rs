@@ -157,9 +157,55 @@ impl Page {
 pub(super) struct Store {
     pages: BTreeMap<PageId, Page>,
     locations: HashMap<ViewId, PageId>,
+    attachments: BTreeMap<ViewId, LayerAttachment>,
 }
 
 impl Store {
+    pub(super) fn parent(&self, child: ViewId) -> Option<ViewId> {
+        self.attachments.get(&child).map(|layer| layer.parent)
+    }
+
+    pub(super) fn child(&self, parent: ViewId) -> Option<ViewId> {
+        self.attachments
+            .iter()
+            .find_map(|(&child, layer)| (layer.parent == parent).then_some(child))
+    }
+
+    pub(super) fn layer_content(&self, child: ViewId) -> Option<&LayerContent> {
+        self.attachments.get(&child).map(|layer| &layer.content)
+    }
+
+    pub(super) fn presentation(&self, child: ViewId) -> LayerPresentation {
+        self.attachments
+            .get(&child)
+            .map_or(LayerPresentation::Pane, |layer| layer.presentation)
+    }
+
+    pub(super) fn attach_layer(&mut self, child: ViewId, attachment: LayerAttachment) {
+        assert!(self.child(attachment.parent).is_none());
+        assert!(!self.attachments.contains_key(&child));
+        self.attachments.insert(child, attachment);
+    }
+
+    pub(super) fn detach_layer(&mut self, child: ViewId) -> Option<LayerAttachment> {
+        self.attachments.remove(&child)
+    }
+
+    pub(super) fn reparent_layer(&mut self, child: ViewId, parent: ViewId) {
+        assert!(self.child(parent).is_none());
+        self.attachments
+            .get_mut(&child)
+            .expect("layer has a parent")
+            .parent = parent;
+    }
+
+    pub(super) fn layer_in_page(&self, page: PageId) -> Option<ViewId> {
+        self.pages
+            .get(&page)?
+            .views()
+            .find_map(|(id, _)| self.child(*id))
+    }
+
     pub(super) fn create_page(&mut self, view: View) -> PageId {
         let id = view.id;
         let page = PageId(id);
@@ -411,7 +457,19 @@ impl Session {
         id
     }
 
+    pub(super) fn reparent_layer_to_source(&mut self, child: ViewId, source: ViewId) {
+        let mut parent = source;
+        while let Some(layer) = self.views.child(parent) {
+            parent = layer;
+        }
+        self.views.reparent_layer(child, parent);
+    }
+
     pub(super) fn retire_view(&mut self, id: ViewId, view: View) {
+        self.views.detach_layer(id);
+        if let Err(error) = self.cancel_prompt_for_view(id) {
+            self.message = format!("prompt: {error:#}");
+        }
         self.cancel_diff_source(Some(id));
         for buffer in self.buffers.values_mut() {
             if let Some(text) = buffer.text() {
@@ -428,20 +486,43 @@ impl Session {
         let mut pages = Vec::new();
         self.layout.as_ref().unwrap().leaves(&mut pages);
         let mut view = self.views.main(pages[0]);
-        while let Some(layer) = self.views[&view].layer {
+        while let Some(layer) = self.views.child(view) {
             view = layer;
         }
         view
     }
 
     pub(super) fn leave_page(&mut self, page: PageId) -> Result<()> {
-        self.cancel_input_context()?;
+        if self.views.page_id(self.focus) == page {
+            self.cancel_input_context()?;
+        } else {
+            let targets = self
+                .prompts()
+                .map(|prompt| prompt.target.view)
+                .filter(|view| self.views.contains_key(view) && self.views.page_id(*view) == page)
+                .collect::<Vec<_>>();
+            for view in targets {
+                self.cancel_prompt_for_view(view)?;
+            }
+        }
         let main = self.views.main(page);
         self.dispatch(main, "view_leaving", Value::Null)?;
         self.close_preview(page)
     }
 
-    pub(super) fn retire_page(&mut self, page: PageId) {
+    pub(super) fn retire_page(&mut self, page: PageId) -> Result<()> {
+        let targets = self
+            .prompts()
+            .map(|prompt| prompt.target.view)
+            .filter(|view| self.views.contains_key(view) && self.views.page_id(*view) == page)
+            .collect::<Vec<_>>();
+        for view in targets {
+            self.cancel_prompt_for_view(view)?;
+        }
+        anyhow::ensure!(
+            self.views.layer_in_page(page).is_none(),
+            "close attached layers before retiring their page"
+        );
         let page = self.views.take_page(page);
         let buffers = page
             .previews
@@ -455,5 +536,6 @@ impl Session {
         for buffer in buffers {
             self.remove_unused_preview_buffer(buffer);
         }
+        Ok(())
     }
 }

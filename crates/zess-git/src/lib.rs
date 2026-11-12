@@ -109,6 +109,12 @@ pub struct GitEntry {
     pub line_stats: Option<LineStats>,
 }
 
+pub struct WorktreeStatus {
+    pub entries: Vec<GitEntry>,
+    pub path_warning: Option<String>,
+    pub line_count_error: Option<anyhow::Error>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct LineStats {
     pub additions: u64,
@@ -196,6 +202,25 @@ impl CommitFile {
             additions: self.additions?,
             deletions: self.deletions?,
         })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CommitFileList {
+    pub files: Vec<CommitFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_count_error: Option<String>,
+}
+
+fn path_warning(skipped: usize) -> Option<String> {
+    match skipped {
+        0 => None,
+        1 => Some("Skipped 1 Git entry with a non-UTF-8 path".into()),
+        _ => Some(format!(
+            "Skipped {skipped} Git entries with non-UTF-8 paths"
+        )),
     }
 }
 
@@ -314,11 +339,11 @@ impl Repository {
         Ok(commits)
     }
 
-    pub fn commit_files(
+    pub fn commit_file_list(
         &self,
         commit: &str,
         cancellation: &impl Execution,
-    ) -> Result<Vec<CommitFile>> {
+    ) -> Result<CommitFileList> {
         let oid = commit_oid(commit)?;
         let parent = self.commit_parent(oid, cancellation)?;
         let output = self.commit_diff_output(
@@ -328,38 +353,89 @@ impl Repository {
             &["."],
             cancellation,
         )?;
-        let mut counts = self.queries.commit_counts(&self.root, oid, cancellation)?;
         let mut fields = output
             .split(|byte| *byte == 0)
             .filter(|field| !field.is_empty());
         let prefix = self.git_checked(&["rev-parse", "--show-prefix"], cancellation)?;
         let prefix = std::str::from_utf8(&prefix)?.trim_end_matches('\n');
         let mut files = Vec::new();
+        let mut skipped = 0;
         while let Some(status) = fields.next() {
             cancellation.check()?;
             let status = std::str::from_utf8(status)?.to_owned();
-            let first = std::str::from_utf8(fields.next().context("missing commit path")?)?;
+            let first = fields.next().context("missing commit path")?;
             let (path, original) = if status.starts_with(['R', 'C']) {
                 (
-                    std::str::from_utf8(fields.next().context("missing rename destination")?)?,
+                    fields.next().context("missing rename destination")?,
                     Some(first),
                 )
             } else {
                 (first, None)
             };
-            let line_stats = counts.remove(path).context("missing commit line counts")?;
-            let Some(path) = path.strip_prefix(prefix) else {
+            let Some(path) = path.strip_prefix(prefix.as_bytes()) else {
+                continue;
+            };
+            let original = original.and_then(|path| path.strip_prefix(prefix.as_bytes()));
+            let (Ok(path), Ok(original)) = (
+                std::str::from_utf8(path),
+                original.map(std::str::from_utf8).transpose(),
+            ) else {
+                skipped += 1;
                 continue;
             };
             files.push(CommitFile {
                 path: path.into(),
                 status,
-                original_path: original
-                    .and_then(|path| path.strip_prefix(prefix))
-                    .map(str::to_owned),
-                additions: line_stats.map(|stats| stats.additions),
-                deletions: line_stats.map(|stats| stats.deletions),
+                original_path: original.map(str::to_owned),
+                additions: None,
+                deletions: None,
             });
+        }
+        let stats = self
+            .queries
+            .commit_counts(&self.root, oid, cancellation)
+            .and_then(|mut counts| {
+                files
+                    .iter()
+                    .map(|file| {
+                        counts
+                            .remove(&format!("{prefix}{}", file.path))
+                            .with_context(|| {
+                                format!("missing commit line counts for {}", file.path)
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            });
+        cancellation.check()?;
+        let line_count_error = match stats {
+            Ok(stats) => {
+                for (file, stats) in files.iter_mut().zip(stats) {
+                    file.additions = stats.map(|stats| stats.additions);
+                    file.deletions = stats.map(|stats| stats.deletions);
+                }
+                None
+            }
+            Err(error) => Some(format!("count changed lines in commit: {error:#}")),
+        };
+        Ok(CommitFileList {
+            files,
+            path_warning: path_warning(skipped),
+            line_count_error,
+        })
+    }
+
+    pub fn commit_files(
+        &self,
+        commit: &str,
+        cancellation: &impl Execution,
+    ) -> Result<Vec<CommitFile>> {
+        let CommitFileList {
+            files,
+            line_count_error,
+            ..
+        } = self.commit_file_list(commit, cancellation)?;
+        if let Some(error) = line_count_error {
+            bail!("{error}");
         }
         Ok(files)
     }
@@ -531,7 +607,10 @@ impl Repository {
         Ok(command)
     }
 
-    fn worktree_changes(&self, cancellation: &impl Execution) -> Result<Vec<GitEntry>> {
+    fn worktree_changes(
+        &self,
+        cancellation: &impl Execution,
+    ) -> Result<(Vec<GitEntry>, Option<String>)> {
         let top = self
             .git(&["rev-parse", "--show-toplevel"], cancellation)
             .context("locate Git working tree")?;
@@ -551,22 +630,29 @@ impl Repository {
         self.status_entries(&top, cancellation)
     }
 
-    pub fn status(&self, cancellation: &impl Execution) -> Result<Vec<GitEntry>> {
-        self.status_with_progress(cancellation, |_| {})
-    }
-
-    pub fn status_with_progress(
+    pub fn worktree_status(
         &self,
         cancellation: &impl Execution,
-        progress: impl FnOnce(&[GitEntry]),
-    ) -> Result<Vec<GitEntry>> {
-        let mut entries = self.worktree_changes(cancellation)?;
+        progress: impl FnOnce(&[GitEntry], Option<&str>),
+    ) -> Result<WorktreeStatus> {
+        let (mut entries, path_warning) = self.worktree_changes(cancellation)?;
         cancellation.check()?;
-        progress(&entries);
-        let mut counts = self
+        progress(&entries, path_warning.as_deref());
+        let counts = self
             .queries
             .worktree_counts(&self.root, cancellation)
-            .context("count changed lines in working tree")?;
+            .context("count changed lines in working tree");
+        cancellation.check()?;
+        let mut counts = match counts {
+            Ok(counts) => counts,
+            Err(error) => {
+                return Ok(WorktreeStatus {
+                    entries,
+                    path_warning,
+                    line_count_error: Some(error),
+                });
+            }
+        };
         for entry in &mut entries {
             cancellation.check()?;
             entry.line_stats = counts.remove(&entry.path).unwrap_or(if entry.untracked {
@@ -578,16 +664,43 @@ impl Repository {
                 })
             });
         }
-        Ok(entries)
+        Ok(WorktreeStatus {
+            entries,
+            path_warning,
+            line_count_error: None,
+        })
     }
 
-    pub fn decorations(&self, cancellation: &impl Execution) -> Result<Vec<GitDecoration>> {
+    pub fn status_with_progress(
+        &self,
+        cancellation: &impl Execution,
+        progress: impl FnOnce(&[GitEntry]),
+    ) -> Result<Vec<GitEntry>> {
+        let WorktreeStatus {
+            entries,
+            line_count_error,
+            ..
+        } = self.worktree_status(cancellation, |entries, _| progress(entries))?;
+        match line_count_error {
+            Some(error) => Err(error),
+            None => Ok(entries),
+        }
+    }
+
+    pub fn status(&self, cancellation: &impl Execution) -> Result<Vec<GitEntry>> {
+        self.status_with_progress(cancellation, |_| {})
+    }
+
+    pub fn decorations(
+        &self,
+        cancellation: &impl Execution,
+    ) -> Result<(Vec<GitDecoration>, Option<String>)> {
         cancellation.check()?;
         let Some(location) = self.queries.discover(&self.root)? else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
-        Ok(self
-            .status_entries(&location.worktree, cancellation)?
+        let (entries, path_warning) = self.status_entries(&location.worktree, cancellation)?;
+        let decorations = entries
             .into_iter()
             .map(|entry| GitDecoration {
                 status: entry.status(),
@@ -595,10 +708,15 @@ impl Repository {
                 path: entry.path,
                 original_path: entry.original_path,
             })
-            .collect())
+            .collect();
+        Ok((decorations, path_warning))
     }
 
-    fn status_entries(&self, top: &Path, cancellation: &impl Execution) -> Result<Vec<GitEntry>> {
+    fn status_entries(
+        &self,
+        top: &Path,
+        cancellation: &impl Execution,
+    ) -> Result<(Vec<GitEntry>, Option<String>)> {
         let top = self.file_system.canonicalize(top)?;
         // Compare native directory identities, then keep porcelain paths in Git's
         // slash-separated form, including on Windows with verbatim root paths.
@@ -636,6 +754,7 @@ impl Repository {
             .split(|byte| *byte == 0)
             .filter(|record| !record.is_empty());
         let mut entries = Vec::new();
+        let mut skipped = 0;
 
         while let Some(record) = records.next() {
             cancellation.check()?;
@@ -644,20 +763,24 @@ impl Repository {
                 bail!("invalid git status record");
             }
 
-            let path = std::str::from_utf8(&record[3..])?;
             let original =
                 if record[0] == b'R' || record[0] == b'C' || record[1] == b'R' || record[1] == b'C'
                 {
-                    Some(std::str::from_utf8(
-                        records.next().context("missing git rename source")?,
-                    )?)
+                    Some(records.next().context("missing git rename source")?)
                 } else {
                     None
                 };
-            let Some(path) = path.strip_prefix(&prefix) else {
+            let Some(path) = record[3..].strip_prefix(prefix.as_bytes()) else {
                 continue;
             };
-            let original = original.and_then(|path| path.strip_prefix(&prefix));
+            let original = original.and_then(|path| path.strip_prefix(prefix.as_bytes()));
+            let (Ok(path), Ok(original)) = (
+                std::str::from_utf8(path),
+                original.map(std::str::from_utf8).transpose(),
+            ) else {
+                skipped += 1;
+                continue;
+            };
 
             let untracked = record[0] == b'?' && record[1] == b'?';
             entries.push(GitEntry {
@@ -670,7 +793,7 @@ impl Repository {
             });
         }
 
-        Ok(entries)
+        Ok((entries, path_warning(skipped)))
     }
 
     pub fn diff(

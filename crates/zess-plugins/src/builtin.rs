@@ -1,5 +1,7 @@
 use std::{cell::RefCell, rc::Rc};
 
+use anyhow::Result;
+use serde_json::Value;
 use zess_plugin::HostRequest;
 use zess_services::NativeServices;
 
@@ -12,6 +14,32 @@ mod git;
 mod schedule;
 
 type Services = Rc<RefCell<NativeServices>>;
+
+struct ViewOptions<T>(Option<(Value, Rc<T>)>);
+
+impl<T> Default for ViewOptions<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<T> ViewOptions<T> {
+    fn resolve(
+        &mut self,
+        options: &Value,
+        parse: impl FnOnce(&Value) -> Result<T>,
+    ) -> Result<Rc<T>> {
+        if let Some((source, parsed)) = &self.0
+            && source == options
+        {
+            return Ok(Rc::clone(parsed));
+        }
+
+        let parsed = Rc::new(parse(options)?);
+        self.0 = Some((options.clone(), Rc::clone(&parsed)));
+        Ok(parsed)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Event {
@@ -50,6 +78,8 @@ enum Event {
     Stage,
     Unstage,
     Discard,
+    Ignore,
+    Exclude,
     Page,
     PageChanges,
     PageHistory,
@@ -95,6 +125,8 @@ impl Event {
             "stage" => Self::Stage,
             "unstage" => Self::Unstage,
             "discard" => Self::Discard,
+            "ignore" => Self::Ignore,
+            "exclude" => Self::Exclude,
             "page" => Self::Page,
             "page-changes" => Self::PageChanges,
             "page-history" => Self::PageHistory,
@@ -275,12 +307,18 @@ impl BuiltinPlugins {
             }
             browser::bind_event(registry, kind, "open", description, &["Enter"]);
         }
-        for (event, description, key) in [
-            ("stage", "Stage selected files", "s"),
-            ("unstage", "Unstage selected files", "u"),
-            ("discard", "Discard selected working tree changes", "d"),
+        for (event, description, keys) in [
+            ("stage", "Stage whole files / directories", &["s"][..]),
+            ("unstage", "Unstage whole files / directories", &["u"][..]),
+            (
+                "discard",
+                "Discard working changes in files / directories",
+                &["d"][..],
+            ),
+            ("ignore", "Ignore in .gitignore (shared)", &["i", "g"][..]),
+            ("exclude", "Ignore in info/exclude (local)", &["i", "l"][..]),
         ] {
-            browser::bind_event(registry, "git", event, description, &[key]);
+            browser::bind_event(registry, "git", event, description, keys);
         }
         registry.buffer_command(
             "git-commit-files.back",

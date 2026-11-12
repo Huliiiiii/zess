@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 
 use anyhow::{Context, Result, bail, ensure};
-use zess_plugin::{HostRequest, PluginInput, PluginOutput, PluginRegistrar};
+use zess_plugin::{
+    HostRequest, OperationCompletion, OperationResult, PluginInput, PluginOutput, PluginRegistrar,
+};
 use zess_services::{QueryRequest, QueryResult};
 
 use super::{Event, Services, browser::Task};
@@ -54,6 +56,7 @@ impl Yanks {
         event: Event,
         input: &PluginInput,
         targets: Vec<Target>,
+        output: &mut PluginOutput,
     ) -> Result<()> {
         let register = match input.register {
             Some(register) => register,
@@ -70,41 +73,108 @@ impl Yanks {
                 .transpose()?
                 .unwrap_or('+'),
         };
-        self.0
-            .push_back(Yank::new(services, event, targets, register)?);
+        let mut yank = Yank::new(services, event, targets, register)?;
+        yank.operation_id = input.context.operation_id.clone();
+        if let Some(operation_id) = &yank.operation_id {
+            output.pending_operations.push(operation_id.clone());
+        }
+        self.0.push_back(yank);
         Ok(())
     }
 
     pub(super) fn advance(&mut self, services: &Services, event: Event, output: &mut PluginOutput) {
         if event == Event::ViewLeaving {
-            self.0.clear();
+            output.completed_operations.extend(self.cancel());
             return;
         }
-        while let Some(yank) = self.0.front_mut() {
-            match yank.advance(services) {
-                Ok(Some(values)) => output.requests.push(HostRequest::Yank {
-                    values,
-                    register: Some(yank.register),
-                }),
-                Ok(None) => break,
-                Err(error) => output.requests.push(HostRequest::Message {
-                    text: format!("{error:#}"),
-                }),
-            }
-            self.0.pop_front();
+        while self.0.front().is_some_and(|yank| {
+            yank.operation_id.is_none()
+                || matches!(&yank.state, YankState::Queued { requests, .. } if requests.is_empty())
+        }) {
+            let Some(mut publication) = self.poll_next(services) else {
+                break;
+            };
+            output.requests.append(&mut publication.requests);
+            output
+                .completed_operations
+                .append(&mut publication.completed_operations);
         }
         if !self.is_empty() {
-            output.display.as_mut().unwrap().loading = true;
+            if let Some(display) = &mut output.display {
+                display.loading = true;
+            }
             output.requests.push(HostRequest::Schedule { after_ms: 50 });
         }
+    }
+
+    pub(super) fn cancel(&mut self) -> Vec<OperationCompletion> {
+        self.0
+            .drain(..)
+            .filter_map(|yank| {
+                yank.operation_id.map(|operation_id| OperationCompletion {
+                    operation_id,
+                    result: OperationResult::Cancelled,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn poll(&mut self, services: &Services) -> Vec<PluginOutput> {
+        let mut outputs = Vec::new();
+        while let Some(output) = self.poll_next(services) {
+            outputs.push(output);
+        }
+        outputs
+    }
+
+    fn poll_next(&mut self, services: &Services) -> Option<PluginOutput> {
+        let yank = self.0.front_mut()?;
+        let mut output = PluginOutput::default();
+        let result = match yank.advance(services) {
+            Ok(Some(values)) => {
+                output.requests.push(HostRequest::Yank {
+                    values,
+                    register: Some(yank.register),
+                });
+                OperationResult::Completed
+            }
+            Ok(None) => return None,
+            Err(error) => {
+                let message = format!("{error:#}");
+                output.requests.push(HostRequest::Message {
+                    text: message.clone(),
+                });
+                OperationResult::Failed { message }
+            }
+        };
+        if let Some(operation_id) = yank.operation_id.take() {
+            output.completed_operations.push(OperationCompletion {
+                operation_id,
+                result,
+            });
+        }
+        self.0.pop_front();
+        Some(output)
     }
 }
 
 struct Yank {
     register: char,
-    requests: VecDeque<QueryRequest>,
-    task: Option<Task>,
-    values: Vec<String>,
+    operation_id: Option<String>,
+    state: YankState,
+}
+
+enum YankState {
+    Queued {
+        requests: VecDeque<QueryRequest>,
+        values: Vec<String>,
+    },
+    Reading {
+        remaining: VecDeque<QueryRequest>,
+        task: Task,
+        values: Vec<String>,
+    },
+    Ready(Vec<String>),
 }
 
 impl Yank {
@@ -167,36 +237,52 @@ impl Yank {
         }
         Ok(Self {
             register,
-            requests,
-            task: None,
-            values,
+            operation_id: None,
+            state: YankState::Queued { requests, values },
         })
     }
 
     fn advance(&mut self, services: &Services) -> Result<Option<Vec<String>>> {
         loop {
-            if let Some(task) = &mut self.task {
-                match task.poll()? {
-                    Some(QueryResult::Text {
-                        text,
-                        truncated: false,
-                        ..
-                    }) => {
-                        ensure!(!text.contains('\0'), "Cannot yank binary file contents");
-                        self.values.push(text);
-                    }
-                    Some(QueryResult::Snapshot { snapshot }) => self.values.push(snapshot.text),
-                    Some(QueryResult::Diff { text, .. }) => self.values.push(text),
-                    Some(QueryResult::Unsupported { message }) => bail!("{message}"),
-                    Some(_) => bail!("Yank query returned an unsupported result"),
-                    None => return Ok(None),
+            match &mut self.state {
+                YankState::Ready(values) => return Ok(Some(std::mem::take(values))),
+                YankState::Queued { requests, values } => {
+                    self.state = if let Some(request) = requests.pop_front() {
+                        YankState::Reading {
+                            task: Task::start(services, request)?,
+                            remaining: std::mem::take(requests),
+                            values: std::mem::take(values),
+                        }
+                    } else {
+                        YankState::Ready(std::mem::take(values))
+                    };
                 }
-                self.task = None;
-            }
-            if let Some(request) = self.requests.pop_front() {
-                self.task = Some(Task::start(services, request)?);
-            } else {
-                return Ok(Some(std::mem::take(&mut self.values)));
+                YankState::Reading {
+                    remaining,
+                    task,
+                    values,
+                } => {
+                    let value = match task.poll()? {
+                        Some(QueryResult::Text {
+                            text,
+                            truncated: false,
+                            ..
+                        }) => {
+                            ensure!(!text.contains('\0'), "Cannot yank binary file contents");
+                            text
+                        }
+                        Some(QueryResult::Snapshot { snapshot }) => snapshot.text,
+                        Some(QueryResult::Diff { text, .. }) => text,
+                        Some(QueryResult::Unsupported { message }) => bail!("{message}"),
+                        Some(_) => bail!("Yank query returned an unsupported result"),
+                        None => return Ok(None),
+                    };
+                    values.push(value);
+                    self.state = YankState::Queued {
+                        requests: std::mem::take(remaining),
+                        values: std::mem::take(values),
+                    };
+                }
             }
         }
     }

@@ -129,11 +129,15 @@ fn diff_counts(
     for (index, delta) in diff.deltas().enumerate() {
         cancellation.check()?;
         let file = delta.new_file();
-        let path = file.path().context("Git delta has no path")?;
-        let Ok(path) = path.strip_prefix(prefix) else {
+        // DiffFile::path assumes the bytes are UTF-8 on Windows.
+        let path = file.path_bytes().context("Git delta has no path")?;
+        let Some(path) = std::str::from_utf8(path)
+            .ok()
+            .and_then(|path| Path::new(path).strip_prefix(prefix).ok())
+            .and_then(Path::to_str)
+        else {
             continue;
         };
-        let path = path.to_str().context("Git path is not UTF-8")?;
         if delta.status() == Delta::Conflicted {
             counts.insert(path.into(), None);
             continue;

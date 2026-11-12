@@ -28,8 +28,31 @@ pub(super) struct Rendered {
     files: Vec<FileIndex>,
     text: String,
     metadata: Vec<Vec<DiffLineMetadata>>,
-    index: Option<DiffIndex>,
-    raw_rows: Vec<Vec<usize>>,
+    mapping: RenderedMapping,
+}
+
+enum RenderedMapping {
+    DisplayOnly,
+    SourceMapped {
+        index: DiffIndex,
+        raw_rows: Vec<Vec<usize>>,
+    },
+}
+
+impl RenderedMapping {
+    fn index(&self) -> Option<&DiffIndex> {
+        match self {
+            Self::DisplayOnly => None,
+            Self::SourceMapped { index, .. } => Some(index),
+        }
+    }
+
+    fn raw_rows(&self) -> &[Vec<usize>] {
+        match self {
+            Self::DisplayOnly => &[],
+            Self::SourceMapped { raw_rows, .. } => raw_rows,
+        }
+    }
 }
 
 pub(super) struct Diff {
@@ -56,7 +79,7 @@ impl Diff {
             && let Some(index) = self
                 .rendered
                 .as_ref()
-                .and_then(|rendered| rendered.index.as_ref())
+                .and_then(|rendered| rendered.mapping.index())
         {
             return index;
         }
@@ -64,9 +87,9 @@ impl Diff {
     }
 
     pub fn mapped_rendering(&self) -> bool {
-        self.rendered
-            .as_ref()
-            .is_some_and(|rendered| rendered.index.is_some())
+        self.rendered.as_ref().is_some_and(|rendered| {
+            matches!(rendered.mapping, RenderedMapping::SourceMapped { .. })
+        })
     }
 
     fn rendered_index(
@@ -229,9 +252,14 @@ impl Diff {
 
     pub fn raw_row(&self, presentation: Presentation, row: usize) -> Option<usize> {
         match presentation {
-            Presentation::Rendered if self.mapped_rendering() => {
-                self.rendered.as_ref()?.raw_rows.get(row)?.last().copied()
-            }
+            Presentation::Rendered if self.mapped_rendering() => self
+                .rendered
+                .as_ref()?
+                .mapping
+                .raw_rows()
+                .get(row)?
+                .last()
+                .copied(),
             _ => self.index.rows.get(row).map(|_| row),
         }
     }
@@ -251,7 +279,7 @@ impl Diff {
                 return None;
             }
             if presentation == Presentation::Rendered && self.mapped_rendering() {
-                rows.extend_from_slice(self.rendered.as_ref()?.raw_rows.get(row)?);
+                rows.extend_from_slice(self.rendered.as_ref()?.mapping.raw_rows().get(row)?);
             } else {
                 rows.push(row);
             }
@@ -441,8 +469,7 @@ impl Diff {
             files: Vec::new(),
             text: String::new(),
             metadata: Vec::new(),
-            index: None,
-            raw_rows: Vec::new(),
+            mapping: RenderedMapping::DisplayOnly,
         };
         let mut valid_metadata = true;
         for (file, patch) in result.files.iter().enumerate() {
@@ -543,8 +570,7 @@ impl Diff {
         if external {
             if valid_metadata {
                 if let Some((index, raw_rows)) = result.rendered_index(&rendered, workspace) {
-                    rendered.index = Some(index);
-                    rendered.raw_rows = raw_rows;
+                    rendered.mapping = RenderedMapping::SourceMapped { index, raw_rows };
                 }
             }
             result.rendered = Some(rendered);
@@ -589,7 +615,7 @@ impl Diff {
             && let Some(raw) = (row..rendered.rows.len())
                 .chain((0..row).rev())
                 .filter(|row| rendered.files[*row] == *file)
-                .find_map(|row| rendered.raw_rows[row].last().copied())
+                .find_map(|row| rendered.mapping.raw_rows()[row].last().copied())
         {
             let raw = if self.index.rows[raw].block.is_some() {
                 raw
@@ -624,7 +650,8 @@ impl Diff {
     pub fn rendered_row_at_raw(&self, row: usize) -> usize {
         if let Some(rendered) = &self.rendered
             && let Some(row) = rendered
-                .raw_rows
+                .mapping
+                .raw_rows()
                 .iter()
                 .position(|rows| rows.contains(&row))
         {
@@ -1107,8 +1134,14 @@ impl Selection {
                 if new_presentation == Presentation::Rendered && new.mapped_rendering() {
                     let mut positions: Vec<Option<usize>> = vec![None; raw_rows.len()];
                     let previous = self.row().unwrap_or(0);
-                    for (display_row, rows) in
-                        new.rendered.as_ref().unwrap().raw_rows.iter().enumerate()
+                    for (display_row, rows) in new
+                        .rendered
+                        .as_ref()
+                        .unwrap()
+                        .mapping
+                        .raw_rows()
+                        .iter()
+                        .enumerate()
                     {
                         for row in rows {
                             if let Ok(index) = raw_rows.binary_search(row)
@@ -1174,7 +1207,8 @@ impl Selection {
             if new_presentation == Presentation::Rendered && new.mapped_rendering() {
                 new.rendered
                     .as_ref()?
-                    .raw_rows
+                    .mapping
+                    .raw_rows()
                     .iter()
                     .enumerate()
                     .filter(|(_, rows)| rows.contains(&raw))
@@ -1268,7 +1302,7 @@ pub(super) struct Search {
     pub selection: Selection,
     pub scroll: usize,
     pub horizontal_scroll: usize,
-    pub manual_viewport: bool,
+    pub scroll_mode: super::ScrollMode,
 }
 
 impl Search {
@@ -1276,7 +1310,7 @@ impl Search {
         view.location.diff_selection = self.selection.clone();
         view.location.scroll = self.scroll;
         view.location.horizontal_scroll = self.horizontal_scroll;
-        view.location.manual_viewport = self.manual_viewport;
+        view.location.scroll_mode = self.scroll_mode;
     }
 }
 

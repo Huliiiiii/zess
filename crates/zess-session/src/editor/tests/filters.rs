@@ -92,7 +92,7 @@ fn invalid_filters_preserve_the_last_results_and_view_position_until_corrected_o
             .location
             .scroll = 3;
         let location = &mut session.views.get_mut(&session.focus).unwrap().location;
-        location.manual_viewport = true;
+        location.scroll_mode = ScrollMode::UserControlled;
         let id = location
             .display
             .rows
@@ -237,6 +237,50 @@ fn outline_filters_match_symbol_names_and_preserve_valid_state_after_invalid_inp
 }
 
 #[test]
+fn configuration_reload_restores_the_outline_filter_and_selection_when_returning_to_it() {
+    let fixture = Fixture::new();
+    let path = fixture.write(
+        "example.rs",
+        "fn alpha() {}\nfn bravo() {}\nfn bravura() {}\n",
+    );
+    let mut session = fixture.session(&[path]);
+    session.command("outline").unwrap();
+    session.execute_command("data.filter", json!({})).unwrap();
+    query(&mut session, Plain, "brav");
+    session.execute_command("prompt.submit", json!({})).unwrap();
+    session
+        .execute_command("data.move-down", json!({}))
+        .unwrap();
+    let view = session.focus;
+    let before = &session.views[&view].location;
+    let buffer = before.buffer;
+    let selection = before.selection.clone();
+    let rows = &before.display.rows;
+    assert!(rows[0].text.ends_with("bravo"));
+    assert!(rows[1].text.ends_with("bravura"));
+    assert_eq!(selection.primary.as_ref(), Some(&rows[1].id));
+    let rows = serde_json::to_value(rows).unwrap();
+
+    session
+        .navigate(
+            view,
+            Navigation::Push {
+                kind: "files".into(),
+                argument: json!({}),
+            },
+        )
+        .unwrap();
+    session.command("config-reload").unwrap();
+    session.navigate(view, Navigation::Back).unwrap();
+
+    let restored = &session.views[&view].location;
+    assert_eq!(restored.buffer, buffer);
+    assert_eq!(serde_json::to_value(&restored.display.rows).unwrap(), rows);
+    assert_eq!(restored.selection, selection);
+    assert_eq!(restored.display.header, "/brav");
+}
+
+#[test]
 fn git_filters_keep_status_paths_and_commit_rows_as_their_matching_fields() {
     let fixture = Fixture::new();
     fs::create_dir(fixture.0.join("src")).unwrap();
@@ -332,5 +376,54 @@ fn git_filters_keep_status_paths_and_commit_rows_as_their_matching_fields() {
                 .header
                 .contains(value)
         );
+    }
+}
+
+#[test]
+fn closing_help_restores_the_filter_draft_and_allows_input_to_continue() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("Alpha.rs"), "alpha").unwrap();
+    fs::write(fixture.0.join("beta.rs"), "beta").unwrap();
+    let mut session = fixture.session(&[]);
+    session.command("files").unwrap();
+    settle(&mut session);
+    let source = session.focus;
+    session.input("/");
+    query(&mut session, Plain, "Alpha");
+    query(&mut session, Regex, "[");
+    session.command("help").unwrap();
+    session.execute_command("help.close", json!({})).unwrap();
+    assert_eq!(session.focus, source);
+    let prompt = session.active_prompt().unwrap();
+    assert!(matches!(prompt.query(), Some((Regex, "["))));
+    assert!(prompt.error.is_some());
+    assert!(session.views[&source].location.mode == ViewMode::Filter);
+    assert_eq!(session.views[&source].item_ids(), ["Alpha.rs"]);
+    session.input("C-u");
+    for key in ["b", "e", "t", "a"] {
+        session.input(key);
+    }
+    assert_eq!(session.views[&source].item_ids(), ["beta.rs"]);
+    session.input("Enter");
+    assert!(session.prompt.is_none());
+    assert!(session.views[&source].location.mode == ViewMode::Normal);
+}
+
+#[test]
+fn splitting_after_filter_input_clones_normal_mode_and_the_last_valid_filter() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("Alpha.rs"), "alpha").unwrap();
+    fs::write(fixture.0.join("beta.rs"), "beta").unwrap();
+    let mut session = fixture.session(&[]);
+    session.command("files").unwrap();
+    settle(&mut session);
+    session.input("/");
+    query(&mut session, Plain, "Alpha");
+    session.command("vsplit").unwrap();
+    assert!(session.prompt.is_none());
+    assert_eq!(session.views.values().count(), 2);
+    for view in session.views.values() {
+        assert!(view.location.mode == ViewMode::Normal);
+        assert_eq!(view.item_ids(), ["Alpha.rs"]);
     }
 }

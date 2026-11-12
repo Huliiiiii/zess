@@ -16,7 +16,9 @@ fn decorations_are_empty_outside_a_repository_but_status_reports_the_error() {
     let repo = Repository::new();
     fs::remove_dir_all(repo.0.join(".git")).unwrap();
     let repository = crate::Repository::open(&repo.0).unwrap();
-    assert!(repository.decorations(&Execute).unwrap().is_empty());
+    let (entries, warning) = repository.decorations(&Execute).unwrap();
+    assert!(entries.is_empty());
+    assert!(warning.is_none());
     assert!(repository.status(&Execute).is_err());
 }
 
@@ -64,7 +66,8 @@ fn decorations_preserve_staging_and_rename_identity_without_line_counts() {
     fs::write(repo.0.join("untracked"), [0, 255]).unwrap();
     repo.git(&["mv", "old name", "new name"]);
     let repository = crate::Repository::open(&repo.0).unwrap();
-    let entries = repository.decorations(&Execute).unwrap();
+    let (entries, warning) = repository.decorations(&Execute).unwrap();
+    assert!(warning.is_none());
     assert_eq!(entries.len(), 5);
     for (path, expected) in [
         ("staged", StagingStatus::Staged),
@@ -107,7 +110,8 @@ fn status_and_decorations_preserve_workspace_relative_git_paths() {
     for (directory, prefix, count) in [("", "sub/", 4), ("sub", "", 3)] {
         let repository = crate::Repository::open(repo.0.join(directory)).unwrap();
         let entries = repository.status(&Execute).unwrap();
-        let decorations = repository.decorations(&Execute).unwrap();
+        let (decorations, warning) = repository.decorations(&Execute).unwrap();
+        assert!(warning.is_none());
         assert_eq!(entries.len(), count);
         assert_eq!(decorations.len(), count);
         for name in ["deleted", "renamed", "untracked"] {
@@ -190,8 +194,9 @@ fn git_queries_and_patch_staging_preserve_path_whitespace() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path, path);
     assert_eq!(entries[0].line_stats.unwrap().additions, 1);
-    let decorations = repository.decorations(&Execute).unwrap();
+    let (decorations, warning) = repository.decorations(&Execute).unwrap();
     assert_eq!(decorations[0].path, path);
+    assert!(warning.is_none());
     let raw = repository
         .diff(path, None, Some(DiffSide::Unstaged), &Execute)
         .unwrap();
@@ -263,7 +268,8 @@ fn git_queries_use_the_worktree_and_its_separate_metadata() {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "file");
         assert_eq!(entries[0].line_stats.unwrap().additions, 1);
-        let decorations = repository.decorations(&Execute).unwrap();
+        let (decorations, warning) = repository.decorations(&Execute).unwrap();
+        assert!(warning.is_none());
         assert_eq!(decorations.len(), 1);
         assert_eq!(decorations[0].path, "file");
         let files = repository.commit_files(oid, &Execute).unwrap();
@@ -303,7 +309,7 @@ fn linked_worktree_queries_respect_its_configured_root() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path, "file");
     assert_eq!(entries[0].line_stats.unwrap().additions, 1);
-    let decorations = repository.decorations(&Execute).unwrap();
+    let (decorations, _) = repository.decorations(&Execute).unwrap();
     assert_eq!(decorations.len(), 1);
     assert_eq!(decorations[0].path, "file");
     let crate::BlobRead::File(blob) = repository.blob(oid, "file", &Execute).unwrap() else {
@@ -417,7 +423,7 @@ fn every_unmerged_index_state_is_a_conflict() {
         assert_eq!(format!("{}{}", entry.index, entry.worktree), entry.path);
         assert_eq!(entry.staging_status(), crate::StagingStatus::Conflict);
     }
-    let decorations = repository.decorations(&Execute).unwrap();
+    let (decorations, _) = repository.decorations(&Execute).unwrap();
     assert_eq!(decorations.len(), 7);
     for entry in decorations {
         assert_eq!(entry.staging_status, crate::StagingStatus::Conflict);

@@ -28,7 +28,7 @@ impl Repository {
         execution: &impl Execution,
     ) -> Result<()> {
         ensure!(!request.entries.is_empty(), "No Git changes selected");
-        let current = self.worktree_changes(execution)?;
+        let (current, _) = self.worktree_changes(execution)?;
         let mut paths = BTreeSet::new();
         for selected in &request.entries {
             validate_relative(&selected.path)?;

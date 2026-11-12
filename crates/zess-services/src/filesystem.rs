@@ -89,8 +89,14 @@ pub(crate) struct Entry {
 }
 
 pub(crate) enum Snapshot {
-    Directory(Vec<Entry>),
-    Text { text: String, truncated: bool },
+    Directory {
+        entries: Vec<Entry>,
+        path_warning: Option<String>,
+    },
+    Text {
+        text: String,
+        truncated: bool,
+    },
     Unsupported(&'static str),
 }
 
@@ -100,15 +106,18 @@ impl Snapshot {
             || relative
                 .strip_suffix('.')
                 .is_some_and(|parent| parent.ends_with(['/', std::path::MAIN_SEPARATOR]));
-        if directory_path && !matches!(self, Self::Directory(_)) {
+        if directory_path && !matches!(self, Self::Directory { .. }) {
             bail!("not a directory: {relative}");
         }
-        if matches!(request, Request::List) && !matches!(self, Self::Directory(_)) {
+        if matches!(request, Request::List) && !matches!(self, Self::Directory { .. }) {
             bail!("cannot list a file: {relative}");
         }
 
         Ok(match self {
-            Self::Directory(entries) => {
+            Self::Directory {
+                entries,
+                path_warning,
+            } => {
                 let entry_parent = zess_platform::slash_separated_path(relative);
                 let entries = entries
                     .iter()
@@ -131,6 +140,7 @@ impl Snapshot {
                 QueryResult::Directory {
                     path: relative.into(),
                     entries,
+                    path_warning: path_warning.clone(),
                 }
             }
             Self::Text { text, truncated } => QueryResult::Text {
@@ -250,6 +260,7 @@ impl Workspace {
         }
 
         let mut entries = Vec::new();
+        let mut skipped = 0;
 
         cancellation.check()?;
 
@@ -260,10 +271,10 @@ impl Workspace {
         {
             cancellation.check()?;
 
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("directory contains a filename that is not UTF-8"))?;
+            let Ok(name) = entry.file_name().into_string() else {
+                skipped += 1;
+                continue;
+            };
             let metadata = self.filesystem.symlink_metadata(&entry.path())?;
             let kind = if metadata.is_dir() {
                 DirectoryEntryKind::Directory
@@ -290,7 +301,17 @@ impl Workspace {
 
         cancellation.check()?;
 
-        Ok(Snapshot::Directory(entries))
+        let path_warning = match skipped {
+            0 => None,
+            1 => Some("Skipped 1 directory entry with a non-UTF-8 name".into()),
+            _ => Some(format!(
+                "Skipped {skipped} directory entries with non-UTF-8 names"
+            )),
+        };
+        Ok(Snapshot::Directory {
+            entries,
+            path_warning,
+        })
     }
 }
 

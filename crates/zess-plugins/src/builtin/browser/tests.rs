@@ -111,6 +111,53 @@ fn next_handle(services: &Services) -> u64 {
         .unwrap()
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn directory_previews_report_non_utf8_names_without_hiding_other_entries() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.0.join("dir")).unwrap();
+    fs::write(fixture.0.join("dir/readable"), "good\n").unwrap();
+    fs::write(fixture.0.join(OsStr::from_bytes(b"dir/raw-\xff")), "raw\n").unwrap();
+    let services = fixture.services();
+    let query = file_query("dir");
+    let _observation = warm(&services, &query);
+    let mut browser = Browser::cloned();
+    let mut output = output();
+    browser
+        .update_surface(
+            &services,
+            Event::Preview,
+            &input(),
+            &mut output,
+            Some(query),
+        )
+        .unwrap();
+
+    let rows = output
+        .requests
+        .into_iter()
+        .find_map(|request| match request {
+            HostRequest::PreviewGroup { mut panes, .. } => match panes.pop()? {
+                PreviewPane::Surface {
+                    content: PreviewContent::Directory { rows, .. },
+                    ..
+                } => Some(rows),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].text,
+        "Skipped 1 directory entry with a non-UTF-8 name"
+    );
+    assert!(rows[0].id.is_empty());
+    assert_eq!(rows[1].id, "dir/readable");
+}
+
 #[test]
 fn observed_files_publish_immediately_without_starting_queries() {
     let fixture = Fixture::new();

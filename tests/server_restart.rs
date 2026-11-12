@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
@@ -141,6 +143,16 @@ fn receive(reader: &mut BufReader<UnixStream>) -> Value {
     serde_json::from_str(&line).unwrap()
 }
 
+fn receive_type(reader: &mut BufReader<UnixStream>, kind: &str) -> Value {
+    loop {
+        let message = receive(reader);
+        assert_ne!(message["type"], "rejected", "{message}");
+        if message["type"] == kind {
+            return message;
+        }
+    }
+}
+
 #[test]
 fn unsaved_changes_require_force_before_replacing_the_session() {
     let server = Server::new();
@@ -160,7 +172,7 @@ fn unsaved_changes_require_force_before_replacing_the_session() {
         );
         loop {
             let message = receive(&mut client);
-            if message["type"] == "update" && message["acknowledged"] == sequence {
+            if message["type"] == "ack" && message["acknowledged"] == sequence {
                 break;
             }
         }
@@ -420,4 +432,195 @@ fn oversized_requests_only_close_the_offending_connection() {
             assert_eq!(server.status()["pid"], server.child.id());
         }
     }
+}
+
+fn attach(
+    server: &Server,
+    client_id: &str,
+    epoch: Option<&Value>,
+) -> (BufReader<UnixStream>, Value) {
+    let mut stream = UnixStream::connect(&server.socket).unwrap();
+    send(
+        &mut stream,
+        json!({"type": "attach", "client_id": client_id, "width": 80, "height": 24, "context_epoch": epoch}),
+    );
+    let mut reader = BufReader::new(stream);
+    loop {
+        let message = receive(&mut reader);
+        if message["type"] == "attached" {
+            return (reader, message);
+        }
+    }
+}
+
+fn input(reader: &mut BufReader<UnixStream>, epoch: &Value, sequence: u64, key: &str) {
+    send(
+        reader.get_mut(),
+        json!({"type": "input", "sequence": sequence, "key": key, "context_epoch": epoch}),
+    );
+    loop {
+        let message = receive(reader);
+        assert_ne!(message["type"], "rejected", "{message}");
+        if message["type"] == "ack" && message["acknowledged"] == sequence {
+            return;
+        }
+    }
+}
+
+#[test]
+fn reconnecting_to_the_same_server_retains_acknowledgements_and_deduplicates_input() {
+    let server = Server::new();
+    let (mut client, first) = attach(&server, "reconnect", None);
+    for (sequence, key) in [(1, "i"), (2, "x")] {
+        input(&mut client, &first["context_epoch"], sequence, key);
+    }
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while server.status()["attached"] == true {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (mut client, second) = attach(&server, "reconnect", Some(&first["context_epoch"]));
+    assert_eq!(second["server_instance"], first["server_instance"]);
+    assert_eq!(second["acknowledged"], 2);
+    assert_eq!(second["replay_allowed"], true);
+    input(&mut client, &second["context_epoch"], 2, "x");
+    for (sequence, key) in [(3, "Esc"), (4, ":"), (5, "w"), (6, "Enter")] {
+        input(&mut client, &second["context_epoch"], sequence, key);
+    }
+    assert_eq!(
+        fs::read_to_string(server.workspace.join("saved.txt")).unwrap(),
+        "xsaved\n"
+    );
+}
+
+#[test]
+fn replacing_a_crashed_server_starts_a_new_input_ledger() {
+    let mut server = Server::new();
+    let (mut client, first) = attach(&server, "crash-reconnect", None);
+    for (sequence, key) in [(1, "i"), (2, "x")] {
+        input(&mut client, &first["context_epoch"], sequence, key);
+    }
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    drop(client);
+    server.child = server
+        .cli()
+        .args(["server", "--workspace"])
+        .arg(&server.workspace)
+        .arg("--socket")
+        .arg(&server.socket)
+        .args(["--", "saved.txt"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if UnixStream::connect(&server.socket).is_ok() {
+            break;
+        }
+        assert!(server.child.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (mut client, second) = attach(&server, "crash-reconnect", Some(&first["context_epoch"]));
+    assert_ne!(second["server_instance"], first["server_instance"]);
+    assert_eq!(second["acknowledged"], 0);
+    assert_eq!(second["replay_allowed"], false);
+    for (sequence, key) in [
+        (1, "i"),
+        (2, "y"),
+        (3, "Esc"),
+        (4, ":"),
+        (5, "w"),
+        (6, "Enter"),
+    ] {
+        input(&mut client, &second["context_epoch"], sequence, key);
+    }
+    assert_eq!(
+        fs::read_to_string(server.workspace.join("saved.txt")).unwrap(),
+        "ysaved\n"
+    );
+}
+
+#[test]
+fn an_unanswered_clipboard_request_is_reissued_after_reconnect_and_duplicate_input() {
+    fn clipboard_input(reader: &mut BufReader<UnixStream>, epoch: &Value) -> Value {
+        send(
+            reader.get_mut(),
+            json!({"type": "input", "sequence": 3, "key": "p", "context_epoch": epoch}),
+        );
+        let mut request = None;
+        let mut acknowledged = false;
+        while request.is_none() || !acknowledged {
+            let message = receive(reader);
+            assert_ne!(message["type"], "rejected", "{message}");
+            if message["type"] == "clipboard_read" {
+                request = Some(message);
+            } else if message["type"] == "ack" && message["acknowledged"] == 3 {
+                acknowledged = true;
+            }
+        }
+        request.unwrap()
+    }
+
+    let server = Server::new();
+    let (mut client, first) = attach(&server, "clipboard-reconnect", None);
+    for (sequence, key) in [(1, "\""), (2, "+")] {
+        input(&mut client, &first["context_epoch"], sequence, key);
+    }
+    let request = clipboard_input(&mut client, &first["context_epoch"]);
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while server.status()["attached"] == true {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (mut client, second) = attach(
+        &server,
+        "clipboard-reconnect",
+        Some(&first["context_epoch"]),
+    );
+    assert_eq!(receive_type(&mut client, "clipboard_read"), request);
+    assert_eq!(
+        clipboard_input(&mut client, &second["context_epoch"]),
+        request
+    );
+    send(
+        client.get_mut(),
+        json!({"type": "clipboard_response", "id": request["id"], "text": "external", "error": null}),
+    );
+    receive_type(&mut client, "delta");
+    for (sequence, key) in [(4, ":"), (5, "w"), (6, "Enter")] {
+        input(&mut client, &second["context_epoch"], sequence, key);
+    }
+    assert_eq!(
+        fs::read_to_string(server.workspace.join("saved.txt")).unwrap(),
+        "sexternalaved\n"
+    );
+}
+
+#[test]
+fn a_rejected_attached_client_does_not_prevent_the_next_attachment() {
+    let server = Server::new();
+    let (mut client, attached) = attach(&server, "rejected", None);
+    send(
+        client.get_mut(),
+        json!({"type": "input", "sequence": 1, "key": "i", "context_epoch": attached["context_epoch"].as_u64().unwrap().wrapping_add(1)}),
+    );
+    loop {
+        if receive(&mut client)["type"] == "rejected" {
+            break;
+        }
+    }
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while server.status()["attached"] == true {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (mut client, attached) = attach(&server, "replacement", None);
+    assert_eq!(attached["acknowledged"], 0);
+    input(&mut client, &attached["context_epoch"], 1, "i");
 }

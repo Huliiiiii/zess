@@ -5,14 +5,15 @@ use std::{
 use zess_filter::{Case, Filter};
 
 use anyhow::{Context, Result, bail};
-use serde_json::json;
+use serde_json::{Value, json};
 use zess_plugin::{
-    BufferId, HostRequest, ItemSelection, PluginInput, PluginOutput, QueryWatch, ViewId,
+    BufferId, HostRequest, ItemSelection, OperationCompletion, PluginInput, PluginOutput,
+    QueryWatch, ViewId,
 };
 use zess_ui::{Display, DisplayRow};
 
 use super::{
-    Event, Services,
+    Event, Services, ViewOptions,
     browser::{self, Browser, PreviewQuery, Task},
     file_actions::{Source, Target, TargetKind, Yanks},
 };
@@ -33,39 +34,115 @@ struct Model {
     directories: BTreeMap<String, Vec<Entry>>,
 }
 
+struct FilesOptions {
+    git_status: bool,
+}
+
+impl FilesOptions {
+    fn parse(options: &Value) -> Result<Self> {
+        let git_status = match options.get("git-status") {
+            None => true,
+            Some(value) => value.as_bool().context("git-status must be a boolean")?,
+        };
+        if options
+            .get("preview-wrap")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            bail!("preview-wrap must be a boolean");
+        }
+        Ok(Self { git_status })
+    }
+}
+
 #[derive(Default)]
 struct FileView {
+    options: ViewOptions<FilesOptions>,
     expanded: BTreeSet<String>,
     filter: Filter,
     show_ignored: bool,
     target: Option<String>,
-    directories: BTreeMap<String, Option<Task>>,
-    rename_targets: VecDeque<String>,
-    rename_destinations: Vec<(String, String)>,
+    directories: BTreeMap<String, DirectoryRequest>,
+    rename: Option<RenameSession>,
     browser: Browser,
-    find: Option<Find>,
+    find: Option<FindSession>,
     yanks: Yanks,
     git_status: git_status::GitStatus,
 }
 
-struct Find {
+#[derive(Default)]
+enum DirectoryRequest {
+    #[default]
+    NotRequested,
+    Running(Task),
+    Settled,
+}
+
+enum RenameSession {
+    Collecting {
+        targets: VecDeque<String>,
+        destinations: Vec<(String, String)>,
+    },
+    Ready {
+        destinations: Vec<(String, String)>,
+    },
+}
+
+impl RenameSession {
+    fn collect(&self, text: &str) -> Self {
+        let Self::Collecting {
+            targets,
+            destinations,
+        } = self
+        else {
+            unreachable!("only collecting sessions accept a destination");
+        };
+        let mut targets = targets.clone();
+        let mut destinations = destinations.clone();
+        if let Some(source) = targets.pop_front() {
+            destinations.push((source, text.into()));
+        }
+        if targets.is_empty() {
+            Self::Ready { destinations }
+        } else {
+            Self::Collecting {
+                targets,
+                destinations,
+            }
+        }
+    }
+}
+
+struct FindSession {
     query: Filter,
     original_selection: ItemSelection,
+    traversal: FindTraversal,
+}
+
+struct FindTraversal {
     pending: VecDeque<String>,
     tasks: BTreeMap<String, Task>,
     visited: BTreeSet<String>,
     entries: Vec<Entry>,
 }
 
-impl Find {
+impl FindSession {
     fn new(original_selection: ItemSelection) -> Self {
         Self {
             query: Filter::default(),
             original_selection,
-            pending: VecDeque::from([String::new()]),
-            tasks: BTreeMap::new(),
-            visited: BTreeSet::new(),
-            entries: Vec::new(),
+            traversal: FindTraversal {
+                pending: VecDeque::from([String::new()]),
+                tasks: BTreeMap::new(),
+                visited: BTreeSet::new(),
+                entries: Vec::new(),
+            },
+        }
+    }
+
+    fn restart(self) -> Self {
+        Self {
+            query: self.query,
+            ..Self::new(self.original_selection)
         }
     }
 
@@ -77,17 +154,24 @@ impl Find {
         output: &mut PluginOutput,
     ) -> Result<()> {
         let mut complete = Vec::new();
-        for (path, task) in &mut self.tasks {
+        for (path, task) in &mut self.traversal.tasks {
             match task.poll() {
-                Ok(Some(QueryResult::Directory { entries, .. })) => {
+                Ok(Some(QueryResult::Directory {
+                    entries,
+                    path_warning,
+                    ..
+                })) => {
+                    if let Some(warning) = path_warning {
+                        output.requests.push(message(&warning));
+                    }
                     for entry in &entries {
                         if entry.ignored && !show_ignored {
                             continue;
                         }
                         if entry.kind == DirectoryEntryKind::Directory {
-                            self.pending.push_back(entry.path.clone());
+                            self.traversal.pending.push_back(entry.path.clone());
                         } else {
-                            self.entries.push(entry.clone());
+                            self.traversal.entries.push(entry.clone());
                         }
                     }
                     model.directories.insert(path.clone(), entries);
@@ -102,22 +186,22 @@ impl Find {
             }
         }
         for path in complete {
-            self.tasks.remove(&path);
+            self.traversal.tasks.remove(&path);
         }
-        while self.tasks.len() < 4 {
-            let Some(path) = self.pending.pop_front() else {
+        while self.traversal.tasks.len() < 4 {
+            let Some(path) = self.traversal.pending.pop_front() else {
                 break;
             };
             let task = Task::start(services, QueryRequest::List { path: path.clone() })?;
-            self.visited.insert(path.clone());
-            self.tasks.insert(path, task);
+            self.traversal.visited.insert(path.clone());
+            self.traversal.tasks.insert(path, task);
         }
-        self.entries.sort_by(|a, b| a.path.cmp(&b.path));
+        self.traversal.entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(())
     }
 
     fn loading(&self) -> bool {
-        !self.pending.is_empty() || !self.tasks.is_empty()
+        !self.traversal.pending.is_empty() || !self.traversal.tasks.is_empty()
     }
 }
 
@@ -125,6 +209,7 @@ pub(super) struct Files {
     services: Services,
     models: BTreeMap<BufferId, Model>,
     views: BTreeMap<(BufferId, ViewId), FileView>,
+    operation_completions: Vec<OperationCompletion>,
 }
 
 impl Files {
@@ -133,21 +218,18 @@ impl Files {
             services,
             models: BTreeMap::new(),
             views: BTreeMap::new(),
+            operation_completions: Vec::new(),
         }
     }
 }
 
 impl BufferPlugin for Files {
+    fn validate_view_options(&self, options: &Value) -> Result<()> {
+        FilesOptions::parse(options).map(|_| ())
+    }
+
     fn update(&mut self, input: &PluginInput) -> Result<PluginOutput> {
         let event = Event::parse(&input.event);
-        let git_status = git_status::enabled(&input.options)?;
-        if input
-            .options
-            .get("preview-wrap")
-            .is_some_and(|value| !value.is_boolean())
-        {
-            bail!("preview-wrap must be a boolean");
-        }
         let key = (input.buffer_id, input.view_id);
         if event == Event::ViewCloned
             && let Some(source) = input.argument["source_view"].as_u64()
@@ -165,12 +247,18 @@ impl BufferPlugin for Files {
                 );
             }
         }
-        let model = self.models.entry(input.buffer_id).or_default();
         let view = self.views.entry(key).or_default();
+        let options = view.options.resolve(&input.options, FilesOptions::parse)?;
+        let model = self.models.entry(input.buffer_id).or_default();
         let old_pending = model.pending.clone();
         let mut output = PluginOutput::default();
-        view.git_status
-            .update(&self.services, event, input, git_status, &mut output)?;
+        view.git_status.update(
+            &self.services,
+            event,
+            input,
+            options.git_status,
+            &mut output,
+        )?;
         let entries = tree(model, view);
         let primary = input.selection.primary.as_deref();
         let current = entries
@@ -227,7 +315,7 @@ impl BufferPlugin for Files {
                         entries
                             .iter()
                             .map(|(entry, _)| entry.as_ref())
-                            .chain(view.find.iter().flat_map(|find| &find.entries))
+                            .chain(view.find.iter().flat_map(|find| &find.traversal.entries))
                             .find(|entry| &entry.path == path)
                             .ok_or_else(|| anyhow::anyhow!("Selected path is unavailable: {path}"))
                             .map(|entry| Target {
@@ -244,11 +332,12 @@ impl BufferPlugin for Files {
                             })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                view.yanks.queue(&self.services, event, input, selected)?;
+                view.yanks
+                    .queue(&self.services, event, input, selected, &mut output)?;
             }
             Event::Find => {
                 view.target = None;
-                view.find = Some(Find::new(input.selection.clone()));
+                view.find = Some(FindSession::new(input.selection.clone()));
                 output.requests.push(HostRequest::SetMode {
                     mode: "find".into(),
                 });
@@ -277,7 +366,8 @@ impl BufferPlugin for Files {
                     });
                 } else if let Some(find) = &view.find {
                     let path = primary.filter(|path| {
-                        find.entries
+                        find.traversal
+                            .entries
                             .iter()
                             .any(|entry| entry.path == *path && find.query.is_match(&entry.path))
                     });
@@ -290,9 +380,7 @@ impl BufferPlugin for Files {
             Event::ToggleIgnored => {
                 view.show_ignored = !view.show_ignored;
                 if let Some(find) = view.find.take() {
-                    let mut next = Find::new(find.original_selection);
-                    next.query = find.query;
-                    view.find = Some(next);
+                    view.find = Some(find.restart());
                 }
             }
             Event::FilterChanged => {
@@ -321,14 +409,13 @@ impl BufferPlugin for Files {
                 if event == Event::Rename && selected.is_empty() {
                     output.requests.push(message("Select a path to rename"));
                 } else {
-                    view.rename_targets = if event == Event::Rename {
-                        selected.iter().cloned().collect()
-                    } else {
-                        VecDeque::new()
-                    };
-                    view.rename_destinations.clear();
-                    let text = if let Some(path) = view.rename_targets.front() {
-                        destination(model, path)
+                    view.rename = (event == Event::Rename).then(|| RenameSession::Collecting {
+                        targets: selected.iter().cloned().collect(),
+                        destinations: Vec::new(),
+                    });
+                    let text = if let Some(RenameSession::Collecting { targets, .. }) = &view.rename
+                    {
+                        destination(model, targets.front().unwrap())
                     } else {
                         let directory = current
                             .map(|(entry, _)| {
@@ -374,49 +461,45 @@ impl BufferPlugin for Files {
             Event::LayerResult => {
                 let text = input.argument["text"].as_str().unwrap_or("");
                 if input.argument["cancelled"] == true || text.is_empty() {
-                    view.rename_targets.clear();
-                    view.rename_destinations.clear();
+                    view.rename = None;
                 } else if input.argument["purpose"] == "rename" {
-                    let mut targets = view.rename_targets.clone();
-                    let mut destinations = view.rename_destinations.clone();
-                    if let Some(source) = targets.pop_front() {
-                        destinations.push((source, text.into()));
-                    }
-                    if let Some(next) = targets.front() {
-                        output.requests.push(HostRequest::MiniBuffer {
-                            purpose: "rename".into(),
-                            text: destination(model, next),
-                            key_scope: None,
-                        });
-                    } else {
-                        let mut candidate = model.pending.clone();
-                        for (path, to) in &destinations {
-                            let created = candidate.iter().find_map(|op| match op {
-                                Operation::Create {
-                                    path: created,
-                                    directory,
-                                } if created == path => Some(*directory),
-                                _ => None,
+                    if let Some(session) = &view.rename {
+                        let next = session.collect(text);
+                        if let RenameSession::Collecting { targets, .. } = &next {
+                            output.requests.push(HostRequest::MiniBuffer {
+                                purpose: "rename".into(),
+                                text: destination(model, targets.front().unwrap()),
+                                key_scope: None,
                             });
-                            candidate.retain(|op| op.path() != path);
-                            candidate.push(if let Some(directory) = created {
-                                Operation::Create {
-                                    path: to.trim_end_matches('/').into(),
-                                    directory,
-                                }
-                            } else {
-                                Operation::Rename {
-                                    path: path.clone(),
-                                    to: to.clone(),
-                                }
-                            });
+                            view.rename = Some(next);
+                        } else if let RenameSession::Ready { destinations } = next {
+                            let mut candidate = model.pending.clone();
+                            for (path, to) in &destinations {
+                                let created = candidate.iter().find_map(|op| match op {
+                                    Operation::Create {
+                                        path: created,
+                                        directory,
+                                    } if created == path => Some(*directory),
+                                    _ => None,
+                                });
+                                candidate.retain(|op| op.path() != path);
+                                candidate.push(if let Some(directory) = created {
+                                    Operation::Create {
+                                        path: to.trim_end_matches('/').into(),
+                                        directory,
+                                    }
+                                } else {
+                                    Operation::Rename {
+                                        path: path.clone(),
+                                        to: to.clone(),
+                                    }
+                                });
+                            }
+                            validate(&self.services, &candidate)?;
+                            model.pending = candidate;
+                            view.rename = None;
                         }
-                        validate(&self.services, &candidate)?;
-                        model.pending = candidate;
-                        destinations.clear();
                     }
-                    view.rename_targets = targets;
-                    view.rename_destinations = destinations;
                 } else {
                     let path = text.trim_end_matches('/').to_owned();
                     let mut candidate = model.pending.clone();
@@ -444,9 +527,7 @@ impl BufferPlugin for Files {
         if matches!(event, Event::FsChanged | Event::Refresh)
             && let Some(find) = view.find.take()
         {
-            let mut next = Find::new(find.original_selection);
-            next.query = find.query;
-            view.find = Some(next);
+            view.find = Some(find.restart());
         }
         if event == Event::Refresh {
             self.services.borrow_mut().invalidate_fs();
@@ -454,24 +535,32 @@ impl BufferPlugin for Files {
         }
         if event == Event::ViewLeaving {
             view.find = None;
+            view.rename = None;
             view.directories.clear();
         } else {
             view.directories
                 .retain(|path, _| !browser::changed(event, input, "fs.list", Some(path)));
             for (path, job) in &mut view.directories {
-                let Some(task) = job else {
+                let DirectoryRequest::Running(task) = job else {
                     continue;
                 };
                 match task.poll() {
-                    Ok(Some(QueryResult::Directory { entries, .. })) => {
+                    Ok(Some(QueryResult::Directory {
+                        entries,
+                        path_warning,
+                        ..
+                    })) => {
+                        if let Some(warning) = path_warning {
+                            output.requests.push(message(&warning));
+                        }
                         model.directories.insert(path.clone(), entries);
-                        *job = None;
+                        *job = DirectoryRequest::Settled;
                         output.changed = true;
                     }
                     Ok(Some(_)) => bail!("directory query returned another kind of result"),
                     Ok(None) => {}
                     Err(error) => {
-                        *job = None;
+                        *job = DirectoryRequest::Settled;
                         output.requests.push(message(&format!("{error:#}")));
                     }
                 }
@@ -487,17 +576,21 @@ impl BufferPlugin for Files {
             }
             view.directories.retain(|path, _| paths.contains(path));
             for path in paths {
-                if !view.directories.contains_key(&path)
-                    && view
-                        .directories
-                        .values()
-                        .filter(|job| job.is_some())
-                        .count()
-                        < 4
+                if view
+                    .directories
+                    .values()
+                    .filter(|job| matches!(job, DirectoryRequest::Running(_)))
+                    .count()
+                    >= 4
                 {
-                    let task =
-                        Task::start(&self.services, QueryRequest::List { path: path.clone() })?;
-                    view.directories.insert(path, Some(task));
+                    break;
+                }
+                let request = view.directories.entry(path.clone()).or_default();
+                if matches!(request, DirectoryRequest::NotRequested) {
+                    *request = DirectoryRequest::Running(Task::start(
+                        &self.services,
+                        QueryRequest::List { path },
+                    )?);
                 }
             }
         }
@@ -522,7 +615,8 @@ impl BufferPlugin for Files {
         }
         let rows = if let Some(find) = &mut view.find {
             find.advance(&self.services, model, view.show_ignored, &mut output)?;
-            find.entries
+            find.traversal
+                .entries
                 .iter()
                 .filter(|entry| find.query.is_match(&entry.path))
                 .map(|entry| {
@@ -547,15 +641,11 @@ impl BufferPlugin for Files {
         {
             output.selection = Some(browser::single(view.target.take()));
         }
-        let mut status = Vec::new();
-        if !model.pending.is_empty() {
-            status.push(format!("{} pending", model.pending.len()));
-        }
-        if view.show_ignored {
-            status.push("ignored shown".into());
-        }
-        let loading = view.directories.values().any(Option::is_some)
-            || view.find.as_ref().is_some_and(Find::loading)
+        let loading = view
+            .directories
+            .values()
+            .any(|request| matches!(request, DirectoryRequest::Running(_)))
+            || view.find.as_ref().is_some_and(FindSession::loading)
             || view.git_status.loading();
         output.changed |= old_pending != model.pending;
         output.modified = Some(!model.pending.is_empty());
@@ -571,12 +661,23 @@ impl BufferPlugin for Files {
                 format!("/{}", view.filter.source())
             },
             rows,
-            status: status.join(" · ").into(),
+            status: if model.pending.is_empty() {
+                String::new()
+            } else {
+                zess_plugin::default_status_text(
+                    "pending",
+                    &[("count", model.pending.len().to_string())],
+                )?
+            }
+            .into(),
+            status_data: json!({"files": {
+                "pending_count": model.pending.len(),
+            }}),
         });
         let paths = view
             .directories
             .keys()
-            .chain(view.find.iter().flat_map(|find| &find.visited))
+            .chain(view.find.iter().flat_map(|find| &find.traversal.visited))
             .collect::<BTreeSet<_>>();
         let watches = output.watches.get_or_insert_default();
         watches.extend(paths.into_iter().map(|path| QueryWatch {
@@ -604,16 +705,47 @@ impl BufferPlugin for Files {
         Ok(output)
     }
 
+    fn poll_operations(&mut self) -> Vec<PluginOutput> {
+        let mut outputs = self
+            .operation_completions
+            .drain(..)
+            .map(|completion| PluginOutput {
+                completed_operations: vec![completion],
+                ..PluginOutput::default()
+            })
+            .collect::<Vec<_>>();
+        for view in self.views.values_mut() {
+            outputs.extend(view.yanks.poll(&self.services));
+        }
+        outputs
+    }
+
     fn remove_buffer_view(&mut self, buffer: BufferId, view: ViewId) {
-        self.views.remove(&(buffer, view));
+        if let Some(mut view) = self.views.remove(&(buffer, view)) {
+            self.operation_completions.extend(view.yanks.cancel());
+        }
     }
 
     fn remove_view(&mut self, id: ViewId) {
-        self.views.retain(|(_, view), _| *view != id);
+        self.views.retain(|(_, view_id), view| {
+            if *view_id == id {
+                self.operation_completions.extend(view.yanks.cancel());
+                false
+            } else {
+                true
+            }
+        });
     }
     fn remove_buffer(&mut self, id: BufferId) {
         self.models.remove(&id);
-        self.views.retain(|(buffer, _), _| *buffer != id);
+        self.views.retain(|(buffer, _), view| {
+            if *buffer == id {
+                self.operation_completions.extend(view.yanks.cancel());
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 

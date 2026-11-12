@@ -138,7 +138,7 @@ fn git_file_layers_stay_open_after_saving_until_explicitly_closed() {
     assert_eq!(fs::read_to_string(&path).unwrap(), "!original\n");
     assert_eq!(session.focus, layer);
     assert_eq!(session.views[&layer].location.buffer, buffer);
-    assert_eq!(session.views[&source].layer, Some(layer));
+    assert_eq!(session.views.child(source), Some(layer));
     assert_eq!(panes(&session), layout);
     for key in ["i", "?", "Esc"] {
         session.input(key);
@@ -530,7 +530,7 @@ fn historical_file_layers_are_readonly_and_release_their_state_on_close() {
         session.buffers[&snapshot],
         Buffer::Snapshot { .. }
     ));
-    assert_eq!(session.views[&layer].parent, Some(source));
+    assert_eq!(session.views.parent(layer), Some(source));
     assert!(session.command("write note.txt").is_err());
     assert!(session.command("reload").is_err());
     assert_eq!(fs::read_to_string(&path).unwrap(), "working\n");

@@ -14,7 +14,7 @@ fn temporary_file_previews_reject_buffer_switches_and_window_splits() {
         let temporary = session.views[&layer].location.buffer;
         session.command(browser).unwrap();
         settle(&mut session);
-        session.focus_preview().unwrap();
+        session.focus_preview(session.focus).unwrap();
         let preview = session.focus;
         if browser == "git" {
             assert_ne!(preview, layer);
@@ -39,8 +39,8 @@ fn temporary_file_previews_reject_buffer_switches_and_window_splits() {
         ] {
             assert!(session.command(command).is_err(), "{browser}: {command}");
             assert_eq!(session.focus, preview);
-            assert_eq!(session.views[&layer].parent, Some(root));
-            assert_eq!(session.views[&root].layer, Some(layer));
+            assert_eq!(session.views.parent(layer), Some(root));
+            assert_eq!(session.views.child(root), Some(layer));
             assert_eq!(
                 session.buffers.keys().copied().collect::<HashSet<_>>(),
                 buffers
@@ -132,8 +132,8 @@ fn closing_a_browser_returns_to_the_unsaved_temporary_file() {
         session.command(command).unwrap();
         settle(&mut session);
         assert_eq!(session.focus, layer, "{}", session.message);
-        assert_eq!(session.views[&layer].parent, Some(root));
-        assert_eq!(session.views[&root].layer, Some(layer));
+        assert_eq!(session.views.parent(layer), Some(root));
+        assert_eq!(session.views.child(root), Some(layer));
         let (id, text) = if command == "files" {
             ("note.txt", "  note.txt")
         } else {
@@ -166,7 +166,7 @@ fn closing_a_browser_returns_to_the_unsaved_temporary_file() {
         assert!(!candidates.contains(&browser));
         assert_eq!(panes(&session), layout);
 
-        session.focus_preview().unwrap();
+        session.focus_preview(session.focus).unwrap();
         session.command("q").unwrap();
         assert!(!session.exiting());
         assert_eq!(session.focus, layer);
@@ -193,7 +193,7 @@ fn closing_a_browser_returns_to_the_unsaved_temporary_file() {
         session.command("q").unwrap();
         assert!(!session.exiting());
         session.command("q").unwrap();
-        assert!(session.exiting());
+        assert!(!session.exiting());
     }
 }
 
@@ -235,7 +235,7 @@ fn git_page_and_commit_navigation_preserve_the_temporary_file_return_point() {
     assert_eq!(session.views[&layer].location.buffer, commit);
     assert_eq!(selected_row(&session, layer).id, "file:note.txt");
 
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     session.command("q").unwrap();
     assert_eq!(session.views[&session.focus].location.buffer, temporary);
     assert_eq!(session.focus, layer);
@@ -263,7 +263,7 @@ fn reopening_a_browser_from_its_preview_keeps_the_temporary_file_return_point() 
     let temporary = session.views[&layer].location.buffer;
     session.command("git").unwrap();
     settle(&mut session);
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     let preview = session.focus;
     assert_ne!(preview, layer, "{}", session.message);
     assert!(

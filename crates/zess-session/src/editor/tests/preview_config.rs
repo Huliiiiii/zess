@@ -135,7 +135,7 @@ fn preview_debounce_configuration_survives_failed_reload() {
         "set-editor-options! : obj 'preview-debounce-ms 0\n",
     )
     .unwrap();
-    assert!(session.reload(), "{}", session.message);
+    session.command("config-reload").unwrap();
     assert_eq!(
         session
             .scripts
@@ -151,9 +151,9 @@ fn preview_debounce_configuration_survives_failed_reload() {
         "set-editor-options! : obj 'preview-debounce-ms -1\n",
     )
     .unwrap();
-    assert!(!session.reload());
+    let error = session.command("config-reload").unwrap_err();
     assert_eq!(
-        session.message,
+        format!("{error:#}"),
         format!(
             "reload failed: load plugin {path}: {path}:1:1: Error: TypeMismatch: preview-debounce-ms must be a non-negative integer",
             path = config.display()

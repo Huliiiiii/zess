@@ -80,6 +80,7 @@ impl CommandCandidate {
 pub(super) struct Help {
     pub view: u64,
     pub source: super::pages::FocusTarget,
+    pub suspended: Option<Prompt>,
 }
 
 #[derive(Clone)]
@@ -91,10 +92,13 @@ pub(super) struct HelpContext {
 impl Session {
     pub(super) fn pending_input(&self) -> String {
         let view = &self.views[&self.focus];
-        if let Some((_, target, _, read)) = &self.clipboard_read
-            && *target == self.focus
+        if let Some(request) = &self.clipboard_read
+            && request.view == self.focus
         {
-            return format!("Reading register \"{} · Esc to cancel", read.register);
+            return format!(
+                "Reading register \"{} · Esc to cancel",
+                request.operation.register
+            );
         }
         if let Some(jump) = &view.jump {
             return if jump.input.is_empty() {
@@ -124,8 +128,11 @@ impl Session {
         if !pending.is_empty() {
             parts.push(pending);
         }
-        if !self.pending.is_empty() {
-            parts.push(format!("{} … · Esc to cancel", self.pending.join(" ")));
+        if !self.key_sequence.keys().is_empty() {
+            parts.push(format!(
+                "{} … · Esc to cancel",
+                self.key_sequence.keys().join(" ")
+            ));
         }
         parts.join(" · ")
     }
@@ -322,6 +329,7 @@ impl Session {
             ..super::Display::default()
         };
         let buffer = self.add_buffer(Buffer::Items {
+            role: super::ItemsRole::Standalone,
             kind: "help".into(),
             path: String::new(),
             display,
@@ -330,9 +338,14 @@ impl Session {
         let view = self.create_page(buffer);
         let source = self.views.focus_target(source);
         self.views.get_mut(&view).unwrap().return_to = Some(source);
-        self.pending.clear();
+        self.key_sequence.clear();
+        let suspended = self.prompt.take();
         self.activate_view(view);
-        self.help = Some(Help { view, source });
+        self.help = Some(Help {
+            view,
+            source,
+            suspended,
+        });
     }
 
     pub(super) fn refresh_help_buffers(&mut self) {
@@ -362,34 +375,48 @@ impl Session {
         }
     }
 
-    pub(super) fn close_help_overlay(&mut self) {
-        if let Some(help) = self.help.take() {
-            if self
+    pub(super) fn close_help_overlay(&mut self) -> anyhow::Result<()> {
+        if let Some(help) = &self.help
+            && self
                 .prompt
                 .as_ref()
-                .is_some_and(|prompt| prompt.view == help.view)
-            {
-                self.prompt = None;
-            }
+                .is_some_and(|prompt| prompt.target.view == help.view)
+        {
+            self.cancel_prompt()?;
+        }
+        if let Some(mut help) = self.help.take() {
             let buffer = self.views[&help.view].location.buffer;
-            self.retire_page(self.views.page_id(help.view));
+            let page = self.views.page_id(help.view);
+            let source = self
+                .views
+                .resolve_focus(help.source)
+                .unwrap_or_else(|| self.first_layout_view());
+            while let Some(child) = self.views.layer_in_page(page) {
+                self.reparent_layer_to_source(child, source);
+            }
+            self.retire_page(page)?;
             self.buffers.remove(&buffer);
             if self.focus == help.view {
-                let focus = self
-                    .views
-                    .resolve_focus(help.source)
-                    .unwrap_or_else(|| self.first_layout_view());
+                let mut focus = source;
+                while let Some(child) = self.views.child(focus) {
+                    focus = child;
+                }
                 self.activate_view(focus);
             }
+            if let Some(prompt) = help.suspended.take() {
+                self.prompt = Some(prompt);
+                self.invalidate_prompt()?;
+            }
         }
+        Ok(())
     }
 
     pub(super) fn help_command(&mut self, command: HelpCommand) -> anyhow::Result<()> {
         match command {
             HelpCommand::Close => {
                 if self.help.is_some() {
-                    self.close_help_overlay();
-                    self.pending.clear();
+                    self.close_help_overlay()?;
+                    self.key_sequence.clear();
                 } else {
                     self.close_view(false)?;
                 }
@@ -398,26 +425,41 @@ impl Session {
                 if self.fullscreen_layer().is_some() {
                     anyhow::bail!("close the fullscreen layer before pinning help");
                 }
-                if let Some(help) = self.help.take() {
+                if let Some(help) = &self.help {
+                    let view = help.view;
                     let mut root = self
                         .views
                         .resolve_focus(help.source)
                         .unwrap_or_else(|| self.first_layout_view());
-                    while let Some(parent) = self.views[&root].parent {
+                    while let Some(parent) = self.views.parent(root) {
                         root = parent;
                     }
-                    self.layout.as_mut().unwrap().split(
-                        self.views.page_id(root),
-                        self.views.page_id(help.view),
-                        super::Axis::Horizontal,
+                    let source_page = self.views.page_id(root);
+                    let mut pages = Vec::new();
+                    self.layout.as_ref().unwrap().leaves(&mut pages);
+                    anyhow::ensure!(
+                        pages.contains(&source_page),
+                        "help source is no longer in the layout"
                     );
-                    self.activate_view(help.view);
+                    self.cancel_suspended_prompt()?;
+                    anyhow::ensure!(
+                        self.layout.as_mut().unwrap().split(
+                            source_page,
+                            self.views.page_id(view),
+                            super::Axis::Horizontal,
+                        ),
+                        "help source is no longer in the layout"
+                    );
+                    self.help = None;
+                    self.activate_view(view);
                 }
             }
-            HelpCommand::ScrollDown => self.data_command(DataCommand::MoveDown)?,
-            HelpCommand::ScrollUp => self.data_command(DataCommand::MoveUp)?,
-            HelpCommand::PageHalfDown => self.data_command(DataCommand::PageHalfDown)?,
-            HelpCommand::PageHalfUp => self.data_command(DataCommand::PageHalfUp)?,
+            HelpCommand::ScrollDown => self.data_command(self.focus, DataCommand::MoveDown)?,
+            HelpCommand::ScrollUp => self.data_command(self.focus, DataCommand::MoveUp)?,
+            HelpCommand::PageHalfDown => {
+                self.data_command(self.focus, DataCommand::PageHalfDown)?
+            }
+            HelpCommand::PageHalfUp => self.data_command(self.focus, DataCommand::PageHalfUp)?,
         }
         Ok(())
     }
@@ -436,7 +478,7 @@ impl Session {
             {
                 grid.render(rows, width);
             }
-        } else if !self.pending.is_empty() {
+        } else if !self.key_sequence.keys().is_empty() {
             let (scopes, mode) = self.key_context();
             let entries = self
                 .scripts
@@ -447,13 +489,13 @@ impl Session {
                             binding_entries(
                                 commands,
                                 keymap.effective_bindings(&scopes, &mode),
-                                &self.pending,
+                                self.key_sequence.keys(),
                             )
                         })
                     })
                 })
                 .unwrap_or_default();
-            overlay(rows, width, &self.pending.join(" "), &entries);
+            overlay(rows, width, &self.key_sequence.keys().join(" "), &entries);
         }
     }
 }

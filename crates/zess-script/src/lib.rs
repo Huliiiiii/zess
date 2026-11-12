@@ -1,11 +1,13 @@
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow};
+use bridge::json::Json;
 use serde_json::Value;
 use steel::{
     SteelVal,
@@ -13,6 +15,7 @@ use steel::{
     rvals::{FromSteelVal, IntoSteelVal},
     steel_vm::engine::Engine,
 };
+use zess_platform::{FileSystem, NativeFileSystem};
 use zess_plugin::{
     BufferBackend, BufferPluginHandle, CommandCatalog, CommandImplementation, Keymap,
     PluginRegistrar, Registry,
@@ -23,13 +26,16 @@ pub use zess_plugin::{
 };
 
 mod bridge;
+mod compiler;
 mod registration;
 mod sources;
+
+pub use compiler::{NativeSteelCompiler, ScriptCompiler};
 
 #[cfg(test)]
 mod tests;
 
-const STANDARD_MODULES: [(&str, &str); 5] = [
+const STANDARD_MODULES: [(&str, &str); 7] = [
     (
         "zess/buffer",
         include_str!("../../../plugins/zess/buffer.w"),
@@ -37,6 +43,14 @@ const STANDARD_MODULES: [(&str, &str); 5] = [
     ("zess/keys", include_str!("../../../plugins/zess/keys.w")),
     ("zess/state", include_str!("../../../plugins/zess/state.w")),
     ("zess/ui", include_str!("../../../plugins/zess/ui.w")),
+    (
+        "zess/config",
+        include_str!("../../../plugins/zess/config.w"),
+    ),
+    (
+        "zess/status-layout",
+        include_str!("../../../plugins/zess/status-layout.w"),
+    ),
     (
         "zess/status",
         include_str!("../../../plugins/zess/status.w"),
@@ -46,6 +60,21 @@ const STANDARD_MODULES: [(&str, &str); 5] = [
 #[derive(Clone)]
 struct Handler {
     function: SteelVal,
+}
+
+#[derive(Clone)]
+struct StatuslineRegion {
+    handler: Handler,
+    components: Vec<String>,
+}
+
+impl steel::rvals::Custom for StatuslineRegion {}
+
+#[derive(Clone, Default)]
+struct StatuslineLayout {
+    left: Option<StatuslineRegion>,
+    center: Option<StatuslineRegion>,
+    right: Option<StatuslineRegion>,
 }
 
 pub enum CommandOutput {
@@ -65,6 +94,9 @@ struct ScriptState {
 
 struct ScriptRegistry {
     plugins: Registry<Handler>,
+    builtin_statuslines: BTreeSet<String>,
+    statusline_components: BTreeMap<String, Handler>,
+    statusline_layouts: BTreeMap<String, StatuslineLayout>,
     host: Box<dyn Fn(String, Value) -> Value>,
 }
 
@@ -74,6 +106,8 @@ struct ModuleSource {
 }
 
 pub struct ScriptRuntime {
+    filesystem: Arc<dyn FileSystem>,
+    compiler: Arc<dyn ScriptCompiler>,
     engine: Engine,
     states: BTreeMap<BufferId, ScriptState>,
     registry: Rc<RefCell<ScriptRegistry>>,
@@ -91,16 +125,40 @@ impl ScriptRuntime {
         host: impl Fn(String, Value) -> Value + 'static,
         identities: IdentityRegistry,
     ) -> Result<Self> {
-        let mut engine = Engine::new_sandboxed();
+        Self::with_identities_and_filesystem(host, identities, Arc::new(NativeFileSystem))
+    }
+
+    pub fn with_identities_and_filesystem(
+        host: impl Fn(String, Value) -> Value + 'static,
+        identities: IdentityRegistry,
+        filesystem: Arc<dyn FileSystem>,
+    ) -> Result<Self> {
+        Self::with_capabilities(host, identities, filesystem, Arc::new(NativeSteelCompiler))
+    }
+
+    /// Uses `filesystem` for configuration reads and module preloading.
+    /// The compiler owns engine initialization and imported-module resolution.
+    pub fn with_capabilities(
+        host: impl Fn(String, Value) -> Value + 'static,
+        identities: IdentityRegistry,
+        filesystem: Arc<dyn FileSystem>,
+        compiler: Arc<dyn ScriptCompiler>,
+    ) -> Result<Self> {
+        let mut engine = compiler.create_engine();
         bridge::register(&mut engine);
         let registry = Rc::new(RefCell::new(ScriptRegistry {
             plugins: Registry::with_identities(identities),
+            builtin_statuslines: BTreeSet::new(),
+            statusline_components: BTreeMap::new(),
+            statusline_layouts: BTreeMap::new(),
             host: Box::new(host),
         }));
         let id = registration::register(&mut engine, &registry);
 
         engine.register_value("null", SteelVal::Void);
         let mut runtime = Self {
+            filesystem,
+            compiler,
             engine,
             states: BTreeMap::new(),
             registry,
@@ -110,8 +168,8 @@ impl ScriptRuntime {
         };
 
         runtime
-            .engine
-            .run(HELPERS)
+            .compiler
+            .compile_and_run(&mut runtime.engine, HELPERS.to_owned(), None)
             .map_err(script_error)
             .context("initialize script helpers")?;
 
@@ -119,10 +177,13 @@ impl ScriptRuntime {
             runtime.register_module_source(name, source, &PathBuf::from(format!("{name}.w")))?;
         }
 
-        let result = runtime.engine.run(
+        let result = runtime.compiler.compile_and_run(
+            &mut runtime.engine,
             r#"(require "zess/buffer")
                    (require (prefix-in standard: "zess/status"))
-                   (register-statusline "default" standard:default-statusline)"#,
+                   (%register-builtin-statusline "default" standard:default-statusline)"#
+                .to_owned(),
+            None,
         );
         runtime.sources.bind_pending(&runtime.engine);
         result
@@ -140,6 +201,7 @@ impl ScriptRuntime {
                 include_str!("../../../plugins/defaults.w"),
                 r##"(require "zess/keys")
                    (require "zess/status")
+                   (require "zess/config")
                    (require "#%private/zess/defaults")"##,
             ),
             (
@@ -154,7 +216,9 @@ impl ScriptRuntime {
             ),
         ] {
             self.register_module_source(name, source, Path::new(path))?;
-            let result = self.engine.run(imports);
+            let result = self
+                .compiler
+                .compile_and_run(&mut self.engine, imports.to_owned(), None);
             self.sources.bind_pending(&self.engine);
             result
                 .map_err(|error| self.source_error(error, Some(Path::new(path))))
@@ -164,39 +228,25 @@ impl ScriptRuntime {
     }
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
-        let source = std::fs::read_to_string(path)
+        let source = self
+            .filesystem
+            .read_to_string(path)
             .with_context(|| format!("read plugin {}", path.display()))?;
 
-        let path = std::fs::canonicalize(path)
+        let path = self
+            .filesystem
+            .canonicalize(path)
             .with_context(|| format!("resolve plugin {}", path.display()))?;
         let (origin, scheme) = sources::SourceOrigin::translate(&source, &path)?;
         self.sources
             .register(sources::SourceIdentity::ProgramPath(path.clone()), origin);
         let result = self
-            .engine
-            .compile_and_run_raw_program_with_path(scheme, path.clone());
+            .compiler
+            .compile_and_run(&mut self.engine, scheme, Some(path.clone()));
         self.sources.bind_pending(&self.engine);
         result
             .map_err(|error| self.source_error(error, Some(&path)))
             .with_context(|| format!("load plugin {}", path.display()))?;
-        Ok(())
-    }
-
-    pub fn load_source(&mut self, source: &str, path: &Path) -> Result<()> {
-        let (origin, source) = sources::SourceOrigin::translate(source, path)?;
-        self.sources.register(
-            sources::SourceIdentity::ProgramPath(path.to_path_buf()),
-            origin,
-        );
-        let result = self
-            .engine
-            .compile_and_run_raw_program_with_path(source, path.to_path_buf());
-
-        self.sources.bind_pending(&self.engine);
-        result
-            .map_err(|error| self.source_error(error, Some(path)))
-            .with_context(|| format!("load plugin {}", path.display()))?;
-
         Ok(())
     }
 
@@ -208,9 +258,10 @@ impl ScriptRuntime {
     }
 
     fn preload_directory(&mut self, root: &Path, directory: &Path) -> Result<()> {
-        let mut entries = std::fs::read_dir(directory)
-            .with_context(|| format!("read module directory {}", directory.display()))?
-            .collect::<std::io::Result<Vec<_>>>()?;
+        let mut entries = self
+            .filesystem
+            .read_dir(directory)
+            .with_context(|| format!("read module directory {}", directory.display()))?;
 
         entries.sort_by_key(|entry| entry.file_name());
 
@@ -230,7 +281,9 @@ impl ScriptRuntime {
                     .with_extension("")
                     .to_string_lossy()
                     .replace('\\', "/");
-                let source = std::fs::read_to_string(&path)
+                let source = self
+                    .filesystem
+                    .read_to_string(&path)
                     .with_context(|| format!("read module {}", path.display()))?;
 
                 self.register_module_source(&name, &source, &path)?;
@@ -378,6 +431,30 @@ impl ScriptRuntime {
         )
     }
 
+    pub fn shares_native_buffer(&self, other: &Self, kind: &str) -> bool {
+        let current = self.registry.borrow();
+        let other = other.registry.borrow();
+        match (
+            current.plugins.buffer_backend(kind),
+            other.plugins.buffer_backend(kind),
+        ) {
+            (Some(BufferBackend::Native(current)), Some(BufferBackend::Native(other))) => {
+                Rc::ptr_eq(current, other)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn poll_operations(&mut self) -> Vec<PluginOutput> {
+        let mut outputs = Vec::new();
+        for backend in self.registry.borrow().plugins.buffer_backends() {
+            if let BufferBackend::Native(backend) = backend {
+                outputs.extend(backend.borrow_mut().poll_operations());
+            }
+        }
+        outputs
+    }
+
     pub fn remove_view(&mut self, view: ViewId) {
         for state in self.states.values_mut() {
             state.views.remove(&view);
@@ -462,7 +539,9 @@ impl ScriptRuntime {
             })),
             CommandImplementation::Request(request) => Ok(CommandOutput::Request(request)),
             CommandImplementation::External(handler) => {
-                let argument = argument.clone().into_steelval().map_err(script_error)?;
+                let argument = Json(argument.clone())
+                    .into_steelval()
+                    .map_err(script_error)?;
                 let value = self
                     .engine
                     .call_function_with_args(handler.function, vec![argument])
@@ -470,7 +549,7 @@ impl ScriptRuntime {
                 if let Ok(request) = bridge::Request::from_steelval(&value) {
                     Ok(CommandOutput::Request(request.0))
                 } else {
-                    let value = Value::from_steelval(&value).map_err(script_error)?;
+                    let value = Json::from_steelval(&value).map_err(script_error)?.0;
                     if let Ok(request) = serde_json::from_value(value.clone()) {
                         Ok(CommandOutput::Request(request))
                     } else {
@@ -534,44 +613,119 @@ impl ScriptRuntime {
         self.registry.borrow().plugins.editor_options
     }
 
+    pub fn on_client_exit(&self) -> zess_plugin::OnClientExit {
+        self.registry.borrow().plugins.on_client_exit
+    }
+
     pub fn view_options(&self, kind: &str) -> Value {
         self.registry.borrow().plugins.view_options(kind)
+    }
+
+    pub fn view_options_with_overrides(
+        &self,
+        kind: &str,
+        overrides: Option<&serde_json::Map<String, Value>>,
+    ) -> Value {
+        self.registry
+            .borrow()
+            .plugins
+            .view_options_with_overrides(kind, overrides)
     }
 
     pub fn validate_view_options(&self) -> Result<()> {
         self.registry.borrow().plugins.validate_view_options()
     }
 
-    pub fn validate_view_options_value(&self, options: &Value) -> Result<()> {
+    pub fn validate_statusline_layouts(&self) -> Result<()> {
+        let registry = self.registry.borrow();
+        for (kind, layout) in &registry.statusline_layouts {
+            for region in [&layout.left, &layout.center, &layout.right]
+                .into_iter()
+                .flatten()
+            {
+                for component in &region.components {
+                    if !registry.statusline_components.contains_key(component) {
+                        anyhow::bail!("unknown statusline component {component} in layout {kind}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_view_options_value(&self, kind: Option<&str>, options: &Value) -> Result<()> {
         self.registry
             .borrow()
             .plugins
-            .validate_view_options_value(options)
+            .validate_view_options_value(kind, options)
     }
 
-    pub fn format_statusline(&mut self, name: &str, context: &Value) -> Result<Value> {
-        let handler = self
-            .registry
-            .borrow()
-            .plugins
-            .statuslines
-            .get(name)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown statusline: {name}"))?;
-
-        self.call(handler, context)
-            .with_context(|| format!("statusline {name}"))
+    pub fn format_statusline(
+        &mut self,
+        name: &str,
+        context: &zess_plugin::StatusContext,
+    ) -> Result<zess_plugin::StatusLine> {
+        let (handler, layout) = {
+            let registry = self.registry.borrow();
+            let formatter = registry
+                .plugins
+                .statuslines
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown statusline: {name}"))?;
+            let layout = if registry.builtin_statuslines.contains(name) {
+                registry.statusline_layouts.get(&context.kind).cloned()
+            } else {
+                None
+            };
+            (formatter.clone(), layout)
+        };
+        (|| -> Result<_> {
+            let argument = bridge::status::context(context).map_err(script_error)?;
+            let mut call = |handler: Handler| {
+                self.engine
+                    .call_function_with_args(handler.function, vec![argument.clone()])
+                    .map_err(|error| self.source_error(error, None))
+            };
+            let mut line = if layout.as_ref().is_some_and(|layout| {
+                layout.left.is_some() && layout.center.is_some() && layout.right.is_some()
+            }) {
+                zess_plugin::StatusLine {
+                    left: Vec::new(),
+                    center: Vec::new(),
+                    right: Vec::new(),
+                }
+            } else {
+                bridge::status::line(&call(handler)?)?
+            };
+            if let Some(layout) = layout {
+                for (spans, region) in [
+                    (&mut line.left, layout.left),
+                    (&mut line.center, layout.center),
+                    (&mut line.right, layout.right),
+                ] {
+                    if let Some(region) = region {
+                        *spans = bridge::status::region(Some(&call(region.handler)?))?;
+                    }
+                }
+            }
+            Ok(line)
+        })()
+        .with_context(|| format!("statusline {name}"))
     }
 
     fn call(&mut self, handler: Handler, argument: &Value) -> Result<Value> {
-        let argument = argument.clone().into_steelval().map_err(script_error)?;
+        let argument = Json(argument.clone())
+            .into_steelval()
+            .map_err(script_error)?;
         let result = self
             .engine
             .call_function_with_args(handler.function, vec![argument]);
 
         let result = result.map_err(|error| self.source_error(error, None))?;
 
-        Value::from_steelval(&result).map_err(|error| self.source_error(error, None))
+        Json::from_steelval(&result)
+            .map(|value| value.0)
+            .map_err(|error| self.source_error(error, None))
     }
 
     fn source_error(&self, error: SteelErr, fallback: Option<&Path>) -> anyhow::Error {

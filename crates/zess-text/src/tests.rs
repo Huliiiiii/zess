@@ -1,4 +1,5 @@
 use super::*;
+use std::fs;
 
 fn rendered_text(result: &RenderResult) -> String {
     result
@@ -74,6 +75,40 @@ fn preview_painting_uses_only_the_viewport_and_leaves_editing_views_unallocated(
 }
 
 #[test]
+fn visible_source_fragments_preserve_character_offsets_after_horizontal_scrolling() {
+    let mut buffer = TextBuffer::new("\t界a\u{301}🙂Z0123456789\nsecond");
+    buffer.render(1, 4, 1, true);
+    buffer.scroll_view(1, 5, 0);
+    assert_eq!(
+        buffer.visible_source_lines(1),
+        vec![(0, 1, "界a\u{301}🙂".into())]
+    );
+
+    let mut viewport = PreviewViewport {
+        horizontal_scroll: 5,
+        ..PreviewViewport::default()
+    };
+    buffer.render_preview(&mut viewport, 4, 1, false);
+    assert_eq!(
+        buffer.preview_visible_source_lines(&viewport, false),
+        vec![(0, 1, "界a\u{301}🙂".into())]
+    );
+}
+
+#[test]
+fn visible_source_fragments_bound_large_lines_to_the_viewport() {
+    let mut buffer = TextBuffer::new(&"a".repeat(20 * 1024 * 1024));
+    buffer.render(1, 80, 2, true);
+    assert_eq!(buffer.visible_source_lines(1), vec![(0, 0, "a".repeat(80))]);
+    let mut viewport = PreviewViewport::default();
+    buffer.render_preview(&mut viewport, 80, 2, true);
+    assert_eq!(
+        buffer.preview_visible_source_lines(&viewport, true),
+        vec![(0, 0, "a".repeat(160))]
+    );
+}
+
+#[test]
 fn wrapped_previews_scroll_through_visual_lines_and_reflow_after_resize() {
     let mut buffer = TextBuffer::new("abcdefghijklmnopqrstuvwx\ntail");
     buffer.set_readonly(true);
@@ -95,6 +130,10 @@ fn wrapped_previews_scroll_through_visual_lines_and_reflow_after_resize() {
     let layout = buffer.preview_wrap.as_ref().unwrap();
     assert_eq!(layout.rows.len(), 3);
     assert!(!layout.complete);
+    assert_eq!(
+        buffer.preview_visible_source_lines(&viewport, true),
+        vec![(0, 0, "abcdefghijklmnop".into())]
+    );
     viewport.scroll = 99;
     viewport.horizontal_scroll = 99;
     assert_eq!(
@@ -103,6 +142,10 @@ fn wrapped_previews_scroll_through_visual_lines_and_reflow_after_resize() {
     );
     assert_eq!(viewport.scroll, 2);
     assert_eq!(viewport.horizontal_scroll, 0);
+    assert_eq!(
+        buffer.preview_visible_source_lines(&viewport, true),
+        vec![(0, 16, "qrstuvwx\n".into()), (1, 25, "tail".into())]
+    );
     assert_eq!(
         text(buffer.render_preview(&mut viewport, 24, 2, true)),
         ["abcdefghijklmnopqrstuvwx", "tail"]
@@ -976,6 +1019,20 @@ fn repeating_insert_replays_text_deletion_newlines_tabs_and_cursor_movement() {
 }
 
 #[test]
+fn repeating_insert_replays_typed_and_pasted_text_in_order() {
+    let mut buffer = TextBuffer::new("");
+    buffer.execute_command(1, "text.append").unwrap();
+    buffer.input_text(1, "A").unwrap();
+    buffer.paste_text(1, "b\nβ").unwrap();
+    buffer.input_text(1, "C").unwrap();
+    buffer.execute_command(1, "text.escape").unwrap();
+    assert_eq!(buffer.text(), "Ab\nβC");
+
+    buffer.execute_command(1, "text.repeat-insert").unwrap();
+    assert_eq!(buffer.text(), "Ab\nβCAb\nβC");
+}
+
+#[test]
 fn repeated_insertions_preserve_the_original_sequence_and_have_separate_undo_steps() {
     let mut buffer = TextBuffer::new("z");
     buffer.execute_command(1, "text.append").unwrap();
@@ -1047,6 +1104,81 @@ fn unfinished_insertions_and_other_views_do_not_replace_the_completed_history() 
     source.execute_command(1, "text.escape").unwrap();
     target.execute_command(1, "text.repeat-insert").unwrap();
     assert_eq!(target.text(), "ABC");
+}
+
+#[test]
+fn readonly_discards_the_unfinished_insertion_but_preserves_repeat_history() {
+    let mut buffer = TextBuffer::new("");
+    buffer.execute_command(1, "text.insert").unwrap();
+    buffer.input_text(1, "A").unwrap();
+    buffer.execute_command(1, "text.escape").unwrap();
+    buffer.execute_command(1, "text.append").unwrap();
+    buffer.input_text(1, "B").unwrap();
+    buffer.set_readonly(true);
+    assert_eq!(buffer.text(), "AB");
+    assert_eq!(buffer.view(1).mode(), "normal");
+    assert!(matches!(
+        buffer.views[&1].insert_recording,
+        InsertRecording::Idle
+    ));
+
+    buffer.set_readonly(false);
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "A");
+    buffer.execute_command(1, "text.repeat-insert").unwrap();
+    assert_eq!(buffer.text(), "AA");
+}
+
+#[test]
+fn readonly_discards_unfinished_insertions_in_all_views() {
+    let history = InsertHistory::default();
+    let mut completed = TextBuffer::new("");
+    completed.set_insert_history(history.clone());
+    completed.execute_command(1, "text.insert").unwrap();
+    completed.input_text(1, "A").unwrap();
+    completed.execute_command(1, "text.escape").unwrap();
+
+    let mut buffer = TextBuffer::new("");
+    buffer.set_insert_history(history.clone());
+    buffer.execute_command(1, "text.insert").unwrap();
+    buffer.input_text(1, "B").unwrap();
+    buffer.execute_command(2, "text.insert").unwrap();
+    buffer.input_text(2, "C").unwrap();
+    buffer.set_readonly(true);
+    assert_eq!(buffer.text(), "CB");
+    for id in [1, 2] {
+        assert_eq!(buffer.view(id).mode(), "normal");
+        assert!(matches!(
+            buffer.views[&id].insert_recording,
+            InsertRecording::Idle
+        ));
+    }
+    buffer.set_readonly(false);
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "B");
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "");
+    buffer.execute_command(1, "text.repeat-insert").unwrap();
+    assert_eq!(buffer.text(), "A");
+}
+
+#[test]
+fn insertions_in_different_views_have_separate_undo_transactions() {
+    let mut buffer = TextBuffer::new("");
+    buffer.execute_command(1, "text.insert").unwrap();
+    buffer.input_text(1, "A").unwrap();
+    buffer.execute_command(2, "text.insert").unwrap();
+    buffer.input_text(2, "B").unwrap();
+    buffer.remove_view(2);
+    buffer.input_text(1, "C").unwrap();
+    buffer.execute_command(1, "text.escape").unwrap();
+    assert_eq!(buffer.text(), "BAC");
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "BA");
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "A");
+    buffer.execute_command(1, "text.undo").unwrap();
+    assert_eq!(buffer.text(), "");
 }
 
 #[test]
@@ -1613,6 +1745,72 @@ fn saving_preserves_an_explicit_language_choice() {
     assert!(buffer.outline().is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn saving_through_a_symlink_preserves_the_link_and_target_permissions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target.txt");
+    let link = directory.path().join("link.txt");
+    fs::write(&target, "old").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o750)).unwrap();
+    symlink("target.txt", &link).unwrap();
+    let mut buffer = TextBuffer::open(&link).unwrap();
+    buffer.execute(1, TextCommand::Insert).unwrap();
+    buffer.input_event(1, TextInput::Character('!')).unwrap();
+
+    buffer.save(None).unwrap();
+
+    assert_eq!(fs::read_link(link).unwrap(), Path::new("target.txt"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "!old");
+    assert_eq!(
+        fs::metadata(target).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn saving_a_retargeted_symlink_leaves_both_targets_untouched() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("original.txt");
+    let new = directory.path().join("new.txt");
+    let link = directory.path().join("link.txt");
+    fs::write(&original, "same").unwrap();
+    fs::write(&new, "same").unwrap();
+    symlink(&original, &link).unwrap();
+    let mut buffer = TextBuffer::open(&link).unwrap();
+    buffer.execute(1, TextCommand::Insert).unwrap();
+    buffer.input_event(1, TextInput::Character('!')).unwrap();
+    fs::remove_file(&link).unwrap();
+    symlink(&new, &link).unwrap();
+
+    let error = buffer.save(None).unwrap_err();
+    assert!(format!("{error:#}").contains("file changed on disk"));
+    assert_eq!(fs::read_to_string(original).unwrap(), "same");
+    assert_eq!(fs::read_to_string(new).unwrap(), "same");
+}
+
+#[test]
+fn using_enter_as_a_replacement_character_preserves_crlf() {
+    let mut buffer = TextBuffer::new("first\r\nsecond\r\n");
+    buffer.execute(1, TextCommand::ReplaceCharacter).unwrap();
+    buffer.input_event(1, TextInput::Enter).unwrap();
+    assert_eq!(buffer.text(), "\r\nirst\r\nsecond\r\n");
+}
+
+#[test]
+fn surrounding_with_crlf_keeps_both_line_endings_in_the_selection() {
+    let mut buffer = TextBuffer::new("first\r\nsecond\r\n");
+    buffer.execute(1, TextCommand::SurroundAdd).unwrap();
+    buffer.input_event(1, TextInput::Enter).unwrap();
+    let selection = buffer.view(1).selection().primary();
+    assert_eq!(selection.fragment(buffer.rope.slice(..)), "\r\nf\r\n");
+}
+
 #[test]
 fn reloading_updates_the_outline_and_highlights() {
     let directory = tempfile::tempdir().unwrap();
@@ -1903,13 +2101,10 @@ fn cancelling_a_search_restores_the_selection_mode_and_viewport() {
     assert_eq!(view.selection, original.selection);
     assert_eq!(view.mode, original.mode);
     assert_eq!(
-        (view.scroll, view.horizontal_scroll, view.manual_viewport),
-        (
-            original.scroll,
-            original.horizontal_scroll,
-            original.manual_viewport
-        )
+        (view.scroll, view.horizontal_scroll),
+        (original.scroll, original.horizontal_scroll)
     );
+    assert!(view.scroll_mode == original.scroll_mode);
 }
 
 #[test]
@@ -1963,7 +2158,7 @@ fn selections_crossing_the_viewport_keep_their_styles_and_secondary_cursor() {
         0,
     );
     view.scroll = 2;
-    view.manual_viewport = true;
+    view.scroll_mode = ScrollMode::UserControlled;
 
     let frame = buffer.render(1, 3, 2, true);
 
@@ -1997,7 +2192,7 @@ fn reloading_maps_each_views_selection_through_the_file_changes() {
     buffer.goto_line(1, 1);
     buffer.goto_line(2, 2);
 
-    buffer.reload_contents("new\nfirst\nsecond\nthird\n");
+    buffer.reload_contents("sample.txt".into(), "new\nfirst\nsecond\nthird\n");
 
     assert_eq!(buffer.view(1).cursor(), (2, 0));
     assert_eq!(buffer.view(2).cursor(), (3, 0));
@@ -2014,7 +2209,7 @@ fn reloading_maps_each_views_selection_through_the_file_changes() {
 fn reloading_a_hidden_buffer_preserves_its_history_without_creating_a_view() {
     let mut buffer = TextBuffer::new("before\n");
 
-    buffer.reload_contents("after\n");
+    buffer.reload_contents("sample.txt".into(), "after\n");
 
     assert_eq!(buffer.text(), "after\n");
     assert!(buffer.views.is_empty());

@@ -587,8 +587,12 @@ impl Listener {
                 let at_git_root = path
                     .parent()
                     .is_some_and(|parent| self.metadata.iter().any(|dir| dir == parent));
+                // Git updates the mtime of the content-addressed shared index on read.
+                // Some watch backends report only a generic modification for that update.
+                let shared_index_refresh =
+                    matches!(event.kind, WatchEventKind::Modify) && shared_index && at_git_root;
                 let index_change = at_git_root && (name == Some(b"index") || shared_index);
-                !(git_metadata && lock_file || self.history && index_change)
+                !(git_metadata && lock_file || shared_index_refresh || self.history && index_change)
                     && self.filter.matches(path)
             });
         if accepted && let Some(signal) = self.signal.upgrade() {

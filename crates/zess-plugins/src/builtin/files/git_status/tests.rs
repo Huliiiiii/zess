@@ -243,6 +243,51 @@ fn non_git_directories_keep_their_plain_file_rows() {
     assert!(rows[0].cells.is_empty());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_names_keep_other_files_and_their_decorations_visible() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let fixture = Fixture::new();
+    git(&fixture.0, &["init", "--quiet"]);
+    let raw_path = fixture.0.join(OsStr::from_bytes(b"note-\xff"));
+    fs::write(raw_path, "raw\n").unwrap();
+    fs::write(fixture.0.join("note-\u{fffd}"), "unicode\n").unwrap();
+    let (mut plugin, input) = fixture.plugin();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut notices = Vec::new();
+    let rows = loop {
+        let output = plugin.update(&input).unwrap();
+        notices.extend(
+            output
+                .requests
+                .into_iter()
+                .filter_map(|request| match request {
+                    zess_plugin::HostRequest::Message { text } => Some(text),
+                    _ => None,
+                }),
+        );
+        let display = output.display.unwrap();
+        if !display.loading {
+            break display.rows;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    let files: Vec<_> = rows.iter().filter(|row| row.id != ".git").collect();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].id, "note-\u{fffd}");
+    assert_eq!(files[0].style, "git.added");
+    notices.sort();
+    assert_eq!(
+        notices,
+        [
+            "Git status: Skipped 1 Git entry with a non-UTF-8 path",
+            "Skipped 1 directory entry with a non-UTF-8 name",
+        ]
+    );
+}
+
 #[test]
 fn broken_repositories_report_the_error_without_hiding_files() {
     let fixture = Fixture::new();

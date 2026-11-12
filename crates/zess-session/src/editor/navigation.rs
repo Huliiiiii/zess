@@ -9,6 +9,26 @@ pub(super) struct History {
 }
 
 impl History {
+    pub(super) fn locations(&self) -> impl Iterator<Item = &ViewLocation> {
+        self.stack
+            .iter()
+            .chain(self.pages.values().flatten())
+            .chain(self.plugin.iter().map(|plugin| &plugin.origin))
+    }
+
+    pub(super) fn replace_buffer(&mut self, buffer: BufferId, replacement: BufferId) {
+        self.stack.retain(|location| location.buffer != buffer);
+        for locations in self.pages.values_mut() {
+            locations.retain(|location| location.buffer != buffer);
+        }
+        if let Some(plugin) = &mut self.plugin {
+            if plugin.origin.buffer == buffer {
+                plugin.origin = ViewLocation::new(replacement);
+            }
+            plugin.buffers.remove(&buffer);
+        }
+    }
+
     pub(super) fn references_buffer(&self, buffer: BufferId) -> bool {
         self.stack.iter().any(|view| view.buffer == buffer)
             || self
@@ -31,13 +51,13 @@ pub(super) struct PluginNavigation {
 impl Session {
     pub(super) fn open_plugin_navigation(
         &mut self,
+        id: ViewId,
         kind: &str,
         argument: Value,
         text_source: Option<BufferId>,
     ) -> Result<()> {
-        let id = self.focus;
         self.ensure_focus_allowed(id)?;
-        if !matches!(self.views[&id].layer_content, Some(LayerContent::File)) {
+        if !matches!(self.views.layer_content(id), Some(LayerContent::File)) {
             self.ensure_buffer_switch_allowed(id)?;
         }
         self.require_buffer_kind(kind)?;
@@ -46,6 +66,7 @@ impl Session {
         self.leave_page(self.views.page_id(id))?;
         let buffer = self.add_buffer(Buffer::Data {
             kind: kind.into(),
+            argument: argument.clone(),
             modified: false,
             text_source,
         });
@@ -100,13 +121,13 @@ impl Session {
             }
         }
         self.remember_text();
-        self.dispatch(id, "view_entered", Value::Null)?;
+        self.enter_plugin_view(id, Value::Null)?;
         Ok(true)
     }
 
     pub(super) fn navigate(&mut self, id: ViewId, navigation: Navigation) -> Result<()> {
         self.ensure_focus_allowed(id)?;
-        if !matches!(self.views[&id].layer_content, Some(LayerContent::File)) {
+        if !matches!(self.views.layer_content(id), Some(LayerContent::File)) {
             self.ensure_buffer_switch_allowed(id)?;
         }
         let source = self.views[&id].location.buffer;
@@ -137,6 +158,7 @@ impl Session {
             Navigation::Push { kind, argument } => {
                 let buffer = self.add_buffer(Buffer::Data {
                     kind,
+                    argument: argument.clone(),
                     modified: false,
                     text_source,
                 });
@@ -162,6 +184,7 @@ impl Session {
                 } else {
                     let buffer = self.add_buffer(Buffer::Data {
                         kind,
+                        argument: argument.clone(),
                         modified: false,
                         text_source,
                     });
@@ -175,7 +198,7 @@ impl Session {
                 let outgoing = std::mem::replace(&mut history.stack, incoming);
                 history.pages.insert((group, current), outgoing);
                 *self.views.navigation_mut(id) = history;
-                self.dispatch(id, "view_entered", argument)?;
+                self.enter_plugin_view(id, argument)?;
                 return Ok(());
             }
         };
@@ -186,7 +209,7 @@ impl Session {
                 history.stack.push(old);
             }
             *self.views.navigation_mut(id) = history;
-            self.dispatch(id, "view_entered", argument)?;
+            self.enter_plugin_view(id, argument)?;
         } else {
             *self.views.navigation_mut(id) = history;
         }
@@ -211,11 +234,24 @@ impl Session {
         presentation: SnapshotPresentation,
     ) -> Result<()> {
         if matches!(presentation, SnapshotPresentation::Fullscreen)
-            && self.views[&source].layer.is_some()
+            && self.views.child(source).is_some()
         {
             bail!("view already has a layer");
         }
         self.focus_view(source)?;
+        if matches!(presentation, SnapshotPresentation::Editor) {
+            self.ensure_buffer_switch_allowed(source)?;
+        }
+        self.cancel_input_context()?;
+        let source = self.focus;
+        if matches!(presentation, SnapshotPresentation::Fullscreen) {
+            anyhow::ensure!(
+                self.views.child(source).is_none(),
+                "view already has a layer"
+            );
+        } else {
+            self.ensure_buffer_switch_allowed(source)?;
+        }
         let buffer = if matches!(presentation, SnapshotPresentation::Editor) {
             self.buffers.iter().find_map(|(&id, buffer)| match buffer {
                 Buffer::Snapshot { id: saved, .. } if saved == &snapshot.id => Some(id),
@@ -225,9 +261,11 @@ impl Session {
             None
         };
         let buffer = buffer.unwrap_or_else(|| {
-            let mut text = TextBuffer::new_with_path(
+            let mut text = TextBuffer::new_with_path_and_capabilities(
                 &snapshot.text,
                 &self.absolute(Path::new(&snapshot.id.path)),
+                self.services.borrow().file_system(),
+                self.syntax_provider.clone(),
             );
             text.set_readonly(true);
             self.add_buffer(Buffer::Snapshot {
@@ -239,11 +277,14 @@ impl Session {
             SnapshotPresentation::Editor => self.switch_buffer(buffer)?,
             SnapshotPresentation::Fullscreen => {
                 let child = self.create_page(buffer);
-                let view = self.views.get_mut(&child).unwrap();
-                view.parent = Some(source);
-                view.layer_content = Some(LayerContent::File);
-                view.presentation = LayerPresentation::Fullscreen;
-                self.views.get_mut(&source).unwrap().layer = Some(child);
+                self.views.attach_layer(
+                    child,
+                    super::LayerAttachment {
+                        parent: source,
+                        content: LayerContent::File,
+                        presentation: LayerPresentation::Fullscreen,
+                    },
+                );
                 self.focus_view(child)?;
             }
         }

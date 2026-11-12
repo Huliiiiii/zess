@@ -40,6 +40,7 @@ pub struct Registry<H> {
     view_defaults: BTreeMap<BufferKindId, serde_json::Map<String, Value>>,
     view_options: BTreeMap<BufferKindId, Value>,
     pub editor_options: EditorOptions,
+    pub on_client_exit: crate::OnClientExit,
     pub keymap: Keymap,
     modes: Vec<ModeRegistration>,
 }
@@ -65,6 +66,7 @@ impl<H> Registry<H> {
             view_defaults: BTreeMap::new(),
             view_options: BTreeMap::new(),
             editor_options: EditorOptions::default(),
+            on_client_exit: crate::OnClientExit::default(),
             modes: Vec::new(),
         }
     }
@@ -177,32 +179,31 @@ impl<H> Registry<H> {
         &self.modes
     }
 
-    pub fn view_options(&self, kind: &str) -> Value {
-        let Some(kind) = self.identities.buffer_kind(kind) else {
-            return Value::Object(Default::default());
-        };
-        let mut options = self.view_defaults.get(&kind).cloned().unwrap_or_default();
-        if let Some(configured) = self.view_options.get(&kind).and_then(Value::as_object) {
-            options.extend(configured.clone());
+    pub fn view_options_with_overrides(
+        &self,
+        kind: &str,
+        overrides: Option<&serde_json::Map<String, Value>>,
+    ) -> Value {
+        let mut options = serde_json::Map::new();
+        if let Some(kind) = self.identities.buffer_kind(kind) {
+            if let Some(defaults) = self.view_defaults.get(&kind) {
+                options.clone_from(defaults);
+            }
+            if let Some(configured) = self.view_options.get(&kind).and_then(Value::as_object) {
+                options.extend(configured.clone());
+            }
+        }
+        if let Some(overrides) = overrides {
+            options.extend(overrides.clone());
         }
         Value::Object(options)
     }
 
-    pub fn validate_view_options(&self) -> Result<()> {
-        let kinds = self
-            .view_defaults
-            .keys()
-            .chain(self.view_options.keys())
-            .collect::<BTreeSet<_>>();
-        for kind in kinds {
-            let name = self.identities.buffer_kind_name(*kind);
-            self.validate_view_options_value(&self.view_options(&name))
-                .with_context(|| format!("view options for {name}"))?;
-        }
-        Ok(())
+    pub fn view_options(&self, kind: &str) -> Value {
+        self.view_options_with_overrides(kind, None)
     }
 
-    pub fn validate_view_options_value(&self, options: &Value) -> Result<()> {
+    pub fn validate_view_options_value(&self, kind: Option<&str>, options: &Value) -> Result<()> {
         if !options.is_object() {
             return Err(anyhow!("view options must be an object"));
         }
@@ -213,6 +214,9 @@ impl<H> Registry<H> {
             if !statusline.is_empty() && !self.statuslines.contains_key(statusline) {
                 return Err(anyhow!("unknown statusline {statusline}"));
             }
+        }
+        if let Some(formats) = options.get("status-formats") {
+            crate::validate_status_formats(formats)?;
         }
         if options
             .get("header-style")
@@ -239,6 +243,25 @@ impl<H> Registry<H> {
                 .parse::<char>()
                 .context("default-yank-register must be a single character")?;
             crate::validate_register_write(register)?;
+        }
+        if let Some(BufferBackend::Native(backend)) =
+            kind.and_then(|kind| self.buffer_backend(kind))
+        {
+            backend.borrow().validate_view_options(options)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_view_options(&self) -> Result<()> {
+        let kinds = self
+            .view_defaults
+            .keys()
+            .chain(self.view_options.keys())
+            .collect::<BTreeSet<_>>();
+        for kind in kinds {
+            let name = self.identities.buffer_kind_name(*kind).to_string();
+            self.validate_view_options_value(Some(&name), &self.view_options(&name))
+                .with_context(|| format!("view options for {name}"))?;
         }
         Ok(())
     }

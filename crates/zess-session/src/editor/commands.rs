@@ -238,48 +238,91 @@ impl Session {
     ) -> Result<()> {
         let command = match action {
             NativeAction::Text(command) => {
-                let buffer = self.views[&self.focus].location.buffer;
+                if origin != self.focus
+                    && matches!(
+                        command,
+                        TextCommand::GotoWord
+                            | TextCommand::SelectRegex
+                            | TextCommand::SplitRegex
+                            | TextCommand::SearchForward
+                            | TextCommand::SearchBackward
+                            | TextCommand::FindForward
+                            | TextCommand::FindBackward
+                            | TextCommand::TillForward
+                            | TextCommand::TillBackward
+                            | TextCommand::ReplaceCharacter
+                            | TextCommand::SelectRegister
+                            | TextCommand::TextObjectInside
+                            | TextCommand::TextObjectAround
+                            | TextCommand::SurroundAdd
+                            | TextCommand::SurroundReplace
+                            | TextCommand::SurroundDelete
+                    )
+                {
+                    bail!("text input requires the focused view");
+                }
+                let buffer = self.views[&origin].location.buffer;
                 let effect = self
                     .buffers
                     .get_mut(&buffer)
                     .and_then(Buffer::text)
                     .context("command requires a text buffer")?
-                    .execute(self.focus, command)?;
-                return self.text_effect(effect);
+                    .execute(origin, command)?;
+                return self.text_effect_for(origin, effect);
             }
-            NativeAction::Prompt(command) => return self.prompt_command(command),
-            NativeAction::Data(command) => return self.data_command(command),
-            NativeAction::Help(command) => return self.help_command(command),
+            NativeAction::Prompt(command) => {
+                anyhow::ensure!(
+                    origin == self.focus,
+                    "prompt commands require the focused view"
+                );
+                return self.prompt_command(command);
+            }
+            NativeAction::Data(command) => return self.data_command(origin, command),
+            NativeAction::Help(command) => {
+                anyhow::ensure!(
+                    origin == self.focus,
+                    "help interaction requires the focused view"
+                );
+                return self.help_command(command);
+            }
             NativeAction::Preview(command) => {
+                if origin != self.focus
+                    && matches!(
+                        command,
+                        PreviewCommand::DiffSearchForward | PreviewCommand::DiffSearchBackward
+                    )
+                {
+                    bail!("preview interaction requires the focused view");
+                }
                 return match command {
                     PreviewCommand::DiffSearchForward => self.begin_diff_search(true),
                     PreviewCommand::DiffSearchBackward => self.begin_diff_search(false),
-                    PreviewCommand::DiffSearchNext => self.search_diff(true),
-                    PreviewCommand::DiffSearchPrevious => self.search_diff(false),
-                    PreviewCommand::DiffMoveNext => self.move_diff(true, false),
-                    PreviewCommand::DiffMovePrevious => self.move_diff(false, false),
+                    PreviewCommand::DiffSearchNext => self.search_diff(origin, true),
+                    PreviewCommand::DiffSearchPrevious => self.search_diff(origin, false),
+                    PreviewCommand::DiffMoveNext => self.move_diff(origin, true, false),
+                    PreviewCommand::DiffMovePrevious => self.move_diff(origin, false, false),
                     PreviewCommand::DiffGotoFirst
                     | PreviewCommand::DiffGotoLast
                     | PreviewCommand::DiffPageHalfDown
-                    | PreviewCommand::DiffPageHalfUp => self.navigate_diff(command),
-                    PreviewCommand::DiffToggleSelection => self.toggle_diff_selection(),
-                    PreviewCommand::DiffRangeSelection => self.range_diff_selection(),
-                    PreviewCommand::DiffSelectHunk => self.select_diff_hunk(),
-                    PreviewCommand::DiffApplySelection => self.apply_diff_selection(),
-                    PreviewCommand::DiffHunkNext => self.diff_hunk(true),
-                    PreviewCommand::DiffHunkPrevious => self.diff_hunk(false),
-                    PreviewCommand::DiffEditSource => self.edit_diff_source(),
-                    PreviewCommand::OpenSource => self.open_preview_source(),
-                    PreviewCommand::MoveLeft => self.move_preview(ViewDirection::Left),
-                    PreviewCommand::MoveRight => self.move_preview(ViewDirection::Right),
-                    PreviewCommand::MoveUp => self.move_preview(ViewDirection::Up),
-                    PreviewCommand::MoveDown => self.move_preview(ViewDirection::Down),
-                    PreviewCommand::Focus => self.focus_preview(),
-                    PreviewCommand::Return => self.return_from_preview(),
+                    | PreviewCommand::DiffPageHalfUp => self.navigate_diff(origin, command),
+                    PreviewCommand::DiffToggleSelection => self.toggle_diff_selection(origin),
+                    PreviewCommand::DiffRangeSelection => self.range_diff_selection(origin),
+                    PreviewCommand::DiffSelectHunk => self.select_diff_hunk(origin),
+                    PreviewCommand::DiffApplySelection => self.apply_diff_selection(origin),
+                    PreviewCommand::DiffHunkNext => self.move_diff(origin, true, true),
+                    PreviewCommand::DiffHunkPrevious => self.move_diff(origin, false, true),
+                    PreviewCommand::DiffEditSource => self.edit_diff_source(origin),
+                    PreviewCommand::OpenSource => self.open_preview_source(origin),
+                    PreviewCommand::MoveLeft => self.move_preview(origin, ViewDirection::Left),
+                    PreviewCommand::MoveRight => self.move_preview(origin, ViewDirection::Right),
+                    PreviewCommand::MoveUp => self.move_preview(origin, ViewDirection::Up),
+                    PreviewCommand::MoveDown => self.move_preview(origin, ViewDirection::Down),
+                    PreviewCommand::Focus => self.focus_preview(origin),
+                    PreviewCommand::Return => self.return_from_preview(origin),
                 };
             }
             NativeAction::Count(digit) => {
-                let view = self.views.get_mut(&self.focus).unwrap();
+                let view = self.views.get_mut(&origin).unwrap();
                 if !matches!(
                     self.buffers[&view.location.buffer],
                     Buffer::Data { .. } | Buffer::Items { .. }
@@ -294,6 +337,21 @@ impl Session {
         if command == EditorCommand::BrowserOpenSource {
             return self.open_browser_source(origin, argument);
         }
+        if origin != self.focus
+            && matches!(
+                command,
+                EditorCommand::CommandPrompt
+                    | EditorCommand::Help
+                    | EditorCommand::KeySequenceCancel
+                    | EditorCommand::FocusLeft
+                    | EditorCommand::FocusDown
+                    | EditorCommand::FocusUp
+                    | EditorCommand::FocusRight
+                    | EditorCommand::FocusNext
+            )
+        {
+            bail!("editor interaction requires the focused view");
+        }
         let argument = argument
             .get("argument")
             .and_then(Value::as_str)
@@ -304,7 +362,10 @@ impl Session {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Command,
                     text: String::new(),
-                    view: self.focus,
+                    target: super::PromptTarget {
+                        view: self.focus,
+                        buffer: self.views[&self.focus].location.buffer,
+                    },
                     completion: None,
                     error: None,
                     cursor: 0,
@@ -312,7 +373,7 @@ impl Session {
             }
             EditorCommand::Help => self.show_help(),
             EditorCommand::KeySequenceCancel => {
-                self.pending.clear();
+                self.key_sequence.clear();
                 self.views.get_mut(&self.focus).unwrap().count.clear();
             }
             EditorCommand::FocusLeft => self.focus_direction(ViewDirection::Left)?,
@@ -320,52 +381,71 @@ impl Session {
             EditorCommand::FocusUp => self.focus_direction(ViewDirection::Up)?,
             EditorCommand::FocusRight => self.focus_direction(ViewDirection::Right)?,
             EditorCommand::FocusNext => self.focus_next(1)?,
-            EditorCommand::Exit => self.exiting = true,
-            EditorCommand::Quit => self.close_view(false)?,
-            EditorCommand::QuitForce => self.close_view(true)?,
+            EditorCommand::Exit => {
+                self.request_stop(false)?;
+            }
+            EditorCommand::Quit => self.close_view_from(origin, false)?,
+            EditorCommand::QuitForce => self.close_view_from(origin, true)?,
             EditorCommand::Write => {
-                let buffer = self.views[&self.focus].location.buffer;
-                let file_layer = matches!(
-                    self.views[&self.focus].layer_content,
-                    Some(LayerContent::File)
-                );
+                let buffer = self.views[&origin].location.buffer;
+                let file_layer =
+                    matches!(self.views.layer_content(origin), Some(LayerContent::File));
                 match self.buffers.get_mut(&buffer).unwrap() {
-                    Buffer::Text(_) if self.views[&self.focus].parent.is_some() && !file_layer => {
-                        self.close_view(false)?
+                    Buffer::Text(_) if self.views.parent(origin).is_some() && !file_layer => {
+                        self.close_view_from(origin, false)?
                     }
                     Buffer::Text(text) => {
                         let path = (!argument.is_empty()).then(|| self.workspace.join(argument));
                         text.save(path.as_deref())?;
+                        self.operation_outcome = Some(zess_protocol::CommandOutcome::Saved {
+                            buffer_id: buffer,
+                            version: text.version(),
+                        });
                         self.services.borrow_mut().invalidate_fs();
                         self.message = format!("{} written", text.path().unwrap().display());
                     }
-                    Buffer::Data { .. } => self.dispatch(self.focus, "save", Value::Null)?,
+                    Buffer::Data { .. } => self.dispatch(origin, "save", Value::Null)?,
                     _ => bail!("buffer is read only"),
                 }
-                self.rebind_file_watch(buffer)?;
+                if let Err(error) = self.rebind_file_watch(buffer) {
+                    self.message = format!("buffer saved; file watch: {error:#}");
+                }
             }
             EditorCommand::WriteQuit => {
-                let original = self.focus;
-                self.command(&format!("w {argument}"))?;
-                if self.focus == original {
-                    self.close_view(false)?;
+                let original_buffer = self.views[&origin].location.buffer;
+                self.native_command(
+                    origin,
+                    NativeAction::Editor(EditorCommand::Write),
+                    json!({"argument": argument}),
+                )?;
+                if self
+                    .views
+                    .get(&origin)
+                    .is_some_and(|view| view.location.buffer == original_buffer)
+                {
+                    self.close_view_from(origin, false)?;
                 }
             }
             EditorCommand::Open => {
-                self.ensure_buffer_switch_allowed(self.focus)?;
+                self.ensure_buffer_switch_allowed(origin)?;
                 let buffer = self.load_file(Path::new(argument))?;
-                self.switch_buffer(buffer)?;
+                self.switch_buffer_with(origin, buffer, Value::Null)?;
             }
             EditorCommand::New => {
-                self.ensure_buffer_switch_allowed(self.focus)?;
-                let buffer = self.add_buffer(Buffer::Text(TextBuffer::new("")));
-                self.switch_buffer(buffer)?;
+                self.ensure_buffer_switch_allowed(origin)?;
+                let text = TextBuffer::with_capabilities(
+                    "",
+                    self.services.borrow().file_system(),
+                    self.syntax_provider.clone(),
+                );
+                let buffer = self.add_buffer(Buffer::Text(text));
+                self.switch_buffer_with(origin, buffer, Value::Null)?;
             }
-            EditorCommand::Vsplit => self.split(Axis::Vertical)?,
-            EditorCommand::Hsplit => self.split(Axis::Horizontal)?,
+            EditorCommand::Vsplit => self.split(origin, Axis::Vertical)?,
+            EditorCommand::Hsplit => self.split(origin, Axis::Horizontal)?,
             EditorCommand::BufferNext | EditorCommand::BufferPrevious => {
-                self.ensure_buffer_switch_allowed(self.focus)?;
-                let owner = self.preview_source(self.focus).unwrap_or(self.focus);
+                self.ensure_buffer_switch_allowed(origin)?;
+                let owner = self.preview_source(origin).unwrap_or(origin);
                 self.close_plugin_navigation(self.views.page_id(owner), false)?;
                 let ids = self
                     .buffers
@@ -381,14 +461,14 @@ impl Session {
                 }
                 .copied()
                 .context("no selectable editor buffers")?;
-                self.switch_buffer(next)?;
+                self.switch_buffer_with(owner, next, Value::Null)?;
             }
             EditorCommand::Buffer => {
                 let id = argument.parse()?;
                 if !self.is_switchable_buffer(id) {
                     bail!("buffer {id} is not a selectable editor buffer");
                 }
-                self.switch_buffer(id)?;
+                self.switch_buffer_with(origin, id, Value::Null)?;
             }
             EditorCommand::Buffers => {
                 self.message = self
@@ -400,7 +480,7 @@ impl Session {
                     .join(" ")
             }
             EditorCommand::SetLanguage => {
-                let buffer = self.views[&self.focus].location.buffer;
+                let buffer = self.views[&origin].location.buffer;
                 let text = self
                     .buffers
                     .get_mut(&buffer)
@@ -413,28 +493,30 @@ impl Session {
                 }
             }
             EditorCommand::Reload => {
-                let buffer = self.views[&self.focus].location.buffer;
+                let buffer = self.views[&origin].location.buffer;
                 let Some(Buffer::Text(text)) = self.buffers.get_mut(&buffer) else {
                     bail!("command requires a file buffer");
                 };
-                text.reload(self.focus)?;
+                text.reload(origin)?;
                 self.rebind_file_watch(buffer)?;
                 self.services.borrow_mut().invalidate_fs();
                 self.message = "File reloaded".into();
                 self.refresh_context_plugins()?;
             }
             EditorCommand::ConfigReload => {
-                if self
-                    .buffers
-                    .values()
-                    .any(|buffer| matches!(buffer, Buffer::Data { kind, modified: true, .. } if !self.scripts.as_ref().is_some_and(|runtime|runtime.is_native_buffer(kind))))
-                {
+                self.message.clear();
+                if self.plugin_buffers().any(|(kind, modified)| {
+                    modified
+                        && !self
+                            .scripts
+                            .as_ref()
+                            .is_some_and(|runtime| runtime.is_native_buffer(kind))
+                }) {
                     bail!("save or undo pending buffer changes before reloading");
                 }
-                if !self.reload() {
-                    return Ok(());
-                }
-                self.cancel_input_context()?;
+                self.reload()?;
+                self.cancel_input_context()
+                    .context("could not reset input after installing the configuration")?;
                 let ids = self
                     .views
                     .iter()
@@ -444,28 +526,30 @@ impl Session {
                     })
                     .collect::<Vec<_>>();
                 for id in ids {
-                    let view = self.views.get_mut(&id).unwrap();
-                    let kind = match &self.buffers[&view.location.buffer] {
-                        Buffer::Data { kind, .. } => kind,
-                        _ => unreachable!(),
+                    let Some(kind) = self
+                        .views
+                        .get(&id)
+                        .and_then(|view| self.buffers[&view.location.buffer].plugin_kind())
+                    else {
+                        continue;
                     };
-                    if self
+                    let refreshed = if self
                         .scripts
                         .as_ref()
                         .is_some_and(|runtime| runtime.is_native_buffer(kind))
                     {
-                        self.dispatch(id, "render", Value::Null)?;
-                        continue;
-                    }
-                    if view.layer.is_none() {
-                        view.location.memories.clear();
-                    }
-                    view.location.mode = ViewMode::Normal;
-                    if self.scripts.is_some() {
-                        self.dispatch(id, "init", Value::Null)?;
-                    }
+                        self.dispatch(id, "render", Value::Null)
+                    } else {
+                        self.reinitialize_plugin_view(id)
+                    };
+                    refreshed
+                        .context("could not refresh a view after installing the configuration")?;
                 }
-                self.emit_event("reload", json!({"generation":self.generation}))?;
+                self.emit_event("reload", json!({"generation":self.generation}))
+                    .context("reload hook failed after installing the configuration")?;
+                if self.message.is_empty() {
+                    self.message = "user plugins reloaded".into();
+                }
             }
             EditorCommand::BrowserOpenSource => {
                 unreachable!("handled before parsing command arguments")

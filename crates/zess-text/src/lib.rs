@@ -4,19 +4,19 @@
 //! Helix's MPL-2.0 core at the revision pinned in Cargo.toml.
 use std::{
     collections::HashMap,
-    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
 use helix_core::{
-    Assoc, Range, Rope, Selection, SmallVec, Transaction, char_idx_at_visual_offset,
+    Assoc, LineEnding, Range, Rope, Selection, SmallVec, Transaction, char_idx_at_visual_offset,
     chars::char_is_word,
     comment,
     doc_formatter::{DocumentFormatter, FormattedGrapheme, TextFormat},
     graphemes::{Grapheme, next_grapheme_boundary, prev_grapheme_boundary},
     history::{History, State},
+    line_ending::auto_detect_line_ending,
     movement::{self, Direction, Movement},
     surround,
     syntax::{Highlight, HighlightEvent, OverlayHighlighter, OverlayHighlights},
@@ -27,8 +27,9 @@ use helix_core::{
 };
 use helix_stdx::rope::RopeSliceExt;
 use unicode_width::UnicodeWidthStr;
+use zess_platform::{FileSystem, NativeFileSystem};
 use zess_plugin::{CommandCount, OutlineSymbol};
-use zess_ui::{FrameRow, Span};
+use zess_ui::{FrameRow, ScrollMode, Span};
 
 mod cursor;
 pub use cursor::Cursor;
@@ -37,6 +38,7 @@ mod language;
 pub mod runtime;
 
 use language::LanguageAttachment;
+pub use language::{HelixSyntaxProvider, SyntaxProvider};
 
 #[cfg(test)]
 mod tests;
@@ -220,7 +222,7 @@ enum PendingInput {
         selection: Selection,
         scroll: usize,
         horizontal_scroll: usize,
-        manual_viewport: bool,
+        scroll_mode: ScrollMode,
         input: String,
     },
     GotoWord {
@@ -316,7 +318,7 @@ pub struct TextView {
     cursor: (usize, usize),
     scroll: usize,
     horizontal_scroll: usize,
-    manual_viewport: bool,
+    scroll_mode: ScrollMode,
     viewport_width: usize,
     viewport_height: usize,
     viewport_version: u64,
@@ -324,7 +326,7 @@ pub struct TextView {
     pending: PendingInput,
     register: Option<char>,
     prompt_register: char,
-    insert_recording: Option<InsertReplay>,
+    insert_recording: InsertRecording,
 }
 
 impl Default for TextView {
@@ -335,7 +337,7 @@ impl Default for TextView {
             cursor: (0, 0),
             scroll: 0,
             horizontal_scroll: 0,
-            manual_viewport: false,
+            scroll_mode: ScrollMode::FollowSelection,
             viewport_width: 0,
             viewport_height: 1,
             viewport_version: 0,
@@ -343,12 +345,21 @@ impl Default for TextView {
             pending: PendingInput::None,
             register: None,
             prompt_register: '/',
-            insert_recording: None,
+            insert_recording: InsertRecording::Idle,
         }
     }
 }
 
 impl TextView {
+    pub fn selection(&self) -> &Selection {
+        &self.selection
+    }
+    pub fn scroll(&self) -> usize {
+        self.scroll
+    }
+    pub fn horizontal_scroll(&self) -> usize {
+        self.horizontal_scroll
+    }
     /// Name used by plugin keymaps and status displays.
     pub fn mode(&self) -> &str {
         self.mode.as_str()
@@ -371,14 +382,14 @@ impl TextView {
             selection,
             scroll,
             horizontal_scroll,
-            manual_viewport,
+            scroll_mode,
             ..
         } = std::mem::take(&mut self.pending)
         {
             self.selection = selection;
             self.scroll = scroll;
             self.horizontal_scroll = horizontal_scroll;
-            self.manual_viewport = manual_viewport;
+            self.scroll_mode = scroll_mode;
         }
         self.count.clear();
         self.register = None;
@@ -474,6 +485,36 @@ struct InsertReplay {
 enum InsertEvent {
     Command(TextCommand),
     Input(TextInput),
+    Paste(String),
+}
+
+#[derive(Clone, Default)]
+enum InsertRecording {
+    #[default]
+    Idle,
+    Recording(InsertReplay),
+}
+
+impl InsertRecording {
+    fn finish(&mut self, history: &InsertHistory) {
+        if let Self::Recording(mut recording) = std::mem::take(self) {
+            if !matches!(
+                recording.events.last(),
+                Some(InsertEvent::Command(TextCommand::Escape))
+            ) {
+                recording
+                    .events
+                    .push(InsertEvent::Command(TextCommand::Escape));
+            }
+            *history.0.lock().unwrap() = Some(recording);
+        }
+    }
+}
+
+#[derive(PartialEq)]
+enum InsertPlayback {
+    Idle,
+    Replaying,
 }
 
 struct EditGroup {
@@ -482,24 +523,40 @@ struct EditGroup {
     view_id: u64,
 }
 
+#[derive(Default)]
+enum EditTransaction {
+    #[default]
+    Idle,
+    Active(EditGroup),
+}
+
 enum LanguageDetection {
     Automatic,
     Explicit,
 }
 
+struct SavedFile {
+    target: PathBuf,
+    contents: Rope,
+}
+
 pub struct TextBuffer {
+    syntax_provider: Arc<dyn SyntaxProvider>,
+    filesystem: Arc<dyn FileSystem>,
     rope: Rope,
+    line_ending: LineEnding,
     line_width: Option<(u64, usize, usize)>,
     preview_wrap: Option<PreviewWrap>,
     path: Option<PathBuf>,
     version: u64,
     history: History,
     saved_revision: usize,
-    group: Option<EditGroup>,
+    saved_file: Option<SavedFile>,
+    group: EditTransaction,
     views: HashMap<u64, TextView>,
     registers: Registers,
     insert_history: InsertHistory,
-    replaying_insert: bool,
+    insert_playback: InsertPlayback,
     reading_clipboard: bool,
     readonly: bool,
     language: Option<LanguageAttachment>,
@@ -508,19 +565,37 @@ pub struct TextBuffer {
 
 impl TextBuffer {
     pub fn new(text: &str) -> Self {
+        Self::with_filesystem(text, Arc::new(NativeFileSystem))
+    }
+
+    pub fn with_filesystem(text: &str, filesystem: Arc<dyn FileSystem>) -> Self {
+        Self::with_capabilities(text, filesystem, language::default_provider())
+    }
+
+    pub fn with_capabilities(
+        text: &str,
+        filesystem: Arc<dyn FileSystem>,
+        syntax_provider: Arc<dyn SyntaxProvider>,
+    ) -> Self {
+        let rope = Rope::from_str(text);
+        let line_ending = auto_detect_line_ending(&rope).unwrap_or(LineEnding::LF);
         Self {
-            rope: Rope::from_str(text),
+            syntax_provider,
+            filesystem,
+            rope,
+            line_ending,
             line_width: None,
             preview_wrap: None,
             path: None,
             version: 0,
             history: History::default(),
             saved_revision: 0,
-            group: None,
+            saved_file: None,
+            group: EditTransaction::Idle,
             views: HashMap::new(),
             registers: Registers::default(),
             insert_history: InsertHistory::default(),
-            replaying_insert: false,
+            insert_playback: InsertPlayback::Idle,
             reading_clipboard: false,
             readonly: false,
             language: None,
@@ -529,15 +604,47 @@ impl TextBuffer {
     }
 
     pub fn new_with_path(text: &str, path: &Path) -> Self {
-        let mut buffer = Self::new(text);
+        Self::new_with_path_and_filesystem(text, path, Arc::new(NativeFileSystem))
+    }
+
+    pub fn new_with_path_and_filesystem(
+        text: &str,
+        path: &Path,
+        filesystem: Arc<dyn FileSystem>,
+    ) -> Self {
+        Self::new_with_path_and_capabilities(text, path, filesystem, language::default_provider())
+    }
+
+    pub fn new_with_path_and_capabilities(
+        text: &str,
+        path: &Path,
+        filesystem: Arc<dyn FileSystem>,
+        syntax_provider: Arc<dyn SyntaxProvider>,
+    ) -> Self {
+        let mut buffer = Self::with_capabilities(text, filesystem, syntax_provider);
         buffer.path = Some(path.to_owned());
-        buffer.language = language::detect(path);
+        buffer.language = buffer.detect_language(path);
         buffer
     }
 
     /// Builds a preview whose initial syntax parsing runs outside the UI thread.
     pub fn new_preview_with_path(text: &str, path: &Path) -> Self {
-        let mut buffer = Self::new_with_path(text, path);
+        Self::new_preview_with_capabilities(
+            text,
+            path,
+            Arc::new(NativeFileSystem),
+            language::default_provider(),
+        )
+    }
+
+    pub fn new_preview_with_capabilities(
+        text: &str,
+        path: &Path,
+        filesystem: Arc<dyn FileSystem>,
+        syntax_provider: Arc<dyn SyntaxProvider>,
+    ) -> Self {
+        let mut buffer =
+            Self::new_with_path_and_capabilities(text, path, filesystem, syntax_provider);
         if let Some(language) = &mut buffer.language {
             language.start_background(&buffer.rope);
         }
@@ -552,25 +659,62 @@ impl TextBuffer {
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Self::open_with_filesystem(path, Arc::new(NativeFileSystem))
+    }
+
+    pub fn open_with_filesystem(path: &Path, filesystem: Arc<dyn FileSystem>) -> Result<Self> {
+        Self::open_with_capabilities(path, filesystem, language::default_provider())
+    }
+
+    pub fn open_with_capabilities(
+        path: &Path,
+        filesystem: Arc<dyn FileSystem>,
+        syntax_provider: Arc<dyn SyntaxProvider>,
+    ) -> Result<Self> {
+        let file = match filesystem.read_text_file(path) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         };
-        Ok(Self::new_with_path(&text, path))
+        let mut buffer = Self::new_with_path_and_capabilities(
+            file.as_ref().map_or("", |(_, contents)| contents.as_str()),
+            path,
+            filesystem,
+            syntax_provider,
+        );
+        if let Some((target, _)) = file {
+            buffer.saved_file = Some(SavedFile {
+                target,
+                contents: buffer.rope.clone(),
+            });
+        }
+        Ok(buffer)
     }
 
     pub fn save(&mut self, path: Option<&Path>) -> Result<()> {
-        self.commit_group();
-
         let path = path
             .or(self.path.as_deref())
             .context("buffer has no file name")?
             .to_owned();
+        let previous = self.saved_file.as_ref().filter(|file| {
+            self.path.as_ref() == Some(&path)
+                || self
+                    .filesystem
+                    .canonicalize(&path)
+                    .is_ok_and(|target| target == file.target)
+        });
+        let previous_contents = previous.map(|file| file.contents.to_string());
+        let previous = previous
+            .zip(previous_contents.as_ref())
+            .map(|(file, contents)| (file.target.as_path(), contents.as_bytes()));
+        let target = self
+            .filesystem
+            .save_file(&path, previous, self.text().as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
 
-        fs::write(&path, self.text()).with_context(|| format!("write {}", path.display()))?;
+        self.commit_group();
         if matches!(self.language_detection, LanguageDetection::Automatic) {
-            let detected = language::detect(&path);
+            let detected = self.detect_language(&path);
             if detected.as_ref().map(LanguageAttachment::id) != self.language_id() {
                 self.language = detected;
                 self.invalidate_viewport_widths();
@@ -578,30 +722,36 @@ impl TextBuffer {
         }
         self.path = Some(path);
         self.saved_revision = self.history.current_revision();
+        self.saved_file = Some(SavedFile {
+            target,
+            contents: self.rope.clone(),
+        });
 
         Ok(())
     }
 
     pub fn reload(&mut self, id: u64) -> Result<()> {
         let path = self.path.as_deref().context("buffer has no file name")?;
-        let contents =
-            fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let (target, contents) = self
+            .filesystem
+            .read_text_file(path)
+            .with_context(|| format!("read {}", path.display()))?;
         self.ensure_view(id);
-        self.reload_with_selection(&contents, self.views[&id].selection.clone());
+        self.reload_with_selection(target, &contents, self.views[&id].selection.clone());
         Ok(())
     }
 
     /// Applies a disk snapshot to every attached view, including hidden buffers.
-    pub fn reload_contents(&mut self, contents: &str) {
+    pub fn reload_contents(&mut self, target: PathBuf, contents: &str) {
         let selection = self
             .views
             .iter()
             .min_by_key(|(id, _)| *id)
             .map_or_else(|| Selection::point(0), |(_, view)| view.selection.clone());
-        self.reload_with_selection(contents, selection);
+        self.reload_with_selection(target, contents, selection);
     }
 
-    fn reload_with_selection(&mut self, contents: &str, selection: Selection) {
+    fn reload_with_selection(&mut self, target: PathBuf, contents: &str, selection: Selection) {
         self.commit_group();
         if self.rope != contents {
             let original = State {
@@ -615,7 +765,14 @@ impl TextBuffer {
             self.history
                 .commit_revision(&transaction.with_selection(selection), &original);
         }
+        if let Some(line_ending) = auto_detect_line_ending(&self.rope) {
+            self.line_ending = line_ending;
+        }
         self.saved_revision = self.history.current_revision();
+        self.saved_file = Some(SavedFile {
+            target,
+            contents: self.rope.clone(),
+        });
     }
 
     pub fn text(&self) -> String {
@@ -623,10 +780,7 @@ impl TextBuffer {
     }
     pub fn modified(&self) -> bool {
         self.history.current_revision() != self.saved_revision
-            || self
-                .group
-                .as_ref()
-                .is_some_and(|g| !g.transaction.changes().is_empty())
+            || matches!(&self.group, EditTransaction::Active(group) if !group.transaction.changes().is_empty())
     }
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
@@ -690,19 +844,11 @@ impl TextBuffer {
         view.pending = PendingInput::None;
         view.count = CommandCount::default();
         view.register = None;
-        if !self.replaying_insert {
+        if self.insert_playback == InsertPlayback::Idle {
             if was_insert && mode != TextMode::Insert {
-                if let Some(mut recording) = view.insert_recording.take() {
-                    if !matches!(recording.events.last(), Some(InsertEvent::Command(command)) if *command == TextCommand::Escape)
-                    {
-                        recording
-                            .events
-                            .push(InsertEvent::Command(TextCommand::Escape));
-                    }
-                    *self.insert_history.0.lock().unwrap() = Some(recording);
-                }
+                view.insert_recording.finish(&self.insert_history);
             } else if !was_insert && mode == TextMode::Insert {
-                view.insert_recording = Some(InsertReplay {
+                view.insert_recording = InsertRecording::Recording(InsertReplay {
                     command: TextCommand::Insert,
                     count: 1,
                     register: None,
@@ -818,6 +964,16 @@ impl TextBuffer {
         read: ClipboardRead,
         text: String,
     ) -> Result<TextEffect> {
+        anyhow::ensure!(
+            !self.readonly
+                || !matches!(
+                    read.command,
+                    TextCommand::PasteAfter
+                        | TextCommand::PasteBefore
+                        | TextCommand::ReplaceWithYank
+                ),
+            "buffer is read-only"
+        );
         self.registers
             .values
             .lock()
@@ -848,6 +1004,7 @@ impl TextBuffer {
 
             for view in self.views.values_mut() {
                 view.cancel_pending_input();
+                view.insert_recording = InsertRecording::Idle;
                 view.mode = TextMode::Normal;
                 view.selection = view.selection.clone().ensure_invariants(slice);
             }
@@ -871,14 +1028,14 @@ impl TextBuffer {
             selection,
             scroll,
             horizontal_scroll,
-            manual_viewport,
+            scroll_mode,
             ..
         } = &view.pending
         {
             view.selection = selection.clone();
             view.scroll = *scroll;
             view.horizontal_scroll = *horizontal_scroll;
-            view.manual_viewport = *manual_viewport;
+            view.scroll_mode = *scroll_mode;
         }
         if !value.is_empty()
             && let Ok(regex) = self.build_regex(value)
@@ -911,14 +1068,14 @@ impl TextBuffer {
             selection,
             scroll,
             horizontal_scroll,
-            manual_viewport,
+            scroll_mode,
             ..
         } = &view.pending
         {
             view.selection = selection.clone();
             view.scroll = *scroll;
             view.horizontal_scroll = *horizontal_scroll;
-            view.manual_viewport = *manual_viewport;
+            view.scroll_mode = *scroll_mode;
         }
         let register = view.prompt_register;
         let result = if value.is_empty() {
@@ -964,7 +1121,7 @@ impl TextBuffer {
     }
 
     pub fn remove_view(&mut self, id: u64) {
-        if self.group.as_ref().is_some_and(|group| group.view_id == id) {
+        if matches!(&self.group, EditTransaction::Active(group) if group.view_id == id) {
             self.commit_group();
         }
 
@@ -981,7 +1138,7 @@ impl TextBuffer {
             TextView {
                 mode: TextMode::Normal,
                 pending: PendingInput::None,
-                insert_recording: None,
+                insert_recording: InsertRecording::Idle,
                 selection: view
                     .selection
                     .clone()
@@ -1084,12 +1241,12 @@ impl TextBuffer {
     }
 
     fn begin_group(&mut self, id: u64) {
-        if self.group.as_ref().is_some_and(|group| group.view_id != id) {
+        if matches!(&self.group, EditTransaction::Active(group) if group.view_id != id) {
             self.commit_group();
         }
 
-        if self.group.is_none() {
-            self.group = Some(EditGroup {
+        if matches!(self.group, EditTransaction::Idle) {
+            self.group = EditTransaction::Active(EditGroup {
                 original: State {
                     doc: self.rope.clone(),
                     selection: self.views[&id].selection.clone(),
@@ -1101,7 +1258,7 @@ impl TextBuffer {
     }
 
     fn commit_group(&mut self) {
-        if let Some(group) = self.group.take()
+        if let EditTransaction::Active(group) = std::mem::take(&mut self.group)
             && !group.transaction.changes().is_empty()
         {
             let selection = self
@@ -1125,7 +1282,9 @@ impl TextBuffer {
         self.begin_group(id);
         self.apply_without_history(Some(id), &transaction, selection);
 
-        let group = self.group.as_mut().unwrap();
+        let EditTransaction::Active(group) = &mut self.group else {
+            unreachable!("begin_group creates an active transaction");
+        };
 
         group.transaction = group.transaction.clone().compose(transaction);
     }
@@ -1274,16 +1433,17 @@ impl TextBuffer {
                 | TextCommand::SearchForward
                 | TextCommand::SearchBackward
         ) {
-            self.views.get_mut(&id).unwrap().manual_viewport = false;
+            self.views.get_mut(&id).unwrap().scroll_mode = ScrollMode::FollowSelection;
         }
 
         let old_version = self.version;
         let mut effect = TextEffect::default();
         let was_insert = self.views[&id].mode == TextMode::Insert;
         if was_insert
-            && !self.replaying_insert
+            && self.insert_playback == InsertPlayback::Idle
             && command != TextCommand::RepeatInsert
-            && let Some(recording) = &mut self.views.get_mut(&id).unwrap().insert_recording
+            && let InsertRecording::Recording(recording) =
+                &mut self.views.get_mut(&id).unwrap().insert_recording
         {
             recording.events.push(InsertEvent::Command(command));
         }
@@ -1455,6 +1615,7 @@ impl TextBuffer {
                     self.apply(id, transaction, None);
                 }
                 TextCommand::InsertNewline => {
+                    let line_ending = self.line_ending.as_str();
                     let positions = self.views[&id]
                         .selection
                         .iter()
@@ -1462,7 +1623,7 @@ impl TextBuffer {
                         .collect::<Vec<_>>();
                     let values = positions
                         .into_iter()
-                        .map(|pos| format!("\n{}", self.newline_indentation(pos)))
+                        .map(|pos| format!("{line_ending}{}", self.newline_indentation(pos)))
                         .collect::<Vec<_>>();
 
                     self.replace_selections(id, &values, false, false);
@@ -1864,7 +2025,7 @@ impl TextBuffer {
                     selection: view.selection.clone(),
                     scroll: view.scroll,
                     horizontal_scroll: view.horizontal_scroll,
-                    manual_viewport: view.manual_viewport,
+                    scroll_mode: view.scroll_mode,
                     input: String::new(),
                 };
                 view.prompt_register = selected_register.unwrap_or('/');
@@ -2048,13 +2209,17 @@ impl TextBuffer {
             self.commit_group();
         }
 
-        if !was_insert && self.views[&id].mode == TextMode::Insert && !self.replaying_insert {
-            self.views.get_mut(&id).unwrap().insert_recording = Some(InsertReplay {
-                command,
-                count,
-                register: selected_register,
-                events: Vec::new(),
-            });
+        if !was_insert
+            && self.views[&id].mode == TextMode::Insert
+            && self.insert_playback == InsertPlayback::Idle
+        {
+            self.views.get_mut(&id).unwrap().insert_recording =
+                InsertRecording::Recording(InsertReplay {
+                    command,
+                    count,
+                    register: selected_register,
+                    events: Vec::new(),
+                });
         }
 
         self.refresh_cursors();
@@ -2068,6 +2233,33 @@ impl TextBuffer {
         self.input_event(id, TextInput::parse(key))
     }
 
+    pub fn paste_text(&mut self, id: u64, text: &str) -> Result<TextEffect> {
+        anyhow::ensure!(!self.readonly, "buffer is read-only");
+        self.ensure_view(id);
+        if text.is_empty() {
+            return Ok(TextEffect::default());
+        }
+        self.commit_group();
+        let old_version = self.version;
+        let text = text.to_owned();
+        if self.views[&id].mode == TextMode::Insert {
+            self.replace_selections(id, std::slice::from_ref(&text), false, false);
+            if self.insert_playback == InsertPlayback::Idle
+                && let InsertRecording::Recording(recording) =
+                    &mut self.views.get_mut(&id).unwrap().insert_recording
+            {
+                recording.events.push(InsertEvent::Paste(text));
+            }
+        } else {
+            self.paste(id, &[text], false);
+        }
+        self.commit_group();
+        Ok(TextEffect {
+            changed: old_version != self.version,
+            ..TextEffect::default()
+        })
+    }
+
     fn input_event(&mut self, id: u64, key: TextInput) -> Result<TextEffect> {
         self.ensure_view(id);
 
@@ -2077,8 +2269,9 @@ impl TextBuffer {
         let character = key.character();
 
         if self.views[&id].mode == TextMode::Insert
-            && !self.replaying_insert
-            && let Some(recording) = &mut self.views.get_mut(&id).unwrap().insert_recording
+            && self.insert_playback == InsertPlayback::Idle
+            && let InsertRecording::Recording(recording) =
+                &mut self.views.get_mut(&id).unwrap().insert_recording
         {
             recording.events.push(InsertEvent::Input(key));
         }
@@ -2094,7 +2287,7 @@ impl TextBuffer {
             selection,
             scroll,
             horizontal_scroll,
-            manual_viewport,
+            scroll_mode,
         } = pending
         {
             if key == TextInput::Enter {
@@ -2110,7 +2303,7 @@ impl TextBuffer {
                     selection,
                     scroll,
                     horizontal_scroll,
-                    manual_viewport,
+                    scroll_mode,
                     input: input.clone(),
                 };
                 self.preview_prompt(id, kind, &input)?;
@@ -2137,7 +2330,7 @@ impl TextBuffer {
                     };
                     view.selection = Selection::single(range.anchor, range.head)
                         .ensure_invariants(self.rope.slice(..));
-                    view.manual_viewport = false;
+                    view.scroll_mode = ScrollMode::FollowSelection;
                 }
             } else if index * 26 < words.len() {
                 self.views.get_mut(&id).unwrap().pending = PendingInput::GotoWord {
@@ -2158,7 +2351,8 @@ impl TextBuffer {
             match pending {
                 PendingInput::SurroundAdd if key == TextInput::Enter || character.is_some() => {
                     let (open, close) = if key == TextInput::Enter {
-                        ("\n".to_owned(), "\n".to_owned())
+                        let line_ending = self.line_ending.as_str();
+                        (line_ending.to_owned(), line_ending.to_owned())
                     } else {
                         let (open, close) =
                             helix_core::match_brackets::get_pair(character.unwrap());
@@ -2168,14 +2362,15 @@ impl TextBuffer {
                     let mut changes = Vec::new();
                     let mut ranges = SmallVec::new();
                     let mut offset = 0;
+                    let inserted = open.chars().count() + close.chars().count();
                     for range in &selection {
                         changes.push((range.from(), range.from(), Some(open.as_str().into())));
                         changes.push((range.to(), range.to(), Some(close.as_str().into())));
                         ranges.push(
-                            Range::new(range.from() + offset, range.to() + offset + 2)
+                            Range::new(range.from() + offset, range.to() + offset + inserted)
                                 .with_direction(range.direction()),
                         );
-                        offset += 2;
+                        offset += inserted;
                     }
                     let transaction = Transaction::change(&self.rope, changes.into_iter());
                     self.apply(
@@ -2261,9 +2456,9 @@ impl TextBuffer {
                 }
                 PendingInput::ReplaceCharacter if !self.readonly => {
                     let replacement = if key == TextInput::Enter {
-                        Some('\n')
+                        Some(self.line_ending.as_str().to_owned())
                     } else {
-                        character
+                        character.map(|ch| ch.to_string())
                     };
 
                     if let Some(replacement) = replacement {
@@ -2271,7 +2466,7 @@ impl TextBuffer {
                             .selection
                             .iter()
                             .map(|range| {
-                                replacement.to_string().repeat(
+                                replacement.repeat(
                                     range
                                         .fragment(self.rope.slice(..))
                                         .graphemes(true)
@@ -2324,7 +2519,10 @@ impl TextBuffer {
     }
 
     fn repeat_insert(&mut self, id: u64, count: usize) -> Result<TextEffect> {
-        anyhow::ensure!(!self.replaying_insert, "Cannot repeat insert recursively");
+        anyhow::ensure!(
+            self.insert_playback == InsertPlayback::Idle,
+            "Cannot repeat insert recursively"
+        );
         anyhow::ensure!(
             self.views[&id].mode != TextMode::Insert,
             "Finish the current insertion before repeating"
@@ -2332,7 +2530,7 @@ impl TextBuffer {
         let Some(recording) = self.insert_history.0.lock().unwrap().clone() else {
             return Ok(TextEffect::default());
         };
-        self.replaying_insert = true;
+        self.insert_playback = InsertPlayback::Replaying;
         let result = (|| {
             let mut effect = TextEffect::default();
             for _ in 0..count {
@@ -2346,6 +2544,7 @@ impl TextBuffer {
                     let step = match event {
                         InsertEvent::Command(command) => self.execute(id, *command)?,
                         InsertEvent::Input(input) => self.input_event(id, *input)?,
+                        InsertEvent::Paste(text) => self.paste_text(id, text)?,
                     };
                     effect.clipboard = step.clipboard.or(effect.clipboard);
                     effect.primary_clipboard = step.primary_clipboard.or(effect.primary_clipboard);
@@ -2353,7 +2552,7 @@ impl TextBuffer {
             }
             Ok(effect)
         })();
-        self.replaying_insert = false;
+        self.insert_playback = InsertPlayback::Idle;
         result
     }
 
@@ -2721,6 +2920,7 @@ impl TextBuffer {
     fn open_lines(&mut self, id: u64, above: bool, count: usize) {
         self.begin_group(id);
 
+        let line_ending = self.line_ending.as_str();
         let selection = self.views[&id].selection.clone();
         let mut changes = Vec::new();
         let mut positions = Vec::new();
@@ -2738,9 +2938,9 @@ impl TextBuffer {
                 self.newline_indentation(pos)
             };
             let text = if above {
-                format!("{indentation}\n").repeat(count)
+                format!("{indentation}{line_ending}").repeat(count)
             } else {
-                format!("\n{indentation}").repeat(count)
+                format!("{line_ending}{indentation}").repeat(count)
             };
 
             positions.push((pos, indentation.chars().count()));
@@ -2766,6 +2966,12 @@ impl TextBuffer {
         self.apply(id, transaction, Some(selection));
     }
 
+    fn detect_language(&self, path: &Path) -> Option<LanguageAttachment> {
+        self.syntax_provider
+            .language_for_path(path)
+            .map(|language| LanguageAttachment::new(language, self.syntax_provider.clone()))
+    }
+
     pub fn language_id(&self) -> Option<&str> {
         self.language.as_ref().map(LanguageAttachment::id)
     }
@@ -2780,9 +2986,9 @@ impl TextBuffer {
     pub fn set_language(&mut self, id: Option<&str>) -> Result<()> {
         let language = id
             .map(|id| {
-                language::loader()
+                self.syntax_provider
                     .language_for_name(id)
-                    .map(LanguageAttachment::new)
+                    .map(|language| LanguageAttachment::new(language, self.syntax_provider.clone()))
                     .with_context(|| format!("unknown language {id:?}"))
             })
             .transpose()?;
@@ -2975,10 +3181,7 @@ impl TextBuffer {
                 helix_stdx::rope::Config::new()
                     .case_insensitive(!pattern.chars().any(char::is_uppercase))
                     .multi_line(true)
-                    .crlf(
-                        helix_core::line_ending::auto_detect_line_ending(&self.rope)
-                            == Some(helix_core::LineEnding::Crlf),
-                    ),
+                    .crlf(self.line_ending == LineEnding::Crlf),
             )
             .build(pattern)
             .context("invalid regular expression")
@@ -3001,7 +3204,7 @@ impl TextBuffer {
                 helix_core::selection::split_on_matches(slice, &view.selection, regex)
             };
             view.selection = selection.ensure_invariants(slice);
-            view.manual_viewport = false;
+            view.scroll_mode = ScrollMode::FollowSelection;
             return Ok(());
         }
 
@@ -3039,7 +3242,7 @@ impl TextBuffer {
                     .replace(view.selection.primary_index(), range),
             }
             .ensure_invariants(slice);
-            view.manual_viewport = false;
+            view.scroll_mode = ScrollMode::FollowSelection;
         }
         Ok(())
     }
@@ -3069,7 +3272,7 @@ impl TextBuffer {
         } else {
             selection.ensure_invariants(slice)
         };
-        view.manual_viewport = false;
+        view.scroll_mode = ScrollMode::FollowSelection;
         self.refresh_cursors();
     }
 
@@ -3093,7 +3296,7 @@ impl TextBuffer {
                 .min(maximum_column.saturating_sub(view.viewport_width));
         }
 
-        view.manual_viewport = true;
+        view.scroll_mode = ScrollMode::UserControlled;
     }
 
     fn maximum_line_width(&mut self) -> usize {
@@ -3113,6 +3316,105 @@ impl TextBuffer {
         width
     }
 
+    pub fn visible_source_lines(&self, id: u64) -> Vec<(usize, usize, String)> {
+        let view = self.view(id);
+        self.unwrapped_visible_source_lines(
+            view.scroll,
+            view.horizontal_scroll,
+            view.viewport_width,
+            view.viewport_height,
+        )
+    }
+
+    /// Returns source fragments covered by a preview after its latest render.
+    pub fn preview_visible_source_lines(
+        &self,
+        viewport: &PreviewViewport,
+        soft_wrap: bool,
+    ) -> Vec<(usize, usize, String)> {
+        if viewport.height == 0 || viewport.width == 0 {
+            return Vec::new();
+        }
+        if !soft_wrap {
+            return self.unwrapped_visible_source_lines(
+                viewport.scroll,
+                viewport.horizontal_scroll,
+                viewport.width,
+                viewport.height,
+            );
+        }
+        let Some(&start) = viewport.hit_positions.first().and_then(|row| row.first()) else {
+            return Vec::new();
+        };
+        let last = viewport
+            .hit_positions
+            .last()
+            .and_then(|row| row.last())
+            .copied()
+            .unwrap_or(start);
+        let end = if last < self.rope.len_chars() {
+            next_grapheme_boundary(self.rope.slice(..), last)
+        } else {
+            self.rope.len_chars()
+        };
+        let mut position = start;
+        let mut fragments = Vec::new();
+        for line in self.rope.slice(start..end).lines() {
+            if position == end && position != start {
+                break;
+            }
+            let source_line = self.rope.char_to_line(position);
+            fragments.push((source_line, position, line.to_string()));
+            position += line.len_chars();
+        }
+        fragments
+    }
+
+    fn unwrapped_visible_source_lines(
+        &self,
+        scroll: usize,
+        horizontal_scroll: usize,
+        width: usize,
+        height: usize,
+    ) -> Vec<(usize, usize, String)> {
+        if width == 0 || height == 0 {
+            return Vec::new();
+        }
+        let tab_width = self.indentation().1;
+        let mut fragments = Vec::new();
+        for index in scroll..scroll.saturating_add(height).min(self.rope.len_lines()) {
+            let line = self.rope.line(index);
+            let mut position = self.rope.line_to_char(index);
+            let mut first = None;
+            let mut text = String::new();
+            let mut column = 0;
+            let right = horizontal_scroll.saturating_add(width);
+            for grapheme in line.graphemes() {
+                if grapheme == "\n" || grapheme == "\r\n" || grapheme == "\r" {
+                    break;
+                }
+                let value = grapheme.to_string();
+                let cells = if value == "\t" {
+                    tab_width - column % tab_width
+                } else {
+                    UnicodeWidthStr::width(value.as_str()).max(1)
+                };
+                let end = column.saturating_add(cells);
+                if end > horizontal_scroll && column < right {
+                    first.get_or_insert(position);
+                    text.push_str(&value);
+                }
+                position += grapheme.len_chars();
+                column = end;
+                if column >= right {
+                    break;
+                }
+            }
+            fragments.push((index, first.unwrap_or(position), text));
+        }
+        fragments
+    }
+
     /// Renders text without allocating editing state.
     pub fn render_preview(
         &mut self,
@@ -3121,6 +3423,7 @@ impl TextBuffer {
         height: usize,
         soft_wrap: bool,
     ) -> Vec<FrameRow> {
+        viewport.hit_positions.clear();
         if soft_wrap && width > 0 {
             return self.render_wrapped_preview(viewport, width, height);
         }
@@ -3135,7 +3438,7 @@ impl TextBuffer {
             .scroll
             .min(self.line_count().saturating_sub(height.max(1)));
         let tab_width = self.indentation().1;
-        paint_text(
+        let (rows, hit_positions) = paint_text(
             &self.rope,
             &mut self.language,
             self.readonly,
@@ -3146,13 +3449,15 @@ impl TextBuffer {
                     horizontal_scroll: viewport.horizontal_scroll,
                     width,
                     height,
+                    ..PreviewViewport::default()
                 },
                 selection: None,
                 focused: false,
                 jump_labels: &HashMap::new(),
             },
-        )
-        .0
+        );
+        viewport.hit_positions = hit_positions;
+        rows
     }
 
     fn render_wrapped_preview(
@@ -3235,7 +3540,7 @@ impl TextBuffer {
         let highlights = self.language.as_mut().map_or_else(Vec::new, |language| {
             language.highlights(&self.rope, start_byte..end_byte)
         });
-        let scopes = self.language.as_ref().map(|_| language::loader().scopes());
+        let scopes = self.language.as_ref().map(LanguageAttachment::scopes);
         let mut highlight_index = 0;
         let mut rows = Vec::<FrameRow>::new();
         for grapheme in wrap_preview_graphemes(
@@ -3253,9 +3558,19 @@ impl TextBuffer {
                 break;
             }
             rows.resize_with(row + 1, FrameRow::default);
+            let source = start_char + grapheme.char_idx;
+            viewport
+                .hit_positions
+                .resize_with(row + 1, || vec![source; width]);
             if grapheme.source.is_eof() || matches!(grapheme.raw, Grapheme::Newline) {
+                let first = grapheme.visual_pos.col.min(width);
+                viewport.hit_positions[row][first..].fill(source);
                 continue;
             }
+            let first = grapheme.visual_pos.col.min(width);
+            let end = first.saturating_add(grapheme.width()).min(width);
+            viewport.hit_positions[row][first..end].fill(source);
+            viewport.hit_positions[row][end..].fill(source + grapheme.doc_chars());
             let position = slice.char_to_byte(start_char + grapheme.char_idx);
             while highlights
                 .get(highlight_index)
@@ -3317,7 +3632,7 @@ impl TextBuffer {
         let tab_width = self.indentation().1;
 
         let view = &self.views[&id];
-        let maximum_column = if !view.manual_viewport
+        let maximum_column = if view.scroll_mode == ScrollMode::FollowSelection
             || view.horizontal_scroll == 0
             || (view.viewport_width == width && view.viewport_version == self.version)
         {
@@ -3335,7 +3650,7 @@ impl TextBuffer {
         view.viewport_width = width;
         view.viewport_height = height;
         view.viewport_version = self.version;
-        if view.manual_viewport {
+        if view.scroll_mode == ScrollMode::UserControlled {
             view.scroll = view
                 .scroll
                 .min(slice.len_lines().saturating_sub(height.max(1)));
@@ -3350,15 +3665,20 @@ impl TextBuffer {
         let cursor_column =
             visual_width(&slice.slice(line_start..cursor_char).to_string(), tab_width);
 
-        if !view.manual_viewport && row < view.scroll {
+        if view.scroll_mode == ScrollMode::FollowSelection && row < view.scroll {
             view.scroll = row;
-        } else if !view.manual_viewport && row >= view.scroll + height.max(1) {
+        } else if view.scroll_mode == ScrollMode::FollowSelection
+            && row >= view.scroll + height.max(1)
+        {
             view.scroll = row + 1 - height.max(1);
         }
 
-        if !view.manual_viewport && cursor_column < view.horizontal_scroll {
+        if view.scroll_mode == ScrollMode::FollowSelection && cursor_column < view.horizontal_scroll
+        {
             view.horizontal_scroll = cursor_column;
-        } else if !view.manual_viewport && cursor_column >= view.horizontal_scroll + width.max(1) {
+        } else if view.scroll_mode == ScrollMode::FollowSelection
+            && cursor_column >= view.horizontal_scroll + width.max(1)
+        {
             view.horizontal_scroll = cursor_column + 1 - width.max(1);
         }
 
@@ -3390,6 +3710,7 @@ impl TextBuffer {
                     horizontal_scroll: view.horizontal_scroll,
                     width,
                     height,
+                    ..PreviewViewport::default()
                 },
                 selection: Some(&view.selection),
                 focused,
@@ -3428,6 +3749,7 @@ pub struct PreviewViewport {
     pub horizontal_scroll: usize,
     pub width: usize,
     pub height: usize,
+    pub hit_positions: Vec<Vec<usize>>,
 }
 
 struct PreviewWrap {
@@ -3498,7 +3820,7 @@ fn paint_text(
     let highlights = language.as_mut().map_or_else(Vec::new, |language| {
         language.highlights(&rope, start_byte..end_byte)
     });
-    let scopes = language.as_ref().map(|_| language::loader().scopes());
+    let scopes = language.as_ref().map(LanguageAttachment::scopes);
     let mut highlight_index = 0;
 
     let start_char = slice.byte_to_char(start_byte);

@@ -5,7 +5,7 @@ use zess_plugin::FileSnapshot;
 
 use crate::DirectoryEntry;
 use zess_git::{
-    Commit, CommitFile, DiffSide, DiffSource, DiffTarget, GitDecoration, GitDiff, GitEntry,
+    Commit, CommitFileList, DiffSide, DiffSource, DiffTarget, GitDecoration, GitDiff, GitEntry,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -101,17 +101,29 @@ impl QueryRequest {
     }
 }
 
+pub struct StatusProgress {
+    pub entries: Vec<GitEntry>,
+    pub path_warning: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QueryResult {
     Directory {
         path: String,
         entries: Vec<DirectoryEntry>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path_warning: Option<String>,
     },
     Text {
         path: String,
         text: String,
         truncated: bool,
+    },
+    FileRead {
+        #[serde(skip)]
+        target: std::path::PathBuf,
+        text: String,
     },
     Diff {
         path: String,
@@ -122,16 +134,20 @@ pub enum QueryResult {
     },
     Status {
         entries: Vec<GitEntry>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path_warning: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line_count_error: Option<String>,
     },
     GitDecorations {
         entries: Vec<GitDecoration>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path_warning: Option<String>,
     },
     Log {
         commits: Vec<Commit>,
     },
-    CommitFiles {
-        files: Vec<CommitFile>,
-    },
+    CommitFiles(CommitFileList),
     Snapshot {
         snapshot: FileSnapshot,
     },

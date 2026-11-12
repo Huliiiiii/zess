@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::filesystem::{FileOperation, Request};
 use crate::jobs::Cancellation;
-use crate::query::{QueryRequest, QueryResult};
+use crate::query::{QueryRequest, QueryResult, StatusProgress};
 
 #[derive(Clone)]
 pub(crate) struct Workspace {
@@ -39,48 +39,54 @@ impl Workspace {
         &self,
         request: &QueryRequest,
         cancellation: &Cancellation,
-        status_progress: Option<&std::sync::mpsc::Sender<Vec<zess_git::GitEntry>>>,
+        status_progress: Option<&std::sync::mpsc::Sender<StatusProgress>>,
     ) -> Result<QueryResult> {
         cancellation.check()?;
         let result: Result<_> = match request {
             QueryRequest::ReadFile { path } => {
                 anyhow::ensure!(path.is_absolute(), "file read requires an absolute path");
-                let text = self
+                let (target, text) = self
                     .filesystem
-                    .read_to_string(path)
+                    .read_text_file(path)
                     .with_context(|| format!("read {}", path.display()))?;
                 cancellation.check()?;
-                Ok(QueryResult::Text {
-                    path: path.to_string_lossy().into_owned(),
-                    text,
-                    truncated: false,
-                })
+                Ok(QueryResult::FileRead { target, text })
             }
             QueryRequest::List { .. } | QueryRequest::Preview { .. } => {
                 let (path, request) = Request::from_query(request)?;
                 self.read_fs(path, cancellation)?.response(path, request)
             }
             QueryRequest::Status {} => {
-                let entries = self
-                    .repository()?
-                    .status_with_progress(cancellation, |entries| {
-                        if let Some(progress) = status_progress {
-                            let _ = progress.send(entries.to_owned());
-                        }
-                        #[cfg(test)]
-                        if let Some(hook) = &self.read_hook {
-                            hook("git.status");
-                        }
-                    })?;
-                Ok(QueryResult::Status { entries })
+                let status =
+                    self.repository()?
+                        .worktree_status(cancellation, |entries, path_warning| {
+                            if let Some(progress) = status_progress {
+                                let _ = progress.send(StatusProgress {
+                                    entries: entries.to_owned(),
+                                    path_warning: path_warning.map(str::to_owned),
+                                });
+                            }
+                            #[cfg(test)]
+                            if let Some(hook) = &self.read_hook {
+                                hook("git.status");
+                            }
+                        })?;
+                Ok(QueryResult::Status {
+                    entries: status.entries,
+                    path_warning: status.path_warning,
+                    line_count_error: status.line_count_error.map(|error| format!("{error:#}")),
+                })
             }
             QueryRequest::GitDecorations {} => {
-                let entries = self.repository()?.decorations(cancellation)?;
+                let (entries, path_warning) = self.repository()?.decorations(cancellation)?;
                 #[cfg(test)]
                 if let Some(hook) = &self.read_hook {
                     hook("git.decorations");
                 }
-                Ok(QueryResult::GitDecorations { entries })
+                Ok(QueryResult::GitDecorations {
+                    entries,
+                    path_warning,
+                })
             }
             QueryRequest::Diff {
                 path,
@@ -107,9 +113,9 @@ impl Workspace {
             QueryRequest::Log {} => Ok(QueryResult::Log {
                 commits: self.repository()?.log(cancellation)?,
             }),
-            QueryRequest::CommitFiles { commit } => Ok(QueryResult::CommitFiles {
-                files: self.repository()?.commit_files(commit, cancellation)?,
-            }),
+            QueryRequest::CommitFiles { commit } => Ok(QueryResult::CommitFiles(
+                self.repository()?.commit_file_list(commit, cancellation)?,
+            )),
             QueryRequest::CommitDiff {
                 commit,
                 path,

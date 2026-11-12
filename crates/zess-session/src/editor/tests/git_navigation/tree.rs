@@ -40,7 +40,7 @@ fn directory_navigation_keeps_tree_selection_and_opens_leaf_diffs() {
     );
     session.input("e");
     assert_eq!(session.focus, source);
-    assert!(session.views[&source].layer.is_none());
+    assert!(session.views.child(source).is_none());
     session.input("l");
     assert_eq!(selected_row(&session, source).text, "▾ nested");
     session.input("l");
@@ -339,7 +339,7 @@ fn external_file_changes_refresh_line_counts_in_both_projections() {
 }
 
 #[test]
-fn invalid_projection_configuration_is_rejected_before_starting_queries() {
+fn invalid_projection_configuration_keeps_the_builtin_tree_at_startup() {
     let fixture = nested_files();
     let config = fixture.0.join("config.w");
     fs::write(
@@ -348,16 +348,20 @@ fn invalid_projection_configuration_is_rejected_before_starting_queries() {
     )
     .unwrap();
     let mut session = Session::new(fixture.0.clone(), &[], Some(config)).unwrap();
-    let error = session.command("git").unwrap_err();
     assert_eq!(
-        format!("{error:#}"),
-        "git-view must be \"tree\" or \"flat\""
+        session.message,
+        "reload failed: view options for git: git-view must be \"tree\" or \"flat\""
     );
-    let stats = session
-        .services
-        .borrow_mut()
-        .call("service.stats", json!({}));
-    assert_eq!(stats["jobs"], 0);
+    session.command("git").unwrap();
+    settle(&mut session);
+    assert!(
+        session.views[&session.focus]
+            .location
+            .display
+            .rows
+            .iter()
+            .any(|row| row.style == "directory")
+    );
 }
 
 #[test]
@@ -413,7 +417,7 @@ fn configured_git_colors_are_shared_by_counts_and_diff_lines() {
     }
     let source = session.focus;
     let target = session.preview_target(source).unwrap();
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     session
         .execute_command("diff.select-hunk", serde_json::json!({}))
         .unwrap();

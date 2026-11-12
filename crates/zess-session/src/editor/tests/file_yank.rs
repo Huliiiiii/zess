@@ -58,13 +58,15 @@ fn path_yanks_use_the_system_clipboard_by_default() {
     let mut session = fixture.session(&[]);
     session.command("files").unwrap();
     settle(&mut session);
-    for (key, expected) in [
-        ("p", "note.txt".to_owned()),
-        ("a", fixture.0.join("note.txt").display().to_string()),
-        ("n", "note.txt".to_owned()),
+    for (command, expected) in [
+        ("files.yank-path", "note.txt".to_owned()),
+        (
+            "files.yank-absolute-path",
+            fixture.0.join("note.txt").display().to_string(),
+        ),
+        ("files.yank-name", "note.txt".to_owned()),
     ] {
-        session.input("y");
-        session.input(key);
+        session.execute_command(command, json!({})).unwrap();
         let mut clipboard = Vec::new();
         session.flush_clipboard_writes(|text| {
             clipboard.push(text);
@@ -103,7 +105,7 @@ fn configured_yank_register_applies_after_reload_and_explicit_registers_take_pri
     });
     assert_eq!(clipboard, ["note.txt"]);
     configure(r#""*""#);
-    assert!(session.reload(), "{}", session.message);
+    session.command("config-reload").unwrap();
     for key in ["y", "n"] {
         session.input(key);
     }
@@ -311,9 +313,9 @@ fn content_yanks_copy_all_selected_files_to_the_system_clipboard() {
         selected: vec!["b.txt".into(), "a.txt".into()],
         anchor: Some("a.txt".into()),
     };
-    for key in ["y", "f"] {
-        session.input(key);
-    }
+    session
+        .execute_command("files.yank-content", json!({}))
+        .unwrap();
     settle(&mut session);
     let mut clipboard = Vec::new();
     session.flush_clipboard_writes(|text| {
@@ -324,7 +326,7 @@ fn content_yanks_copy_all_selected_files_to_the_system_clipboard() {
 }
 
 #[test]
-fn diff_keys_yank_the_working_changes_from_head() {
+fn diff_yanks_copy_the_working_changes_from_head() {
     let fixture = Fixture::new();
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
@@ -377,9 +379,9 @@ fn diff_keys_yank_the_working_changes_from_head() {
         selected: vec!["note.txt".into()],
         anchor: Some("note.txt".into()),
     };
-    for key in ["y", "d"] {
-        session.input(key);
-    }
+    session
+        .execute_command("files.yank-diff", json!({}))
+        .unwrap();
     settle(&mut session);
     let mut clipboard = Vec::new();
     session.flush_clipboard_writes(|text| {
