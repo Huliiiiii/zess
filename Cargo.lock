@@ -3675,6 +3675,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zess-platform"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "etcetera",
+ "ignore",
+ "libc",
+ "notify",
+ "tempfile",
+ "windows-sys",
+]
+
+[[package]]
 name = "zess-plugin"
 version = "0.1.0"
 dependencies = [
