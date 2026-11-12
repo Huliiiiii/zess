@@ -10,6 +10,25 @@ use zess_ui::{StyleAttribute, StyleColor, TextStyle};
 #[cfg(test)]
 mod tests;
 
+pub fn resolve_in(role: &str, styles: &std::collections::HashMap<String, TextStyle>) -> TextStyle {
+    if let Some(style) = styles.get(role) {
+        style.clone()
+    } else if let Some(semantic) = role.strip_prefix("selection.") {
+        let mut style = styles
+            .get(semantic)
+            .cloned()
+            .unwrap_or_else(|| resolve(role));
+        style.background = styles
+            .get("selection")
+            .cloned()
+            .unwrap_or_else(|| resolve("selection"))
+            .background;
+        style
+    } else {
+        resolve(role)
+    }
+}
+
 pub(super) fn apply(stdout: &mut impl Write, style: &TextStyle) -> Result<()> {
     queue!(
         stdout,
@@ -33,6 +52,26 @@ pub(super) fn apply(stdout: &mut impl Write, style: &TextStyle) -> Result<()> {
 }
 
 pub(super) fn resolve(role: &str) -> TextStyle {
+    if role == "selection.match" {
+        return TextStyle {
+            foreground: Some(StyleColor::Indexed(11)),
+            background: Some(StyleColor::Indexed(8)),
+            attributes: vec![StyleAttribute::Bold],
+            ..TextStyle::default()
+        };
+    }
+    if role == "selection" {
+        return TextStyle {
+            foreground: Some(StyleColor::Indexed(15)),
+            background: Some(StyleColor::Indexed(8)),
+            ..TextStyle::default()
+        };
+    }
+    if let Some(role) = role.strip_prefix("selection.") {
+        let mut style = resolve(role);
+        style.background = Some(StyleColor::Indexed(8));
+        return style;
+    }
     if role == "diff.selection" {
         return TextStyle {
             attributes: vec![StyleAttribute::Underline],
@@ -51,15 +90,10 @@ pub(super) fn resolve(role: &str) -> TextStyle {
         "status.select" => (Some(0), Some(StyleColor::Indexed(13)), true, false),
         "status.inactive" => (Some(7), popup_background, false, false),
         "linenr.current" => (Some(15), None, false, false),
-        "selection.added" => (Some(10), Some(StyleColor::Indexed(8)), false, false),
-        "selection.modified" => (Some(11), Some(StyleColor::Indexed(8)), false, false),
-        "selection.deleted" => (Some(9), Some(StyleColor::Indexed(8)), false, false),
-        "selection.match" => (Some(11), Some(StyleColor::Indexed(8)), true, false),
         "popup.secondary" => (Some(7), popup_background, false, false),
         "popup.match" => (Some(11), popup_background, true, false),
         "popup" => (Some(15), popup_background, false, false),
         _ => match role.split('.').next().unwrap_or(role) {
-            "selection" => (Some(15), Some(StyleColor::Indexed(8)), false, false),
             "primary" => (Some(0), Some(StyleColor::Indexed(11)), true, false),
             "cursor" => (Some(0), Some(StyleColor::Indexed(15)), true, false),
             "comment" => (Some(8), None, false, true),

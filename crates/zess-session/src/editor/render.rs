@@ -489,11 +489,7 @@ impl Session {
                     };
                     let style = if active && view.location.diff_selection.contains(&diff.index, row)
                     {
-                        if base.is_empty() {
-                            "selection".into()
-                        } else {
-                            format!("selection.{base}")
-                        }
+                        format!("selection.{base}")
                     } else {
                         base.into()
                     };
@@ -642,11 +638,7 @@ impl Session {
                 .take(available)
             {
                 let style = if active && view.location.selection.selected.contains(&row.id) {
-                    if row.style.is_empty() {
-                        "selection".to_owned()
-                    } else {
-                        format!("selection.{}", row.style)
-                    }
+                    format!("selection.{}", row.style)
                 } else {
                     row.style.clone()
                 };

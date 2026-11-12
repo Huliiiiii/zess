@@ -986,12 +986,7 @@ fn render_row(
             break;
         }
 
-        let resolve = |role: &str| {
-            styles
-                .get(role)
-                .cloned()
-                .unwrap_or_else(|| style::resolve(role))
-        };
+        let resolve = |role: &str| style::resolve_in(role, styles);
         let base = span.base_style.as_deref().map(resolve).unwrap_or_default();
         style::apply(stdout, &base.patch(&resolve(&span.style)))?;
         let (text, cells, truncated) = clip_to_width(&sanitize(&span.text), remaining);
