@@ -8,7 +8,7 @@ mod tests;
 
 const COLUMN_GAP: usize = 2;
 
-#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ColumnAlignment {
     None,

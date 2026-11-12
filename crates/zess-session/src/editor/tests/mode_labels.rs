@@ -1,4 +1,5 @@
 use super::*;
+use zess_plugin::StatusContext;
 
 #[test]
 fn modes_have_short_default_labels() {
@@ -17,7 +18,18 @@ fn modes_have_short_default_labels() {
         ("custom", " CUS "),
         ("go", " GO "),
     ] {
-        let spans = session.statusline(id, "default", json!({"mode": mode, "width": 40}), 40, true);
+        let spans = session.statusline(
+            id,
+            "default",
+            StatusContext {
+                mode: Some(mode.into()),
+                width: 40,
+                active: true,
+                ..StatusContext::default()
+            },
+            40,
+            true,
+        );
         assert_eq!(spans[0].text, label, "mode {mode}");
     }
 }
@@ -39,7 +51,18 @@ fn configured_labels_override_defaults_and_keep_their_full_length() {
         ("custom", " Custom "),
         ("insert", " INS "),
     ] {
-        let spans = session.statusline(id, "default", json!({"mode": mode, "width": 40}), 40, true);
+        let spans = session.statusline(
+            id,
+            "default",
+            StatusContext {
+                mode: Some(mode.into()),
+                width: 40,
+                active: true,
+                ..StatusContext::default()
+            },
+            40,
+            true,
+        );
         assert_eq!(spans[0].text, label, "mode {mode}");
     }
 }

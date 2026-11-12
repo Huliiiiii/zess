@@ -6,12 +6,18 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use zess_ipc::{Listener, SocketPath, Stream, framing};
-use zess_protocol::{ClientMessage, MAX_INPUT_BYTES, MAX_MESSAGE_BYTES, ServerMessage};
+use zess_ipc::{LocalIpc, SocketPath, Stream, framing};
+use zess_platform::{NativePlatform, Platform};
+use zess_protocol::{
+    ClientMessage, CommandAction, CommandOutcome, MAX_INPUT_BYTES, MAX_MESSAGE_BYTES,
+    OperationResult, RequestId, ServerInstanceId, ServerMessage, SessionDelta, SessionId,
+    SessionSnapshot,
+};
 
 use crate::Session;
+use zess_ui::Frame;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 
 struct PendingMessage {
@@ -19,15 +25,59 @@ struct PendingMessage {
     update: bool,
 }
 
+enum ConnectionRole {
+    Unidentified {
+        accepted: Instant,
+    },
+    Attached {
+        client: String,
+    },
+    Closing {
+        client: Option<String>,
+        deadline: Instant,
+    },
+}
+
+impl ConnectionRole {
+    fn client(&self) -> Option<&String> {
+        match self {
+            Self::Attached { client } => Some(client),
+            Self::Closing { client, .. } => client.as_ref(),
+            Self::Unidentified { .. } => None,
+        }
+    }
+}
+
+enum ServerState {
+    Running,
+    Draining { deadline: Instant },
+    Stopped,
+}
+
+impl ServerState {
+    fn drain(&mut self, connections: &mut Vec<Connection>) {
+        let Self::Draining { deadline } = self else {
+            return;
+        };
+        connections
+            .retain_mut(|connection| connection.flush().is_ok() && !connection.output.is_empty());
+        if connections.is_empty() || Instant::now() >= *deadline {
+            connections.clear();
+            *self = Self::Stopped;
+        }
+    }
+}
+
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 struct Connection {
     stream: Stream,
     input: framing::Decoder,
     output: VecDeque<PendingMessage>,
     written: usize,
-    client: Option<String>,
-    accepted: Instant,
-    closing: bool,
+    role: ConnectionRole,
     eof: bool,
+    normal_exit: bool,
 }
 
 impl Connection {
@@ -38,11 +88,26 @@ impl Connection {
             input: framing::Decoder::default(),
             output: VecDeque::new(),
             written: 0,
-            client: None,
-            accepted: Instant::now(),
-            closing: false,
+            role: ConnectionRole::Unidentified {
+                accepted: Instant::now(),
+            },
             eof: false,
+            normal_exit: false,
         })
+    }
+
+    fn disconnect(self, session: &mut Session, active: &mut Option<String>) {
+        if self.role.client().is_some() {
+            session.invalidate_mouse();
+            *active = None;
+        }
+    }
+
+    fn close_after_flush(&mut self) {
+        self.role = ConnectionRole::Closing {
+            client: self.role.client().cloned(),
+            deadline: Instant::now() + DRAIN_TIMEOUT,
+        };
     }
 
     fn send(&mut self, message: &ServerMessage) -> Result<()> {
@@ -67,6 +132,17 @@ impl Connection {
         Ok(())
     }
 
+    fn send_clipboard_effects(&mut self, session: &mut Session) -> Result<()> {
+        session.flush_clipboard_writes(|text| self.send(&ServerMessage::ClipboardWrite { text }));
+        session.flush_primary_clipboard_writes(|text| {
+            self.send(&ServerMessage::ClipboardWritePrimary { text })
+        });
+        if let Some((id, primary)) = session.clipboard_request() {
+            self.send(&ServerMessage::ClipboardRead { id, primary })?;
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         while let Some(message) = self.output.front() {
             match self.stream.write(&message.bytes[self.written..]) {
@@ -87,6 +163,7 @@ impl Connection {
     }
 
     fn receive(&mut self) -> Result<Vec<ClientMessage>> {
+        let mut messages = Vec::new();
         let mut bytes = [0; 8192];
         loop {
             match self.stream.read(&mut bytes) {
@@ -95,35 +172,257 @@ impl Connection {
                     break;
                 }
                 Ok(count) => {
-                    self.input.push(&bytes[..count], MAX_INPUT_BYTES)?;
+                    for fragment in bytes[..count].split_inclusive(|byte| *byte == b'\n') {
+                        self.input.push(fragment, MAX_INPUT_BYTES)?;
+                        if fragment.last() == Some(&b'\n') {
+                            messages.push(
+                                self.input
+                                    .decode_next()?
+                                    .expect("fragment completes a message"),
+                            );
+                        }
+                    }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error.into()),
             }
         }
-        let mut messages = Vec::new();
-        while let Some(message) = self.input.decode_next()? {
-            messages.push(message);
-        }
         Ok(messages)
     }
 }
 
+struct PublishedState {
+    session_id: SessionId,
+    server_instance: ServerInstanceId,
+    revision: u64,
+    semantic: SessionSnapshot,
+    frame: Frame,
+}
+
+impl PublishedState {
+    fn new(session: &mut Session, server_instance: ServerInstanceId) -> Self {
+        let frame = session.frame();
+        let semantic = session.snapshot_with_frame(&frame);
+        Self {
+            session_id: SessionId(format!("session-{}", server_instance.0)),
+            server_instance,
+            revision: 1,
+            semantic,
+            frame,
+        }
+    }
+
+    fn snapshot(&self) -> ServerMessage {
+        ServerMessage::Snapshot {
+            session_id: self.session_id.clone(),
+            server_instance: self.server_instance.clone(),
+            state_revision: self.revision,
+            state: self.semantic.clone(),
+            frame: self.frame.clone(),
+        }
+    }
+
+    fn refresh(&mut self, session: &mut Session) -> Option<ServerMessage> {
+        let frame = session.frame();
+        let semantic = session.snapshot_with_frame(&frame);
+        if self.semantic == semantic && self.frame == frame {
+            return None;
+        }
+        let base_revision = self.revision;
+        self.revision += 1;
+        let delta = SessionDelta::between(&self.semantic, &semantic);
+        let frame_delta = (self.frame != frame).then(|| frame.clone());
+        self.semantic = semantic;
+        self.frame = frame;
+        Some(ServerMessage::Delta {
+            session_id: self.session_id.clone(),
+            server_instance: self.server_instance.clone(),
+            base_revision,
+            state_revision: self.revision,
+            delta,
+            frame: frame_delta,
+        })
+    }
+
+    fn publish(&mut self, session: &mut Session, connection: &mut Connection) -> Result<()> {
+        if let Some(message) = self.refresh(session) {
+            connection.send(&message)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum OperationAction {
+    Command(CommandAction),
+    Input {
+        sequence: u64,
+        key: String,
+        context_epoch: u64,
+    },
+}
+
+struct Operation {
+    token: String,
+    action: OperationAction,
+    result: OperationResult,
+    acknowledged: bool,
+}
+
+#[derive(Default)]
+struct OperationTable {
+    operations: HashMap<(String, RequestId), Operation>,
+}
+
+impl OperationTable {
+    fn execute(
+        &mut self,
+        client: &str,
+        request_id: RequestId,
+        action: OperationAction,
+        session: &mut Session,
+        published: &mut PublishedState,
+    ) -> (OperationResult, Option<ServerMessage>) {
+        let key = (client.to_owned(), request_id);
+        if let Some(operation) = self.operations.get(&key) {
+            return (
+                if operation.action == action {
+                    operation.result.clone()
+                } else {
+                    OperationResult::Completed {
+                        outcome: CommandOutcome::Failed {
+                            message: "request ID already belongs to another command".into(),
+                        },
+                        state_revision: published.revision,
+                    }
+                },
+                None,
+            );
+        }
+        let token = format!("{}:{}:{}", client.len(), client, key.1.0);
+        self.operations.insert(
+            key.clone(),
+            Operation {
+                token: token.clone(),
+                action: action.clone(),
+                result: OperationResult::Pending,
+                acknowledged: false,
+            },
+        );
+        let outcome = match &action {
+            OperationAction::Command(action) => session.begin_operation(&token, action),
+            OperationAction::Input { key, .. } => session.tracked_input(&token, key),
+        };
+        let delta = published.refresh(session);
+        let result = match outcome {
+            Some(outcome) => OperationResult::Completed {
+                outcome,
+                state_revision: published.revision,
+            },
+            None => OperationResult::Pending,
+        };
+        self.operations.get_mut(&key).unwrap().result = result.clone();
+        (result, delta)
+    }
+
+    fn complete(
+        &mut self,
+        token: &str,
+        outcome: CommandOutcome,
+        revision: u64,
+    ) -> Option<(String, RequestId, OperationResult)> {
+        let ((client, request_id), operation) = self
+            .operations
+            .iter_mut()
+            .find(|(_, operation)| operation.token == token)?;
+        if !matches!(operation.result, OperationResult::Pending) {
+            return None;
+        }
+        operation.result = OperationResult::Completed {
+            outcome,
+            state_revision: revision,
+        };
+        operation.acknowledged = false;
+        Some((client.clone(), request_id.clone(), operation.result.clone()))
+    }
+
+    fn result(&self, client: &str, request_id: &RequestId) -> OperationResult {
+        self.operations
+            .get(&(client.to_owned(), request_id.clone()))
+            .map(|operation| operation.result.clone())
+            .unwrap_or(OperationResult::Unknown)
+    }
+
+    fn acknowledge(&mut self, client: &str, request_id: RequestId) {
+        if let Some(operation) = self.operations.get_mut(&(client.to_owned(), request_id)) {
+            operation.acknowledged = true;
+        }
+    }
+
+    fn resend(
+        &self,
+        client: &str,
+        instance: &ServerInstanceId,
+        connection: &mut Connection,
+    ) -> Result<()> {
+        for ((owner, request_id), operation) in &self.operations {
+            if owner == client && !operation.acknowledged {
+                connection.send(&ServerMessage::CommandResult {
+                    request_id: request_id.clone(),
+                    server_instance: instance.clone(),
+                    result: operation.result.clone(),
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Serve a single active terminal while retaining all session state on detach.
-pub fn serve(socket: &SocketPath, mut session: Session) -> Result<()> {
-    let listener = Listener::bind(socket)?;
+pub fn serve(ipc: &dyn LocalIpc, socket: &SocketPath, session: Session) -> Result<()> {
+    serve_with_platform(ipc, socket, session, &NativePlatform)
+}
+
+/// Serves with caller-supplied IPC and host identity facts.
+pub fn serve_with_platform(
+    ipc: &dyn LocalIpc,
+    socket: &SocketPath,
+    mut session: Session,
+    platform: &dyn Platform,
+) -> Result<()> {
+    let listener = ipc.bind(socket)?;
     listener.set_nonblocking(true)?;
     let mut connections = Vec::<Connection>::new();
     let mut active = None::<String>;
     let mut acknowledged = HashMap::<String, u64>::new();
     let mut previous_client = None::<String>;
-    let mut stopping = false;
-    let mut context_epoch = std::time::SystemTime::now()
+    let mut state = ServerState::Running;
+    let process_id = platform.process_id();
+    let server_instance = ServerInstanceId(format!(
+        "{}-{}",
+        process_id,
+        platform
+            .system_time()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let mut published = PublishedState::new(&mut session, server_instance.clone());
+    let mut operations = OperationTable::default();
+    let mut context_epoch = platform
+        .system_time()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos() as u64;
 
     loop {
+        if matches!(state, ServerState::Draining { .. }) {
+            state.drain(&mut connections);
+            thread::sleep(Duration::from_millis(8));
+            continue;
+        }
+        if matches!(state, ServerState::Stopped) {
+            break;
+        }
         loop {
             match listener.accept() {
                 Ok(stream) => connections.push(Connection::new(stream)?),
@@ -135,7 +434,7 @@ pub fn serve(socket: &SocketPath, mut session: Session) -> Result<()> {
         let mut index = 0;
         while index < connections.len() {
             let connection = &mut connections[index];
-            let messages = if connection.closing {
+            let messages = if matches!(connection.role, ConnectionRole::Closing { .. }) {
                 Ok(Vec::new())
             } else {
                 connection.receive()
@@ -144,24 +443,33 @@ pub fn serve(socket: &SocketPath, mut session: Session) -> Result<()> {
             if let Ok(messages) = messages {
                 for message in messages {
                     match message {
-                        ClientMessage::Status if connection.client.is_none() => {
+                        ClientMessage::Status
+                            if matches!(connection.role, ConnectionRole::Unidentified { .. }) =>
+                        {
                             connection.send(&ServerMessage::Status {
-                                pid: std::process::id(),
+                                session_id: published.session_id.clone(),
+                                server_instance: server_instance.clone(),
+                                state_revision: published.revision,
+                                pid: process_id,
                                 workspace: session.workspace().to_string_lossy().into_owned(),
                                 attached: active.is_some(),
                                 modified: session.modified(),
                             })?;
-                            connection.closing = true;
+                            connection.close_after_flush();
                             break;
                         }
-                        ClientMessage::Stop { force } if connection.client.is_none() => {
+                        ClientMessage::Stop { force }
+                            if matches!(connection.role, ConnectionRole::Unidentified { .. }) =>
+                        {
                             if !force && session.modified() {
                                 connection.send(&ServerMessage::Rejected {
                                     reason: "unsaved buffers; save them first or use --force to discard them".into(),
                                 })?;
-                                connection.closing = true;
+                                connection.close_after_flush();
                             } else {
-                                stopping = true;
+                                state = ServerState::Draining {
+                                    deadline: Instant::now() + DRAIN_TIMEOUT,
+                                };
                             }
                             break;
                         }
@@ -171,14 +479,14 @@ pub fn serve(socket: &SocketPath, mut session: Session) -> Result<()> {
                             height,
                             files,
                             context_epoch: previous_epoch,
-                        } if connection.client.is_none() => {
+                        } if matches!(connection.role, ConnectionRole::Unidentified { .. }) => {
                             if active.is_some() {
                                 connection.send(&ServerMessage::Rejected {
                                     reason:
                                         "another terminal is attached; detach it with Ctrl-z first"
                                             .into(),
                                 })?;
-                                connection.closing = true;
+                                connection.close_after_flush();
                             } else if client_id.is_empty() || client_id.len() > 128 {
                                 disconnected = true;
                             } else {
@@ -186,61 +494,133 @@ pub fn serve(socket: &SocketPath, mut session: Session) -> Result<()> {
                                     .as_ref()
                                     .is_some_and(|previous| previous != &client_id)
                                 {
+                                    session.cancel_clipboard_operations(
+                                        "clipboard operation cancelled: another client attached",
+                                    );
+                                    published.refresh(&mut session);
+                                    for (token, outcome) in session.take_operation_completions() {
+                                        operations.complete(&token, outcome, published.revision);
+                                    }
                                     context_epoch += 1;
                                 }
                                 previous_client = Some(client_id.clone());
                                 active = Some(client_id.clone());
-                                connection.client = Some(client_id.clone());
+                                connection.role = ConnectionRole::Attached {
+                                    client: client_id.clone(),
+                                };
                                 session.resize(width, height);
                                 if !acknowledged.contains_key(&client_id) {
                                     session.open_paths(&files);
                                 }
+                                let client_id_for_resend = client_id.clone();
                                 connection.send(&ServerMessage::Attached {
+                                    server_instance: server_instance.clone(),
                                     acknowledged: *acknowledged.entry(client_id).or_default(),
                                     context_epoch,
                                     replay_allowed: previous_epoch
                                         .is_none_or(|epoch| epoch == context_epoch),
                                     frame: session.frame(),
                                 })?;
+                                published.refresh(&mut session);
+                                connection.send(&published.snapshot())?;
+                                operations.resend(
+                                    &client_id_for_resend,
+                                    &server_instance,
+                                    connection,
+                                )?;
+                                if let Some((id, primary)) = session.clipboard_request() {
+                                    connection
+                                        .send(&ServerMessage::ClipboardRead { id, primary })?;
+                                }
                             }
                         }
                         ClientMessage::Input {
                             sequence,
                             key,
                             context_epoch: input_epoch,
-                        } if connection.client.is_some() => {
+                        } if matches!(connection.role, ConnectionRole::Attached { .. }) => {
                             if input_epoch != context_epoch {
                                 connection.send(&ServerMessage::Rejected {
                                     reason: "input context changed; reconnect before replaying queued input".into(),
                                 })?;
-                                connection.closing = true;
+                                connection.close_after_flush();
                                 break;
                             }
-                            let client = connection.client.as_ref().unwrap();
+                            let client = connection.role.client().unwrap();
                             let watermark = acknowledged.get_mut(client).unwrap();
                             if sequence == *watermark + 1 {
                                 session.input(&key);
                                 *watermark = sequence;
-                                session.flush_clipboard_writes(|text| {
-                                    connection.send(&ServerMessage::ClipboardWrite { text })
-                                });
-                                session.flush_primary_clipboard_writes(|text| {
-                                    connection.send(&ServerMessage::ClipboardWritePrimary { text })
-                                });
-                                if let Some((id, primary)) = session.clipboard_request() {
-                                    connection
-                                        .send(&ServerMessage::ClipboardRead { id, primary })?;
-                                }
                             } else if sequence > *watermark + 1 {
                                 connection.send(&ServerMessage::Rejected {
                                     reason: "input sequence gap; reconnect to retry unacknowledged input".into(),
                                 })?;
-                                connection.closing = true;
+                                connection.close_after_flush();
                                 break;
                             }
-                            connection.send(&ServerMessage::Update {
+                            connection.send_clipboard_effects(&mut session)?;
+                            connection.send(&ServerMessage::Ack {
                                 acknowledged: *watermark,
-                                frame: session.frame(),
+                                context_epoch,
+                            })?;
+                            published.publish(&mut session, connection)?;
+                        }
+                        ClientMessage::TrackedInput {
+                            request_id,
+                            server_instance: expected,
+                            sequence,
+                            key,
+                            context_epoch: input_epoch,
+                        } if matches!(connection.role, ConnectionRole::Attached { .. }) => {
+                            if expected != server_instance {
+                                connection.send(&ServerMessage::CommandResult {
+                                    request_id,
+                                    server_instance: server_instance.clone(),
+                                    result: OperationResult::Unknown,
+                                })?;
+                                continue;
+                            }
+                            if input_epoch != context_epoch {
+                                connection.send(&ServerMessage::Rejected { reason: "input context changed; reconnect before replaying queued input".into() })?;
+                                connection.close_after_flush();
+                                break;
+                            }
+                            let client = connection.role.client().unwrap().clone();
+                            let watermark = acknowledged.get_mut(&client).unwrap();
+                            let result = if sequence == *watermark + 1 {
+                                let (result, delta) = operations.execute(
+                                    &client,
+                                    request_id.clone(),
+                                    OperationAction::Input {
+                                        sequence,
+                                        key,
+                                        context_epoch: input_epoch,
+                                    },
+                                    &mut session,
+                                    &mut published,
+                                );
+                                *watermark = sequence;
+                                if let Some(delta) = delta {
+                                    connection.send(&delta)?;
+                                }
+                                result
+                            } else if sequence <= *watermark {
+                                operations.result(&client, &request_id)
+                            } else {
+                                connection.send(&ServerMessage::Rejected { reason: "input sequence gap; reconnect to retry unacknowledged input".into() })?;
+                                connection.close_after_flush();
+                                break;
+                            };
+                            connection.send_clipboard_effects(&mut session)?;
+                            published.publish(&mut session, connection)?;
+                            connection.send(&ServerMessage::Ack {
+                                acknowledged: *watermark,
+                                context_epoch,
+                            })?;
+                            connection.send(&ServerMessage::CommandResult {
+                                request_id,
+                                server_instance: server_instance.clone(),
+                                result,
                             })?;
                         }
                         ClientMessage::Mouse {
@@ -248,58 +628,148 @@ pub fn serve(socket: &SocketPath, mut session: Session) -> Result<()> {
                             context_epoch: input_epoch,
                             mouse_context,
                             event,
-                        } if connection.client.is_some() => {
+                        } if matches!(connection.role, ConnectionRole::Attached { .. }) => {
                             if input_epoch != context_epoch {
                                 connection.send(&ServerMessage::Rejected { reason: "input context changed; reconnect before sending mouse input".into() })?;
-                                connection.closing = true;
+                                connection.close_after_flush();
                                 break;
                             }
                             let watermark = acknowledged
-                                .get_mut(connection.client.as_ref().unwrap())
+                                .get_mut(connection.role.client().unwrap())
                                 .unwrap();
                             if sequence == *watermark + 1 {
                                 session.mouse(mouse_context, event);
                                 *watermark = sequence;
                             } else if sequence > *watermark + 1 {
                                 connection.send(&ServerMessage::Rejected { reason: "input sequence gap; reconnect to retry unacknowledged input".into() })?;
-                                connection.closing = true;
+                                connection.close_after_flush();
                                 break;
                             }
-                            connection.send(&ServerMessage::Update {
+                            connection.send_clipboard_effects(&mut session)?;
+                            connection.send(&ServerMessage::Ack {
                                 acknowledged: *watermark,
-                                frame: session.frame(),
+                                context_epoch,
                             })?;
+                            published.publish(&mut session, connection)?;
                         }
                         ClientMessage::Skip {
                             through,
                             context_epoch: input_epoch,
-                        } if connection.client.is_some() && input_epoch == context_epoch => {
+                        } if matches!(connection.role, ConnectionRole::Attached { .. })
+                            && input_epoch == context_epoch =>
+                        {
                             let watermark = acknowledged
-                                .get_mut(connection.client.as_ref().unwrap())
+                                .get_mut(connection.role.client().unwrap())
                                 .unwrap();
                             *watermark = (*watermark).max(through);
-                            connection.send(&ServerMessage::Update {
+                            connection.send(&ServerMessage::Ack {
                                 acknowledged: *watermark,
-                                frame: session.frame(),
+                                context_epoch,
                             })?;
+                            published.publish(&mut session, connection)?;
                         }
-                        ClientMessage::Resize { width, height } if connection.client.is_some() => {
+                        ClientMessage::Resize { width, height }
+                            if matches!(connection.role, ConnectionRole::Attached { .. }) =>
+                        {
                             session.resize(width, height);
-                            let watermark = acknowledged[connection.client.as_ref().unwrap()];
-                            connection.send(&ServerMessage::Update {
+                            let watermark = acknowledged[connection.role.client().unwrap()];
+                            connection.send(&ServerMessage::Ack {
                                 acknowledged: watermark,
-                                frame: session.frame(),
+                                context_epoch,
                             })?;
+                            published.publish(&mut session, connection)?;
                         }
                         ClientMessage::ClipboardResponse { id, text, error }
-                            if connection.client.is_some() =>
+                            if matches!(connection.role, ConnectionRole::Attached { .. }) =>
                         {
                             session.complete_clipboard_read(id, text, error);
-                            let watermark = acknowledged[connection.client.as_ref().unwrap()];
-                            connection.send(&ServerMessage::Update {
+                            let watermark = acknowledged[connection.role.client().unwrap()];
+                            connection.send_clipboard_effects(&mut session)?;
+                            connection.send(&ServerMessage::Ack {
                                 acknowledged: watermark,
-                                frame: session.frame(),
+                                context_epoch,
                             })?;
+                            published.publish(&mut session, connection)?;
+                        }
+                        ClientMessage::Resync { session_id, .. }
+                            if matches!(connection.role, ConnectionRole::Attached { .. }) =>
+                        {
+                            if session_id != published.session_id {
+                                connection.send(&ServerMessage::Rejected {
+                                    reason: "session identity changed".into(),
+                                })?;
+                            } else {
+                                published.refresh(&mut session);
+                                connection.send(&published.snapshot())?;
+                            }
+                        }
+                        ClientMessage::Command {
+                            request_id,
+                            server_instance: expected,
+                            action,
+                        } if matches!(connection.role, ConnectionRole::Attached { .. }) => {
+                            let client_exit =
+                                matches!(&action, zess_protocol::CommandAction::ClientExit { .. });
+                            let result = if expected != server_instance {
+                                OperationResult::Unknown
+                            } else {
+                                let client = connection.role.client().unwrap().clone();
+                                let (result, delta) = operations.execute(
+                                    &client,
+                                    request_id.clone(),
+                                    OperationAction::Command(action),
+                                    &mut session,
+                                    &mut published,
+                                );
+                                if let Some(delta) = delta {
+                                    connection.send(&delta)?;
+                                }
+                                result
+                            };
+                            connection.send_clipboard_effects(&mut session)?;
+                            published.publish(&mut session, connection)?;
+                            let exited = client_exit
+                                && matches!(
+                                    &result,
+                                    OperationResult::Completed {
+                                        outcome: zess_protocol::CommandOutcome::Applied,
+                                        ..
+                                    }
+                                );
+                            connection.send(&ServerMessage::CommandResult {
+                                request_id,
+                                server_instance: server_instance.clone(),
+                                result,
+                            })?;
+                            if exited {
+                                connection.send(&ServerMessage::Detached)?;
+                                connection.close_after_flush();
+                                connection.normal_exit = true;
+                            }
+                        }
+                        ClientMessage::QueryOperation {
+                            request_id,
+                            server_instance: expected,
+                        } if matches!(connection.role, ConnectionRole::Attached { .. }) => {
+                            let result = if expected == server_instance {
+                                operations.result(connection.role.client().unwrap(), &request_id)
+                            } else {
+                                OperationResult::Unknown
+                            };
+                            connection.send(&ServerMessage::CommandResult {
+                                request_id,
+                                server_instance: server_instance.clone(),
+                                result,
+                            })?;
+                        }
+                        ClientMessage::ResultAck {
+                            request_id,
+                            server_instance: expected,
+                        } if matches!(connection.role, ConnectionRole::Attached { .. }) => {
+                            if expected == server_instance {
+                                operations
+                                    .acknowledge(connection.role.client().unwrap(), request_id);
+                            }
                         }
                         ClientMessage::Detach => {
                             disconnected = true;
@@ -310,82 +780,139 @@ pub fn serve(socket: &SocketPath, mut session: Session) -> Result<()> {
                             break;
                         }
                     }
-                    if session.exiting() || stopping {
+                    if matches!(connection.role, ConnectionRole::Attached { .. }) {
+                        let copied = session.flush_clipboard_writes(|text| {
+                            connection.send(&ServerMessage::ClipboardWrite { text })
+                        });
+                        let primary_copied = session.flush_primary_clipboard_writes(|text| {
+                            connection.send(&ServerMessage::ClipboardWritePrimary { text })
+                        });
+                        if copied || primary_copied {
+                            published.publish(&mut session, connection)?;
+                        }
+                    }
+                    if session.exiting() || matches!(state, ServerState::Draining { .. }) {
                         break;
                     }
                 }
             }
-            if connection.flush().is_err() {
+            let flush_failed = connection.flush().is_err();
+            if flush_failed {
                 disconnected = true;
             }
             if connection.eof {
                 disconnected = true;
             }
-            if connection.closing && connection.output.is_empty() {
-                disconnected = true;
-            }
-            if connection.client.is_none() && connection.accepted.elapsed() > Duration::from_secs(5)
+            if matches!(connection.role, ConnectionRole::Closing { .. })
+                && connection.output.is_empty()
             {
                 disconnected = true;
             }
+            match connection.role {
+                ConnectionRole::Unidentified { accepted }
+                    if accepted.elapsed() > Duration::from_secs(5) =>
+                {
+                    disconnected = true
+                }
+                ConnectionRole::Closing { deadline, .. } if Instant::now() >= deadline => {
+                    disconnected = true
+                }
+                _ => {}
+            }
             if disconnected {
-                let connection = connections.remove(index);
-                if connection.client.is_some() {
-                    session.invalidate_mouse();
-                    active = None;
+                let normal_exit =
+                    connection.normal_exit && !flush_failed && connection.output.is_empty();
+                connections
+                    .remove(index)
+                    .disconnect(&mut session, &mut active);
+                if normal_exit
+                    && active.is_none()
+                    && !session.modified()
+                    && session.on_client_exit() == zess_plugin::OnClientExit::StopIfUnused
+                {
+                    state = ServerState::Draining {
+                        deadline: Instant::now() + DRAIN_TIMEOUT,
+                    };
                 }
             } else {
                 index += 1;
             }
-            if stopping {
+            if matches!(state, ServerState::Draining { .. }) {
                 break;
             }
         }
-        if session.exiting() || stopping {
+        if session.exiting() || matches!(state, ServerState::Draining { .. }) {
             for connection in &mut connections {
                 let _ = connection.send(&ServerMessage::Exited);
-                let _ = connection.flush();
+                connection.close_after_flush();
             }
-            break;
+            state = ServerState::Draining {
+                deadline: Instant::now() + DRAIN_TIMEOUT,
+            };
+            continue;
         }
         let changed = session.tick();
-        let copied = session.flush_clipboard_writes(|text| {
-            if let Some(connection) = connections
-                .iter_mut()
-                .find(|connection| connection.client.is_some())
-            {
-                connection.send(&ServerMessage::ClipboardWrite { text })?;
-            }
-            Ok(())
-        });
-        let primary_copied = session.flush_primary_clipboard_writes(|text| {
-            if let Some(connection) = connections
-                .iter_mut()
-                .find(|connection| connection.client.is_some())
-            {
-                connection.send(&ServerMessage::ClipboardWritePrimary { text })?;
-            }
-            Ok(())
-        });
-        if changed || copied || primary_copied {
+        let completed = session.take_operation_completions();
+        let has_attached = connections
+            .iter()
+            .any(|connection| matches!(connection.role, ConnectionRole::Attached { .. }));
+        let copied = has_attached
+            && session.flush_clipboard_writes(|text| {
+                if let Some(connection) = connections
+                    .iter_mut()
+                    .find(|connection| matches!(connection.role, ConnectionRole::Attached { .. }))
+                {
+                    connection.send(&ServerMessage::ClipboardWrite { text })?;
+                }
+                Ok(())
+            });
+        let primary_copied = has_attached
+            && session.flush_primary_clipboard_writes(|text| {
+                if let Some(connection) = connections
+                    .iter_mut()
+                    .find(|connection| matches!(connection.role, ConnectionRole::Attached { .. }))
+                {
+                    connection.send(&ServerMessage::ClipboardWritePrimary { text })?;
+                }
+                Ok(())
+            });
+        if changed || copied || primary_copied || !completed.is_empty() {
+            let delta = published.refresh(&mut session);
             let mut index = 0;
             while index < connections.len() {
                 let connection = &mut connections[index];
-                if let Some(client) = &connection.client {
+                if let ConnectionRole::Attached { client } = &connection.role {
                     let watermark = acknowledged[client];
-                    connection.send(&ServerMessage::Update {
+                    connection.send(&ServerMessage::Ack {
                         acknowledged: watermark,
-                        frame: session.frame(),
+                        context_epoch,
                     })?;
+                    if let Some(delta) = &delta {
+                        connection.send(delta)?;
+                    }
                 }
                 if connection.flush().is_err() {
-                    let connection = connections.remove(index);
-                    if connection.client.is_some() {
-                        session.invalidate_mouse();
-                        active = None;
-                    }
+                    connections
+                        .remove(index)
+                        .disconnect(&mut session, &mut active);
                 } else {
                     index += 1;
+                }
+            }
+        }
+        for (token, outcome) in completed {
+            if let Some((client, request_id, result)) =
+                operations.complete(&token, outcome, published.revision)
+            {
+                if let Some(connection) = connections
+                    .iter_mut()
+                    .find(|connection| connection.role.client() == Some(&client))
+                {
+                    connection.send(&ServerMessage::CommandResult {
+                        request_id,
+                        server_instance: server_instance.clone(),
+                        result,
+                    })?;
                 }
             }
         }

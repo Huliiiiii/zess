@@ -5,7 +5,7 @@ provide
   . input-event input-argument input-query input-options input-context input-mode input-selection
   . input-buffer-id input-view-id input-generation input-register
   . buffer-result unpack-buffer-result
-  . buffer-output buffer-display display-row row-id row-text row-depth row-style
+  . buffer-output buffer-display with-status-data display-row row-id row-text row-depth row-style
   . display-cell cell-append-span row-cells with-row-cells
   . item-selection selection-primary selection-selected selection-anchor
   . output-watches output-modified watch-query

@@ -59,17 +59,24 @@ zess-plugins = { path = "crates/zess-plugins" }
 
 [package]
 name = "zess"
+default-run = "zess"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+zess-platform.workspace = true
+zess-remote.workspace = true
 zess-protocol.workspace = true
 zess-ipc.workspace = true
 zess-session.workspace = true
 zess-terminal.workspace = true
 zess-text.workspace = true
+zess-services.workspace = true
+zess-script.workspace = true
+zess-git.workspace = true
 
 [dev-dependencies]
 fnv.workspace = true

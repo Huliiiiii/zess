@@ -1,91 +1,56 @@
 use std::{
-    collections::VecDeque,
-    io::{self, BufReader, Write},
+    collections::{HashMap, HashSet, VecDeque},
+    io::{self, Read, Write},
     path::PathBuf,
-    process::Command,
-    sync::mpsc::{self, Receiver},
-    thread::{self, JoinHandle},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use crossterm::{
     SynchronizedUpdate,
-    clipboard::CopyToClipboard,
     cursor::{Hide, MoveTo, SetCursorStyle, Show},
-    event::{
-        self, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
-    },
-    execute, queue,
+    event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
+    queue,
     style::{Attribute, Print, ResetColor, SetAttribute},
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{Clear, ClearType},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use zess_ipc::{SocketPath, Stream, framing};
-use zess_protocol::{ClientMessage, MAX_INPUT_BYTES, MAX_MESSAGE_BYTES, ServerMessage};
+use zess_platform::{NativePlatform, Platform};
+use zess_protocol::{
+    ClientMessage, MAX_INPUT_BYTES, MAX_MESSAGE_BYTES, RequestId, ServerInstanceId, ServerMessage,
+};
 use zess_ui::{CursorShape, Frame, FrameRow, MouseEvent, MouseKind};
 
+mod clipboard;
+mod clipboard_actions;
+mod clipboard_helper;
+mod clipboard_write;
+mod state;
 mod style;
+mod terminal;
 
 #[cfg(test)]
 mod tests;
+
+use clipboard_actions::ClipboardActions;
+
+pub use clipboard::{
+    Clipboard, ClipboardJob, ClipboardReadJob, ClipboardWrite, ClipboardWriteJob, NativeClipboard,
+    NoClipboardJob, Osc52Clipboard, TerminalClipboard,
+};
+pub use clipboard_helper::{CLIPBOARD_HELPER_ARG, run_clipboard_helper};
+pub use state::RemoteStateCache;
+pub use style::resolve_in as resolve_style;
+pub use terminal::{CrosstermTerminal, TerminalIo};
 
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CONNECT_ATTEMPTS: u8 = 5;
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
-
-fn read_clipboard(primary: bool) -> Result<String> {
-    let mut candidates: Vec<(&str, Vec<&str>)> = Vec::new();
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        candidates.push((
-            "wl-paste",
-            if primary {
-                vec!["-p", "--no-newline"]
-            } else {
-                vec!["--no-newline"]
-            },
-        ));
-    }
-    if std::env::var_os("DISPLAY").is_some() {
-        candidates.push((
-            "xclip",
-            vec![
-                "-o",
-                "-selection",
-                if primary { "primary" } else { "clipboard" },
-            ],
-        ));
-        candidates.push((
-            "xsel",
-            if primary {
-                vec!["-o"]
-            } else {
-                vec!["-o", "-b"]
-            },
-        ));
-    }
-    if cfg!(target_os = "macos") && !primary {
-        candidates.push(("pbpaste", vec![]));
-    }
-    for (program, args) in candidates {
-        match Command::new(program).args(args).output() {
-            Ok(output) if output.status.success() => {
-                return String::from_utf8(output.stdout).context("clipboard is not UTF-8");
-            }
-            Ok(output) => anyhow::bail!(
-                "{program} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).with_context(|| format!("run {program}")),
-        }
-    }
-    anyhow::bail!("no local clipboard provider found (install wl-paste, xclip, or xsel)")
-}
 
 /// Run the terminal client connected to a local zess server socket.
 pub fn run(socket: &SocketPath) -> Result<()> {
@@ -94,6 +59,82 @@ pub fn run(socket: &SocketPath) -> Result<()> {
 
 /// Run the terminal client and open the requested files on the first attach.
 pub fn run_files(socket: &SocketPath, files: &[PathBuf]) -> Result<()> {
+    run_connection(&mut LocalConnectionFactory(socket.clone()), files)
+}
+
+/// Creates a fresh transport for the first connection and each reconnect.
+pub trait ConnectionFactory {
+    fn connect(&mut self) -> Result<Box<dyn ConnectionStream>>;
+
+    fn connect_with_cancellation(
+        &mut self,
+        cancellation: &zess_platform::CancellationToken,
+    ) -> Result<Box<dyn ConnectionStream>> {
+        cancellation.check()?;
+        self.connect()
+    }
+}
+
+/// Nonblocking byte transport consumed by the terminal event loop.
+pub trait ConnectionStream: Read + Write {
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
+}
+
+impl ConnectionStream for Stream {
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        Stream::set_nonblocking(self, nonblocking)
+    }
+}
+
+pub struct LocalConnectionFactory(pub SocketPath);
+
+impl ConnectionFactory for LocalConnectionFactory {
+    fn connect(&mut self) -> Result<Box<dyn ConnectionStream>> {
+        Stream::connect(&self.0)
+            .map(|stream| Box::new(stream) as Box<dyn ConnectionStream>)
+            .with_context(|| format!("connect to zess socket {}", self.0.display()))
+    }
+}
+
+/// Runs a terminal client over a reconnectable local or remote transport.
+pub fn run_connection(factory: &mut impl ConnectionFactory, files: &[PathBuf]) -> Result<()> {
+    run_connection_with_platform(factory, files, &NativePlatform)
+}
+
+/// Runs a terminal client with host identity facts supplied by the launcher.
+pub fn run_connection_with_platform(
+    factory: &mut impl ConnectionFactory,
+    files: &[PathBuf],
+    platform: &dyn Platform,
+) -> Result<()> {
+    let mut terminal = CrosstermTerminal::enter()?;
+    run_connection_with_devices_and_platform(
+        factory,
+        files,
+        &mut terminal,
+        &mut TerminalClipboard::default(),
+        platform,
+    )
+}
+
+/// Runs with caller-owned terminal and clipboard devices.
+pub fn run_connection_with_devices(
+    factory: &mut impl ConnectionFactory,
+    files: &[PathBuf],
+    terminal: &mut impl TerminalIo,
+    clipboard: &mut impl Clipboard,
+) -> Result<()> {
+    run_connection_with_devices_and_platform(factory, files, terminal, clipboard, &NativePlatform)
+}
+
+/// Runs the terminal client with host identity facts supplied by the launcher.
+pub fn run_connection_with_devices_and_platform(
+    factory: &mut impl ConnectionFactory,
+    files: &[PathBuf],
+    terminal: &mut impl TerminalIo,
+    clipboard: &mut impl Clipboard,
+    platform: &dyn Platform,
+) -> Result<()> {
     let files = files
         .iter()
         .map(|path| {
@@ -102,147 +143,48 @@ pub fn run_files(socket: &SocketPath, files: &[PathBuf]) -> Result<()> {
                 .map(str::to_owned)
         })
         .collect::<Result<Vec<_>>>()?;
-    let client_id = format!("{}-{}", std::process::id(), unique_id());
-    run_with_id(socket, client_id, files)
+    run_client(factory, client_id(platform)?, files, terminal, clipboard)
 }
 
-fn unique_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+fn client_id(platform: &dyn Platform) -> Result<String> {
+    static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
+    let nonce = NEXT_CLIENT
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| anyhow::anyhow!("client namespace sequence exhausted"))?;
+    let timestamp = platform
+        .system_time()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos()
-        .to_string()
-}
-
-struct TerminalGuard {
-    alternate_screen: bool,
-    raw_mode: bool,
-    mouse_capture: bool,
-}
-
-impl TerminalGuard {
-    fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
-        if self.mouse_capture == enabled {
-            return Ok(());
-        }
-        let mut stdout = io::stdout();
-        if enabled {
-            self.mouse_capture = true;
-            // Button-motion tracking includes dragging, without idle-motion reports.
-            stdout.write_all(b"\x1b[?1002h\x1b[?1006h")?;
-            stdout.flush()?;
-        } else {
-            execute!(stdout, DisableMouseCapture)?;
-            self.mouse_capture = false;
-        }
-        Ok(())
-    }
-
-    fn enter() -> Result<Self> {
-        let mut guard = Self {
-            alternate_screen: false,
-            raw_mode: false,
-            mouse_capture: false,
-        };
-
-        terminal::enable_raw_mode().context("enable terminal raw mode")?;
-        guard.raw_mode = true;
-
-        guard.alternate_screen = true;
-        execute!(io::stdout(), EnterAlternateScreen).context("enter terminal alternate screen")?;
-        execute!(io::stdout(), Hide, Clear(ClearType::All))
-            .context("initialize terminal screen")?;
-
-        Ok(guard)
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let mut stdout = io::stdout();
-
-        if self.mouse_capture {
-            let _ = execute!(stdout, DisableMouseCapture);
-        }
-
-        if self.alternate_screen {
-            let _ = execute!(
-                stdout,
-                ResetColor,
-                SetAttribute(Attribute::Reset),
-                SetCursorStyle::DefaultUserShape,
-                Show,
-                LeaveAlternateScreen
-            );
-        }
-
-        if self.raw_mode {
-            let _ = terminal::disable_raw_mode();
-        }
-    }
+        .as_nanos();
+    Ok(format!("{}-{timestamp}-{nonce}", platform.process_id()))
 }
 
 struct Connection {
-    writer: Stream,
-    messages: Receiver<io::Result<ServerMessage>>,
-    reader: Option<JoinHandle<()>>,
-    attached: bool,
+    stream: Box<dyn ConnectionStream>,
+    input: framing::Decoder,
+    output: VecDeque<Vec<u8>>,
+    written: usize,
 }
 
 impl Connection {
     fn connect(
-        socket: &SocketPath,
+        factory: &mut impl ConnectionFactory,
         client_id: &str,
         files: &[String],
         context_epoch: Option<u64>,
         width: u16,
         height: u16,
     ) -> Result<Self> {
-        let writer = Stream::connect(socket)
-            .with_context(|| format!("connect to zess socket {}", socket.display()))?;
-        let reader_stream = writer.try_clone().context("clone zess socket")?;
-        let (sender, messages) = mpsc::channel();
-
-        let reader = thread::spawn(move || {
-            let mut reader = BufReader::new(reader_stream);
-            loop {
-                match framing::read(&mut reader, MAX_MESSAGE_BYTES) {
-                    Ok(None) => {
-                        let _ = sender.send(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "zess server closed the connection",
-                        )));
-                        break;
-                    }
-                    Ok(Some(line)) => match framing::decode(&line) {
-                        Ok(message) => {
-                            if sender.send(Ok(message)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            let _ =
-                                sender.send(Err(io::Error::new(io::ErrorKind::InvalidData, error)));
-                            break;
-                        }
-                    },
-                    Err(error) => {
-                        let _ = sender.send(Err(error));
-                        break;
-                    }
-                }
-            }
-        });
-
+        let stream = factory.connect()?;
+        stream.set_nonblocking(true)?;
         let mut connection = Self {
-            writer,
-            messages,
-            reader: Some(reader),
-            attached: false,
+            stream,
+            input: framing::Decoder::default(),
+            output: VecDeque::new(),
+            written: 0,
         };
-
         connection.send(&ClientMessage::Attach {
             client_id: client_id.to_owned(),
             files: files.to_vec(),
@@ -250,334 +192,891 @@ impl Connection {
             width,
             height,
         })?;
-
         Ok(connection)
     }
 
-    fn send(&mut self, message: &ClientMessage) -> Result<()> {
-        framing::write(&mut self.writer, message).context("write zess client message")?;
-        self.writer.flush().context("flush zess client message")?;
+    fn send(&mut self, message: &ClientMessage) -> serde_json::Result<()> {
+        self.output.push_back(framing::encode(message)?);
         Ok(())
     }
 
-    fn close(&mut self) {
-        let _ = self.writer.shutdown(std::net::Shutdown::Both);
+    fn poll(&mut self) -> Result<Vec<ServerMessage>> {
+        // Limit work per UI turn even while the peer is continuously readable/writable.
+        let mut budget = 64 * 1024;
+        while budget > 0 {
+            let Some(message) = self.output.front() else {
+                break;
+            };
+            let end = message.len().min(self.written + budget);
+            match self.stream.write(&message[self.written..end]) {
+                Ok(0) => anyhow::bail!("server closed the connection"),
+                Ok(count) => {
+                    budget -= count;
+                    self.written += count;
+                    if self.written == message.len() {
+                        self.output.pop_front();
+                        self.written = 0;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut messages = Vec::new();
+        let mut bytes = [0; 8192];
+        for _ in 0..8 {
+            match self.stream.read(&mut bytes) {
+                Ok(0) if !messages.is_empty() => break,
+                Ok(0) => anyhow::bail!("server closed the connection"),
+                Ok(count) => {
+                    for fragment in bytes[..count].split_inclusive(|byte| *byte == b'\n') {
+                        self.input.push(fragment, MAX_MESSAGE_BYTES)?;
+                        if fragment.last() == Some(&b'\n') {
+                            messages.push(
+                                self.input
+                                    .decode_next()?
+                                    .expect("fragment completes a message"),
+                            );
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(messages)
+    }
+}
 
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+enum ClientConnection {
+    Disconnected {
+        retry_at: Instant,
+        attempts: u8,
+    },
+    Attaching {
+        connection: Connection,
+        deadline: Instant,
+        attempts: u8,
+    },
+    Attached(Connection),
+}
+
+impl ClientConnection {
+    fn active_mut(&mut self) -> Option<&mut Connection> {
+        match self {
+            Self::Attaching { connection, .. } | Self::Attached(connection) => Some(connection),
+            Self::Disconnected { .. } => None,
         }
     }
-}
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.close();
+    fn attached(&self) -> bool {
+        matches!(self, Self::Attached(_))
+    }
+
+    fn disconnect(&mut self) {
+        let attempts = match self {
+            Self::Disconnected { attempts, .. } | Self::Attaching { attempts, .. } => *attempts,
+            Self::Attached(_) => 0,
+        };
+        *self = Self::Disconnected {
+            retry_at: Instant::now() + RECONNECT_INTERVAL,
+            attempts,
+        };
+    }
+
+    fn finish_attach(&mut self) {
+        let old = std::mem::replace(
+            self,
+            Self::Disconnected {
+                retry_at: Instant::now(),
+                attempts: 0,
+            },
+        );
+        *self = match old {
+            Self::Attaching { connection, .. } | Self::Attached(connection) => {
+                Self::Attached(connection)
+            }
+            disconnected => disconnected,
+        };
     }
 }
 
-enum Recovery {
+#[derive(Clone, Copy)]
+pub enum InputRecovery {
+    Ready,
     ConfirmReplay { epoch: u64 },
     AwaitSkip { epoch: u64, through: u64 },
 }
 
 enum PendingInput {
     Key(String),
+    TrackedKey { key: String, request_id: RequestId },
     Mouse,
 }
 
-fn run_with_id(socket: &SocketPath, client_id: String, files: Vec<String>) -> Result<()> {
-    let mut terminal = TerminalGuard::enter()?;
-    let (mut width, mut height) = terminal::size().unwrap_or((80, 24));
+struct PendingOperation {
+    server_instance: ServerInstanceId,
+    exits_client: bool,
+    action_id: Option<u64>,
+    workspace_change: Option<zess_protocol::ClientActionKind>,
+}
 
-    let mut connection = None;
+struct InputLedger {
+    server_instance: Option<ServerInstanceId>,
+    pending: VecDeque<(u64, PendingInput)>,
+    next_sequence: u64,
+    next_request_id: u64,
+    acknowledged: u64,
+    operations: HashMap<RequestId, PendingOperation>,
+}
+
+impl InputLedger {
+    fn new() -> Self {
+        Self {
+            server_instance: None,
+            pending: VecDeque::new(),
+            next_sequence: 1,
+            next_request_id: 1,
+            acknowledged: 0,
+            operations: HashMap::new(),
+        }
+    }
+
+    fn request_id(&mut self, client_id: &str) -> Result<RequestId> {
+        let sequence = self.next_request_id;
+        self.next_request_id = sequence
+            .checked_add(1)
+            .context("client request ID sequence exhausted")?;
+        Ok(RequestId(format!("{client_id}-{sequence}")))
+    }
+
+    fn attach(&mut self, server_instance: ServerInstanceId, acknowledged: u64) -> bool {
+        let replaced = self
+            .server_instance
+            .as_ref()
+            .is_some_and(|previous| previous != &server_instance);
+        if replaced {
+            // A new server has a new deduplication ledger. Only unresolved input
+            // crosses this boundary; already acknowledged input must stay consumed.
+            self.acknowledged = 0;
+            self.next_sequence = 1;
+            for (sequence, _) in &mut self.pending {
+                *sequence = self.next_sequence;
+                self.next_sequence += 1;
+            }
+        }
+        self.server_instance = Some(server_instance);
+        self.acknowledge(acknowledged);
+        replaced
+    }
+
+    fn acknowledge(&mut self, acknowledged: u64) {
+        self.acknowledged = self.acknowledged.max(acknowledged);
+        while self
+            .pending
+            .front()
+            .is_some_and(|(sequence, _)| *sequence <= self.acknowledged)
+        {
+            self.pending.pop_front();
+        }
+        self.next_sequence = self.next_sequence.max(self.acknowledged.saturating_add(1));
+    }
+
+    fn push(&mut self, input: PendingInput) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.pending.push_back((sequence, input));
+        sequence
+    }
+}
+
+enum ClipboardRead<J = ClipboardJob> {
+    Idle,
+    Reading {
+        server_instance: ServerInstanceId,
+        id: u64,
+        job: J,
+    },
+    Ready {
+        server_instance: ServerInstanceId,
+        id: u64,
+        response: ClientMessage,
+    },
+}
+
+impl<J: ClipboardReadJob> ClipboardRead<J> {
+    fn attach(&mut self, server_instance: &ServerInstanceId) {
+        match self {
+            Self::Reading {
+                server_instance: previous,
+                ..
+            }
+            | Self::Ready {
+                server_instance: previous,
+                ..
+            } if previous != server_instance => *self = Self::Idle,
+            _ => {}
+        }
+    }
+
+    fn request(
+        &mut self,
+        server_instance: &ServerInstanceId,
+        id: u64,
+        primary: bool,
+        connection: &mut Connection,
+        provider: &mut impl Clipboard<ReadJob = J>,
+    ) -> Result<()> {
+        self.attach(server_instance);
+        match self {
+            Self::Reading { id: current, .. } if *current == id => return Ok(()),
+            Self::Ready {
+                id: current,
+                response,
+                ..
+            } if *current == id => {
+                connection.send(response)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+        *self = match provider.read(primary) {
+            Ok(job) => Self::Reading {
+                server_instance: server_instance.clone(),
+                id,
+                job,
+            },
+            Err(error) => Self::Ready {
+                server_instance: server_instance.clone(),
+                id,
+                response: clipboard_response(id, Err(error))?,
+            },
+        };
+        if let Self::Ready { response, .. } = self {
+            connection.send(response)?;
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self, connection: &mut ClientConnection) -> Result<()> {
+        if let Self::Reading {
+            server_instance,
+            id,
+            job,
+        } = self
+            && let Some(result) = job.poll()
+        {
+            let (server_instance, id) = (server_instance.clone(), *id);
+            *self = Self::Ready {
+                server_instance,
+                id,
+                response: clipboard_response(id, result)?,
+            };
+            if connection.attached()
+                && let Some(active) = connection.active_mut()
+                && let Self::Ready { response, .. } = self
+            {
+                active.send(response)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn clipboard_response(id: u64, result: Result<String>) -> Result<ClientMessage> {
+    let (text, error) = match result {
+        Ok(text) => (Some(text), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    let response = ClientMessage::ClipboardResponse { id, text, error };
+    if framing::encode(&response)?.len() > MAX_INPUT_BYTES {
+        return Ok(ClientMessage::ClipboardResponse {
+            id,
+            text: None,
+            error: Some("clipboard contents exceed the input limit".into()),
+        });
+    }
+    Ok(response)
+}
+
+struct QueuedCommand {
+    server_instance: ServerInstanceId,
+    action: zess_protocol::CommandAction,
+}
+
+struct ClientUiState {
+    notice: Option<String>,
+    dirty: bool,
+    clicks: ClickTracker,
+    commands: VecDeque<QueuedCommand>,
+}
+
+fn run_client<C: Clipboard>(
+    factory: &mut impl ConnectionFactory,
+    client_id: String,
+    files: Vec<String>,
+    terminal: &mut impl TerminalIo,
+    provider: &mut C,
+) -> Result<()> {
+    let (mut width, mut height) = terminal.size().unwrap_or((80, 24));
+    let mut connection = ClientConnection::Disconnected {
+        retry_at: Instant::now(),
+        attempts: 0,
+    };
     let mut frame = Frame {
         width,
         height,
         ..Frame::default()
     };
-    let mut pending = VecDeque::<(u64, PendingInput)>::new();
-    let mut next_sequence = 1_u64;
-    let mut acknowledged = 0_u64;
+    let mut ledger = InputLedger::new();
+    let mut submitted_actions = HashSet::new();
+    let mut client_workspace = zess_protocol::ClientWorkspace::default();
     let mut context_epoch = None;
-    let mut recovery = None;
-    let mut disconnected_since = Instant::now() - RECONNECT_INTERVAL;
-    let mut connect_attempts = 0;
-    let mut connected_since = Instant::now();
-    let mut display_notice = Some("Connecting to zess server...".to_owned());
-    let mut dirty = true;
-    let mut clicks = ClickTracker::default();
+    let mut remote_state: Option<RemoteStateCache> = None;
+    let mut attach_metadata = None;
+    let mut resync_deadline = None;
+    let mut recovery = InputRecovery::Ready;
+    let mut clipboard = ClipboardActions::new();
+    let mut ui = ClientUiState {
+        notice: Some("Connecting to zess server...".to_owned()),
+        dirty: true,
+        clicks: ClickTracker::default(),
+        commands: VecDeque::new(),
+    };
 
     loop {
-        if connection.is_none() && connect_attempts >= MAX_CONNECT_ATTEMPTS {
-            anyhow::bail!(
-                "could not attach to zess after {MAX_CONNECT_ATTEMPTS} attempts: {}",
-                display_notice.as_deref().unwrap_or("connection lost")
-            );
-        }
-
-        if connection.is_none() && disconnected_since.elapsed() >= RECONNECT_INTERVAL {
-            connect_attempts += 1;
-            match Connection::connect(socket, &client_id, &files, context_epoch, width, height) {
-                Ok(new_connection) => {
-                    connection = Some(new_connection);
-                    connected_since = Instant::now();
-                    display_notice = Some("Connected; attaching...".to_owned());
-                    dirty = true;
-                }
-                Err(error) => {
-                    disconnected_since = Instant::now();
-                    let notice = format!("Connection failed: {error:#}");
-                    if display_notice.as_deref() != Some(&notice) {
-                        display_notice = Some(notice);
-                        dirty = true;
+        if let ClientConnection::Disconnected { retry_at, attempts } = &connection {
+            if *attempts >= MAX_CONNECT_ATTEMPTS {
+                anyhow::bail!(
+                    "could not attach to zess after {MAX_CONNECT_ATTEMPTS} attempts: {}",
+                    ui.notice.as_deref().unwrap_or("connection lost")
+                );
+            }
+            if Instant::now() >= *retry_at {
+                let attempts = attempts + 1;
+                terminal.suspend()?;
+                let attempt =
+                    Connection::connect(factory, &client_id, &files, context_epoch, width, height);
+                terminal.resume()?;
+                connection = match attempt {
+                    Ok(connection) => {
+                        ui.notice = Some("Connected; attaching...".into());
+                        ClientConnection::Attaching {
+                            connection,
+                            deadline: Instant::now() + ATTACH_TIMEOUT,
+                            attempts,
+                        }
                     }
-                }
+                    Err(error) => {
+                        ui.notice = Some(format!("Connection failed: {error:#}"));
+                        ClientConnection::Disconnected {
+                            retry_at: Instant::now() + RECONNECT_INTERVAL,
+                            attempts,
+                        }
+                    }
+                };
+                ui.dirty = true;
             }
         }
-
-        if connection.is_some() {
-            let mut disconnect = false;
-
-            {
-                let active = connection.as_mut().expect("connection checked above");
-
-                loop {
-                    match active.messages.try_recv() {
-                        Ok(Ok(ServerMessage::Attached {
-                            acknowledged: server_ack,
-                            context_epoch: server_epoch,
-                            replay_allowed,
-                            frame: new_frame,
-                        })) => {
-                            acknowledged = acknowledged.max(server_ack);
-                            discard_acknowledged(&mut pending, acknowledged);
-                            next_sequence = next_sequence.max(acknowledged.saturating_add(1));
-                            context_epoch = Some(server_epoch);
-                            frame = new_frame;
-                            active.attached = true;
-                            connect_attempts = 0;
-                            dirty = true;
-
-                            match recovery {
-                                Some(Recovery::AwaitSkip { through, .. })
-                                    if acknowledged < through =>
-                                {
-                                    recovery = Some(Recovery::AwaitSkip {
-                                        epoch: server_epoch,
-                                        through,
-                                    });
-                                    display_notice = Some(
-                                        "Discarding queued input; waiting for server confirmation"
-                                            .to_owned(),
-                                    );
-                                    if let Err(error) = active.send(&ClientMessage::Skip {
-                                        through,
-                                        context_epoch: server_epoch,
-                                    }) {
-                                        display_notice = Some(format!(
-                                            "Disconnected; retaining queued input: {error}"
-                                        ));
-                                        disconnect = true;
-                                    }
-                                }
-                                Some(Recovery::AwaitSkip { .. }) => {
-                                    recovery = None;
-                                    display_notice = None;
-                                }
-                                Some(Recovery::ConfirmReplay { .. }) if !pending.is_empty() => {
-                                    recovery = Some(Recovery::ConfirmReplay {
-                                        epoch: server_epoch,
-                                    });
-                                    display_notice = Some(recovery_notice());
-                                }
-                                _ if pending.is_empty() => {
-                                    recovery = None;
-                                    display_notice = None;
-                                }
-                                _ if replay_allowed => {
-                                    recovery = None;
-                                    display_notice = None;
-                                    if let Err(error) = send_pending(active, &pending, server_epoch)
-                                    {
-                                        display_notice = Some(format!(
-                                            "Disconnected; retaining queued input: {error}"
-                                        ));
-                                        disconnect = true;
-                                    }
-                                }
-                                _ => {
-                                    recovery = Some(Recovery::ConfirmReplay {
-                                        epoch: server_epoch,
-                                    });
-                                    display_notice = Some(recovery_notice());
-                                }
-                            }
-                        }
-                        Ok(Ok(ServerMessage::Update {
-                            acknowledged: server_ack,
-                            frame: new_frame,
-                        })) => {
-                            acknowledged = acknowledged.max(server_ack);
-                            discard_acknowledged(&mut pending, acknowledged);
-                            next_sequence = next_sequence.max(acknowledged.saturating_add(1));
-                            frame = new_frame;
-                            match recovery {
-                                Some(Recovery::AwaitSkip { through, .. })
-                                    if acknowledged >= through =>
-                                {
-                                    recovery = None;
-                                    display_notice = None;
-                                }
-                                Some(Recovery::ConfirmReplay { .. }) if pending.is_empty() => {
-                                    recovery = None;
-                                    display_notice = None;
-                                }
-                                None => display_notice = None,
-                                _ => {}
-                            }
-                            dirty = true;
-                        }
-                        Ok(Ok(ServerMessage::ClipboardWrite { text })) => {
-                            execute!(io::stdout(), CopyToClipboard::to_clipboard_from(&text))
-                                .context("write clipboard to terminal")?;
-                        }
-                        Ok(Ok(ServerMessage::ClipboardWritePrimary { text })) => {
-                            execute!(io::stdout(), CopyToClipboard::to_primary_from(&text))
-                                .context("write primary clipboard to terminal")?;
-                        }
-                        Ok(Ok(ServerMessage::ClipboardRead { id, primary })) => {
-                            let result = read_clipboard(primary);
-                            let (text, error) = match result {
-                                Ok(text) => (Some(text), None),
-                                Err(error) => (None, Some(format!("{error:#}"))),
+        if connection.attached()
+            && remote_state.is_some()
+            && resync_deadline.is_none()
+            && matches!(recovery, InputRecovery::Ready)
+        {
+            let state = &remote_state.as_ref().unwrap().state;
+            for pending in &state.client_actions {
+                if ledger
+                    .operations
+                    .values()
+                    .any(|operation| operation.action_id.is_some())
+                {
+                    break;
+                }
+                if !submitted_actions.contains(&pending.id) {
+                    let action = match &pending.kind {
+                        zess_protocol::ClientActionKind::Close { buffer_id, force } => {
+                            let Some(buffer) =
+                                state.buffers.iter().find(|buffer| buffer.id == *buffer_id)
+                            else {
+                                continue;
                             };
-                            let mut response = ClientMessage::ClipboardResponse { id, text, error };
-                            if framing::encode(&response)?.len() > MAX_INPUT_BYTES {
-                                response = ClientMessage::ClipboardResponse {
-                                    id,
-                                    text: None,
-                                    error: Some("clipboard contents exceed the input limit".into()),
-                                };
+                            if client_workspace.buffers == [*buffer_id]
+                                && matches!(
+                                    &buffer.kind,
+                                    zess_protocol::BufferKind::Text { path: None }
+                                )
+                                && !buffer.modified
+                            {
+                                zess_protocol::CommandAction::ClientExit {
+                                    action_id: pending.id,
+                                    buffer_id: *buffer_id,
+                                }
+                            } else {
+                                zess_protocol::CommandAction::CloseBuffer {
+                                    action_id: pending.id,
+                                    buffer_id: *buffer_id,
+                                    replacement: client_workspace
+                                        .buffers
+                                        .iter()
+                                        .copied()
+                                        .find(|id| *id != *buffer_id),
+                                    force: *force,
+                                }
                             }
-                            active.send(&response)?;
                         }
-                        Ok(Ok(ServerMessage::Rejected { reason })) => {
-                            if pending.is_empty() {
-                                return Err(anyhow::anyhow!(
-                                    "zess server rejected the client: {}",
-                                    sanitize(&reason)
-                                ));
-                            }
-
-                            display_notice = Some(format!(
-                                "Server rejected reconnect; retaining queued input: {}",
-                                sanitize(&reason)
-                            ));
-                            disconnect = true;
-                            dirty = true;
-                            break;
-                        }
-                        Ok(Ok(ServerMessage::Exited)) => return Ok(()),
-                        Ok(Ok(ServerMessage::Status { .. })) => {
-                            return Err(anyhow::anyhow!("unexpected server status response"));
-                        }
-                        Ok(Err(error)) => {
-                            display_notice = Some(format!("Disconnected; reconnecting: {error}"));
-                            disconnect = true;
-                            dirty = true;
-                            break;
-                        }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            display_notice = Some("Disconnected; reconnecting...".to_owned());
-                            disconnect = true;
-                            dirty = true;
-                            break;
-                        }
-                    }
-                }
-
-                if !active.attached && connected_since.elapsed() >= ATTACH_TIMEOUT {
-                    display_notice = Some("Timed out waiting for server attachment".to_owned());
-                    disconnect = true;
+                        _ => zess_protocol::CommandAction::AcknowledgeClientAction {
+                            action_id: pending.id,
+                        },
+                    };
+                    submitted_actions.insert(pending.id);
+                    ui.commands.push_back(QueuedCommand {
+                        server_instance: ledger.server_instance.clone().unwrap(),
+                        action,
+                    });
+                    break;
                 }
             }
-
-            if disconnect {
-                if let Some(mut old) = connection.take() {
-                    old.close();
+            while let Some(command) = ui.commands.pop_front() {
+                if ledger.server_instance.as_ref() != Some(&command.server_instance) {
+                    ui.notice =
+                        Some("Session changed; the queued command was not submitted".into());
+                    ui.dirty = true;
+                    continue;
                 }
-                disconnected_since = Instant::now();
-                dirty = true;
+                let action = command.action;
+                let exits_client =
+                    matches!(&action, zess_protocol::CommandAction::ClientExit { .. });
+                let action_id = match &action {
+                    zess_protocol::CommandAction::AcknowledgeClientAction { action_id }
+                    | zess_protocol::CommandAction::CloseBuffer { action_id, .. }
+                    | zess_protocol::CommandAction::ClientExit { action_id, .. } => {
+                        Some(*action_id)
+                    }
+                    _ => None,
+                };
+                let workspace_change = match &action {
+                    zess_protocol::CommandAction::AcknowledgeClientAction { action_id } => state
+                        .client_actions
+                        .iter()
+                        .find(|pending| pending.id == *action_id)
+                        .map(|pending| pending.kind.clone()),
+                    _ => None,
+                };
+                let request_id = ledger.request_id(&client_id)?;
+                let server_instance = ledger.server_instance.clone().unwrap();
+                let message = ClientMessage::Command {
+                    request_id: request_id.clone(),
+                    server_instance: server_instance.clone(),
+                    action,
+                };
+                if framing::encode(&message)?.len() > MAX_INPUT_BYTES {
+                    ui.notice = Some("Command exceeds the input byte limit".into());
+                    ui.dirty = true;
+                    continue;
+                }
+                ledger.operations.insert(
+                    request_id,
+                    PendingOperation {
+                        server_instance,
+                        exits_client,
+                        action_id,
+                        workspace_change,
+                    },
+                );
+                connection.active_mut().unwrap().send(&message)?;
             }
         }
 
-        if dirty {
+        let messages = match connection.active_mut().map(Connection::poll).transpose() {
+            Ok(messages) => messages.unwrap_or_default(),
+            Err(error) => {
+                ui.notice = Some(format!("Disconnected; reconnecting: {error}"));
+                connection.disconnect();
+                ui.dirty = true;
+                Vec::new()
+            }
+        };
+        for message in messages {
+            let primary_write = matches!(&message, ServerMessage::ClipboardWritePrimary { .. });
+            match message {
+                ServerMessage::Attached {
+                    server_instance,
+                    acknowledged,
+                    context_epoch: epoch,
+                    replay_allowed,
+                    frame: _,
+                } => {
+                    attach_metadata = Some((server_instance, acknowledged, epoch, replay_allowed));
+                    remote_state = None;
+                    ui.dirty = true;
+                }
+                ServerMessage::Snapshot {
+                    session_id,
+                    server_instance,
+                    state_revision,
+                    state,
+                    frame: _,
+                } => {
+                    let expected_server = attach_metadata
+                        .as_ref()
+                        .map(|(instance, _, _, _)| instance)
+                        .or(ledger.server_instance.as_ref());
+                    if expected_server.is_some_and(|expected| expected != &server_instance) {
+                        connection.disconnect();
+                        ui.notice = Some("Server identity changed; reconnecting".into());
+                        ui.dirty = true;
+                        break;
+                    }
+                    let next_state = RemoteStateCache {
+                        session_id,
+                        server_instance: server_instance.clone(),
+                        revision: state_revision,
+                        state,
+                    };
+                    match zess_protocol::render_snapshot(&next_state.state) {
+                        Ok(next_frame) => {
+                            frame = next_frame;
+                            remote_state = Some(next_state);
+                        }
+                        Err(error) => {
+                            if let Some(active) = connection.active_mut() {
+                                active.send(&ClientMessage::Resync {
+                                    session_id: next_state.session_id,
+                                    state_revision: remote_state
+                                        .as_ref()
+                                        .map_or(0, |state| state.revision),
+                                })?;
+                            }
+                            resync_deadline = Some(Instant::now() + ATTACH_TIMEOUT);
+                            ui.notice = Some(format!("Synchronizing session state: {error}"));
+                            ui.dirty = true;
+                            continue;
+                        }
+                    }
+                    resync_deadline = None;
+                    client_workspace = remote_state.as_ref().unwrap().state.workspace.clone();
+                    let Some((attached_instance, acknowledged, epoch, replay_allowed)) =
+                        attach_metadata.take()
+                    else {
+                        if matches!(recovery, InputRecovery::Ready) {
+                            ui.notice = None;
+                        }
+                        ui.dirty = true;
+                        continue;
+                    };
+                    anyhow::ensure!(
+                        attached_instance == server_instance,
+                        "snapshot does not match attachment server"
+                    );
+                    clipboard.attach(&server_instance);
+                    let replaced = ledger.attach(server_instance, acknowledged);
+                    if replaced {
+                        submitted_actions.clear();
+                    }
+                    connection.finish_attach();
+                    context_epoch = Some(epoch);
+                    recovery = match recovery {
+                        InputRecovery::AwaitSkip { through, .. } if !ledger.pending.is_empty() => {
+                            InputRecovery::AwaitSkip {
+                                epoch,
+                                through: if replaced {
+                                    ledger.pending.back().unwrap().0
+                                } else {
+                                    through
+                                },
+                            }
+                        }
+                        _ if ledger.pending.is_empty() => InputRecovery::Ready,
+                        InputRecovery::ConfirmReplay { .. } => {
+                            InputRecovery::ConfirmReplay { epoch }
+                        }
+                        _ if replay_allowed && !replaced => InputRecovery::Ready,
+                        _ => InputRecovery::ConfirmReplay { epoch },
+                    };
+                    let active = connection.active_mut().unwrap();
+                    ui.notice = None;
+                    match recovery {
+                        InputRecovery::Ready => {
+                            send_pending(
+                                active,
+                                &ledger.pending,
+                                epoch,
+                                ledger.server_instance.as_ref().unwrap(),
+                            )?;
+                        }
+                        InputRecovery::ConfirmReplay { .. } => {}
+                        InputRecovery::AwaitSkip { through, .. } => {
+                            active.send(&ClientMessage::Skip {
+                                through,
+                                context_epoch: epoch,
+                            })?;
+                        }
+                    }
+                    for (request_id, operation) in &ledger.operations {
+                        active.send(&ClientMessage::QueryOperation {
+                            request_id: request_id.clone(),
+                            server_instance: operation.server_instance.clone(),
+                        })?;
+                    }
+                    // Resizing while attaching must reach the final attached View.
+                    if frame.width != width || frame.height != height {
+                        active.send(&ClientMessage::Resize { width, height })?;
+                    }
+                    ui.dirty = true;
+                }
+                ServerMessage::Delta {
+                    session_id,
+                    server_instance,
+                    base_revision,
+                    state_revision,
+                    delta,
+                    frame: _,
+                } => {
+                    let mut next_state = remote_state.clone();
+                    let rendered = if resync_deadline.is_none()
+                        && next_state.as_mut().is_some_and(|state| {
+                            state.apply_delta(
+                                &session_id,
+                                &server_instance,
+                                base_revision,
+                                state_revision,
+                                delta,
+                            )
+                        }) {
+                        zess_protocol::render_snapshot(&next_state.as_ref().unwrap().state).ok()
+                    } else {
+                        None
+                    };
+                    if let Some(next_frame) = rendered {
+                        frame = next_frame;
+                        remote_state = next_state;
+                        ui.dirty = true;
+                    } else if resync_deadline.is_none() {
+                        if let Some(active) = connection.active_mut() {
+                            active.send(&ClientMessage::Resync {
+                                session_id,
+                                state_revision: remote_state
+                                    .as_ref()
+                                    .map_or(0, |state| state.revision),
+                            })?;
+                        }
+                        resync_deadline = Some(Instant::now() + ATTACH_TIMEOUT);
+                        ui.notice = Some("Synchronizing session state...".into());
+                        ui.dirty = true;
+                    }
+                }
+                ServerMessage::Ack {
+                    acknowledged,
+                    context_epoch: epoch,
+                } => {
+                    if context_epoch == Some(epoch) {
+                        ledger.acknowledge(acknowledged);
+                        if matches!(recovery, InputRecovery::AwaitSkip { through, .. } if ledger.acknowledged >= through)
+                            || matches!(recovery, InputRecovery::ConfirmReplay { .. } if ledger.pending.is_empty())
+                        {
+                            recovery = InputRecovery::Ready;
+                            ui.dirty = true;
+                        }
+                    }
+                }
+                ServerMessage::CommandResult {
+                    request_id,
+                    server_instance,
+                    result,
+                } => {
+                    if ledger.operations.contains_key(&request_id)
+                        && ledger.server_instance.as_ref() == Some(&server_instance)
+                    {
+                        match result {
+                            zess_protocol::OperationResult::Completed { outcome, .. } => {
+                                let operation = ledger.operations.remove(&request_id).unwrap();
+                                let exited = operation.exits_client
+                                    && matches!(&outcome, zess_protocol::CommandOutcome::Applied);
+                                match (&outcome, operation.workspace_change) {
+                                    (zess_protocol::CommandOutcome::Applied, Some(change)) => {
+                                        client_workspace.apply(&change)
+                                    }
+                                    (
+                                        zess_protocol::CommandOutcome::BufferClosed {
+                                            buffer_id,
+                                            replacement,
+                                        },
+                                        _,
+                                    ) => {
+                                        client_workspace.buffers.retain(|id| id != buffer_id);
+                                        if !client_workspace.buffers.contains(replacement) {
+                                            client_workspace.buffers.push(*replacement);
+                                        }
+                                        client_workspace.current = Some(*replacement);
+                                    }
+                                    _ => {}
+                                }
+                                match outcome {
+                                    zess_protocol::CommandOutcome::Failed { message } => {
+                                        ui.notice = Some(message);
+                                        ui.dirty = true;
+                                    }
+                                    _ => {}
+                                }
+                                if let Some(active) = connection.active_mut() {
+                                    active.send(&ClientMessage::ResultAck {
+                                        request_id,
+                                        server_instance,
+                                    })?;
+                                }
+                                if exited {
+                                    return Ok(());
+                                }
+                            }
+                            zess_protocol::OperationResult::Unknown => {
+                                if let Some(operation) = ledger.operations.remove(&request_id) {
+                                    if let Some(action_id) = operation.action_id {
+                                        submitted_actions.remove(&action_id);
+                                    }
+                                }
+                                ui.notice = Some("The previous operation's outcome is unknown; check the remote state before retrying".into());
+                                ui.dirty = true;
+                            }
+                            zess_protocol::OperationResult::Pending => {}
+                        }
+                    }
+                }
+                ServerMessage::Detached => return Ok(()),
+                ServerMessage::Update { .. } => {}
+                ServerMessage::ClipboardWrite { text }
+                | ServerMessage::ClipboardWritePrimary { text } => {
+                    clipboard.copy(primary_write, text);
+                }
+                ServerMessage::ClipboardRead { id, primary } => {
+                    if connection.attached()
+                        && let Some(instance) = &ledger.server_instance
+                    {
+                        clipboard.read(instance.clone(), id, primary);
+                    }
+                }
+                ServerMessage::Rejected { reason } => {
+                    if ledger.pending.is_empty() {
+                        anyhow::bail!("zess server rejected the client: {}", sanitize(&reason));
+                    }
+                    ui.notice = Some(format!(
+                        "Server rejected reconnect; retaining queued input: {}",
+                        sanitize(&reason)
+                    ));
+                    connection.disconnect();
+                    ui.dirty = true;
+                    break;
+                }
+                ServerMessage::Exited => return Ok(()),
+                ServerMessage::Status { .. } => anyhow::bail!("unexpected server status response"),
+            }
+        }
+        if let ClientConnection::Attaching { deadline, .. } = connection
+            && Instant::now() >= deadline
+        {
+            ui.notice = Some("Timed out waiting for server attachment".into());
+            connection.disconnect();
+            ui.dirty = true;
+        }
+        if resync_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            ui.notice = Some("Timed out synchronizing session state; reconnecting".into());
+            connection.disconnect();
+            resync_deadline = None;
+            ui.dirty = true;
+        }
+        if let Some(notice) = clipboard.poll(provider, terminal.writer(), &mut connection)? {
+            ui.notice = Some(notice);
+            ui.dirty = true;
+        }
+
+        let synchronized =
+            connection.attached() && remote_state.is_some() && resync_deadline.is_none();
+        let ready = synchronized && matches!(recovery, InputRecovery::Ready);
+        if ui.dirty {
             terminal.set_mouse_capture(
                 frame.mouse_enabled
-                    && connection.as_ref().is_some_and(|active| active.attached)
-                    && recovery.is_none(),
+                    && connection.attached()
+                    && remote_state.is_some()
+                    && resync_deadline.is_none()
+                    && matches!(recovery, InputRecovery::Ready),
             )?;
-            if !terminal.mouse_capture {
-                clicks = ClickTracker::default();
+            if !terminal.mouse_capture() {
+                ui.clicks = ClickTracker::default();
             }
-            let notice = display_notice.as_ref().map(|notice| {
-                if connection.as_ref().is_none_or(|active| !active.attached) {
+            let control_notice = match recovery {
+                InputRecovery::ConfirmReplay { .. } => Some(recovery_notice()),
+                InputRecovery::AwaitSkip { .. } => {
+                    Some("Discarding queued input; waiting for server confirmation".into())
+                }
+                InputRecovery::Ready => None,
+            };
+            let notice = match (control_notice, ui.notice.as_deref()) {
+                (Some(control), Some(message)) => Some(format!("{control} | {message}")),
+                (Some(control), None) => Some(control),
+                (None, _) => ui.notice.clone(),
+            };
+            let notice = notice.map(|notice| {
+                if !connection.attached() {
                     format!("Esc/Ctrl-c exit | {notice}")
-                } else if recovery.is_some() {
+                } else if !matches!(recovery, InputRecovery::Ready) {
                     format!("Ctrl-c exit | {notice}")
                 } else {
-                    notice.clone()
+                    notice
                 }
             });
-            render(&mut io::stdout(), &frame, width, height, notice.as_deref())?;
-            dirty = false;
+            let (width, height) = terminal.size().unwrap_or((frame.width, frame.height));
+            render(terminal.writer(), &frame, width, height, notice.as_deref())?;
+            ui.dirty = false;
         }
-
-        if !event::poll(EVENT_POLL_INTERVAL).context("poll terminal input")? {
+        let Some(event) = terminal.poll_event(EVENT_POLL_INTERVAL)? else {
             continue;
+        };
+        let new_input = match &event {
+            Event::Paste(_) => true,
+            Event::Key(key) => key.kind != KeyEventKind::Release,
+            _ => false,
+        };
+        if ready && new_input && ui.notice.take().is_some() {
+            ui.dirty = true;
         }
-
-        let event = event::read().context("read terminal input")?;
         if !matches!(event, Event::Mouse(_)) {
-            clicks = ClickTracker::default();
+            ui.clicks = ClickTracker::default();
         }
         match event {
+            Event::Paste(text) => {
+                if !ready {
+                    ui.notice = Some("Session is not ready; paste was not submitted".into());
+                    ui.dirty = true;
+                    continue;
+                }
+                ui.commands.push_back(QueuedCommand {
+                    server_instance: ledger.server_instance.clone().unwrap(),
+                    action: zess_protocol::CommandAction::Paste { text },
+                });
+            }
             Event::Resize(new_width, new_height) => {
                 width = new_width;
                 height = new_height;
-                dirty = true;
-
-                let mut disconnect = false;
-                if let Some(active) = connection.as_mut()
-                    && active.attached
-                    && let Err(error) = active.send(&ClientMessage::Resize { width, height })
+                ui.dirty = true;
+                if connection.attached()
+                    && let Some(active) = connection.active_mut()
                 {
-                    display_notice = Some(format!("Disconnected; reconnecting: {error}"));
-                    disconnect = true;
-                }
-
-                if disconnect {
-                    if let Some(mut old) = connection.take() {
-                        old.close();
-                    }
-                    disconnected_since = Instant::now();
+                    active.send(&ClientMessage::Resize { width, height })?;
                 }
             }
             Event::Mouse(mouse)
-                if terminal.mouse_capture && frame.width == width && frame.height == height =>
+                if terminal.mouse_capture() && frame.width == width && frame.height == height =>
             {
-                let Some(kind) = clicks.at(mouse.kind, mouse.column, mouse.row, Instant::now())
+                let Some(kind) = ui
+                    .clicks
+                    .at(mouse.kind, mouse.column, mouse.row, Instant::now())
                 else {
                     continue;
                 };
-                let sequence = next_sequence;
-                next_sequence = next_sequence.saturating_add(1);
-                // Coordinates are valid only in this connection's displayed layout.
-                // A reconnect resolves the sequence with Skip, never replays a gesture.
-                pending.push_back((sequence, PendingInput::Mouse));
-                if let Some(active) = connection.as_mut()
-                    && let Err(error) = active.send(&ClientMessage::Mouse {
+                let sequence = ledger.push(PendingInput::Mouse);
+                if let Some(active) = connection.active_mut() {
+                    active.send(&ClientMessage::Mouse {
                         sequence,
                         context_epoch: context_epoch
                             .expect("attached clients have a context epoch"),
@@ -587,146 +1086,116 @@ fn run_with_id(socket: &SocketPath, client_id: String, files: Vec<String>) -> Re
                             column: mouse.column,
                             row: mouse.row,
                         },
-                    })
-                {
-                    display_notice = Some(format!("Disconnected; reconnecting: {error}"));
-                    if let Some(mut old) = connection.take() {
-                        old.close();
-                    }
-                    disconnected_since = Instant::now();
-                    dirty = true;
+                    })?;
                 }
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    if let Some(active) = connection.as_mut() {
-                        let _ = active.send(&ClientMessage::Detach);
+                    if let Some(active) = connection.active_mut() {
+                        active.send(&ClientMessage::Detach)?;
+                        let _ = active.poll();
                     }
                     return Ok(());
                 }
-
-                let is_disconnected = connection.as_ref().is_none_or(|active| !active.attached);
                 let cancel =
                     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-                if (is_disconnected && key.code == KeyCode::Esc)
-                    || ((is_disconnected || recovery.is_some()) && cancel)
+                if (!connection.attached() && key.code == KeyCode::Esc)
+                    || ((!connection.attached() || !matches!(recovery, InputRecovery::Ready))
+                        && cancel)
                 {
                     return Ok(());
                 }
-                if is_disconnected {
+                if !synchronized {
                     continue;
                 }
-
+                let active = connection.active_mut().unwrap();
                 match recovery {
-                    Some(Recovery::ConfirmReplay { epoch }) => {
+                    InputRecovery::ConfirmReplay { epoch } => {
                         if key.code == KeyCode::Char('r')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
-                            recovery = None;
-                            context_epoch = Some(epoch);
-                            display_notice = None;
-
-                            let mut disconnect = false;
-                            if let Some(active) = connection.as_mut()
-                                && let Err(error) = send_pending(active, &pending, epoch)
-                            {
-                                display_notice =
-                                    Some(format!("Disconnected; retaining queued input: {error}"));
-                                disconnect = true;
-                            }
-                            if disconnect {
-                                if let Some(mut old) = connection.take() {
-                                    old.close();
+                            recovery = InputRecovery::Ready;
+                            for (_, input) in &ledger.pending {
+                                if let PendingInput::TrackedKey { request_id, .. } = input {
+                                    ledger.operations.insert(
+                                        request_id.clone(),
+                                        PendingOperation {
+                                            server_instance: ledger
+                                                .server_instance
+                                                .clone()
+                                                .unwrap(),
+                                            exits_client: false,
+                                            action_id: None,
+                                            workspace_change: None,
+                                        },
+                                    );
                                 }
-                                disconnected_since = Instant::now();
                             }
+                            send_pending(
+                                active,
+                                &ledger.pending,
+                                epoch,
+                                ledger.server_instance.as_ref().unwrap(),
+                            )?;
                         } else if key.code == KeyCode::Esc {
-                            let through = pending.back().map(|(sequence, _)| *sequence);
-                            if let Some(through) = through {
-                                recovery = Some(Recovery::AwaitSkip { epoch, through });
-                                display_notice = Some(
-                                    "Discarding queued input; waiting for server confirmation"
-                                        .to_owned(),
-                                );
-
-                                let mut disconnect = false;
-                                if let Some(active) = connection.as_mut()
-                                    && let Err(error) = active.send(&ClientMessage::Skip {
-                                        through,
-                                        context_epoch: epoch,
-                                    })
-                                {
-                                    display_notice = Some(format!(
-                                        "Disconnected; retaining queued input: {error}"
-                                    ));
-                                    disconnect = true;
-                                }
-                                if disconnect {
-                                    if let Some(mut old) = connection.take() {
-                                        old.close();
-                                    }
-                                    disconnected_since = Instant::now();
-                                }
-                            }
-                        }
-                        dirty = true;
-                        continue;
-                    }
-                    Some(Recovery::AwaitSkip { epoch, through }) => {
-                        if key.code == KeyCode::Esc {
-                            let mut disconnect = false;
-                            if let Some(active) = connection.as_mut()
-                                && let Err(error) = active.send(&ClientMessage::Skip {
+                            if let Some((through, _)) = ledger.pending.back() {
+                                let through = *through;
+                                recovery = InputRecovery::AwaitSkip { epoch, through };
+                                active.send(&ClientMessage::Skip {
                                     through,
                                     context_epoch: epoch,
-                                })
-                            {
-                                display_notice =
-                                    Some(format!("Disconnected; retaining queued input: {error}"));
-                                disconnect = true;
+                                })?;
+                            } else {
+                                recovery = InputRecovery::Ready;
                             }
-                            if disconnect {
-                                if let Some(mut old) = connection.take() {
-                                    old.close();
-                                }
-                                disconnected_since = Instant::now();
-                            }
-                            dirty = true;
+                        }
+                        ui.dirty = true;
+                        continue;
+                    }
+                    InputRecovery::AwaitSkip { epoch, through } => {
+                        if key.code == KeyCode::Esc {
+                            active.send(&ClientMessage::Skip {
+                                through,
+                                context_epoch: epoch,
+                            })?;
                         }
                         continue;
                     }
-                    None => {}
+                    InputRecovery::Ready => {}
                 }
-
-                let Some(encoded) = encode_key(key) else {
-                    continue;
-                };
-
-                let sequence = next_sequence;
-                next_sequence = next_sequence.saturating_add(1);
-                pending.push_back((sequence, PendingInput::Key(encoded.clone())));
-                let input_epoch = context_epoch.expect("attached clients have a context epoch");
-
-                let mut disconnect = false;
-                if let Some(active) = connection.as_mut()
-                    && let Err(error) = active.send(&ClientMessage::Input {
+                let Some(key) = encode_key(key) else { continue };
+                let epoch = context_epoch.expect("attached clients have a context epoch");
+                let tracked = key == "Enter";
+                if tracked {
+                    let request_id = ledger.request_id(&client_id)?;
+                    let server_instance = ledger.server_instance.clone().unwrap();
+                    let sequence = ledger.push(PendingInput::TrackedKey {
+                        key: key.clone(),
+                        request_id: request_id.clone(),
+                    });
+                    ledger.operations.insert(
+                        request_id.clone(),
+                        PendingOperation {
+                            server_instance: server_instance.clone(),
+                            exits_client: false,
+                            action_id: None,
+                            workspace_change: None,
+                        },
+                    );
+                    active.send(&ClientMessage::TrackedInput {
                         sequence,
-                        key: encoded,
-                        context_epoch: input_epoch,
-                    })
-                {
-                    display_notice = Some(format!("Disconnected; reconnecting: {error}"));
-                    disconnect = true;
-                    // Preserve this sequence; the server may have processed it before
-                    // the write failed, and its acknowledgement resolves the ambiguity.
-                }
-
-                if disconnect {
-                    if let Some(mut old) = connection.take() {
-                        old.close();
-                    }
-                    disconnected_since = Instant::now();
-                    dirty = true;
+                        key,
+                        context_epoch: epoch,
+                        request_id,
+                        server_instance,
+                    })?;
+                } else {
+                    let sequence = ledger.push(PendingInput::Key(key.clone()));
+                    active.send(&ClientMessage::Input {
+                        sequence,
+                        key,
+                        context_epoch: epoch,
+                    })?;
                 }
             }
             _ => {}
@@ -734,25 +1203,24 @@ fn run_with_id(socket: &SocketPath, client_id: String, files: Vec<String>) -> Re
     }
 }
 
-fn discard_acknowledged(pending: &mut VecDeque<(u64, PendingInput)>, acknowledged: u64) {
-    while pending
-        .front()
-        .is_some_and(|(sequence, _)| *sequence <= acknowledged)
-    {
-        pending.pop_front();
-    }
-}
-
 fn send_pending(
     connection: &mut Connection,
     pending: &VecDeque<(u64, PendingInput)>,
     context_epoch: u64,
+    server_instance: &ServerInstanceId,
 ) -> Result<()> {
     for (sequence, input) in pending {
         let message = match input {
             PendingInput::Key(key) => ClientMessage::Input {
                 sequence: *sequence,
                 key: key.clone(),
+                context_epoch,
+            },
+            PendingInput::TrackedKey { key, request_id } => ClientMessage::TrackedInput {
+                sequence: *sequence,
+                key: key.clone(),
+                request_id: request_id.clone(),
+                server_instance: server_instance.clone(),
                 context_epoch,
             },
             PendingInput::Mouse => ClientMessage::Skip {
@@ -762,7 +1230,6 @@ fn send_pending(
         };
         connection.send(&message)?;
     }
-
     Ok(())
 }
 

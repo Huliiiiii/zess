@@ -27,6 +27,8 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
         ("%register-api", "api"),
         ("%register-event", "event"),
         ("register-statusline", "statusline"),
+        ("%register-builtin-statusline", "builtin-statusline"),
+        ("%register-statusline-component", "statusline-component"),
     ] {
         engine.register_fn(
             function,
@@ -49,10 +51,25 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
                         .register_buffer(&name, BufferBackend::External(handler));
                     return Ok(());
                 }
+                if category == "statusline-component" {
+                    if registry.statusline_components.contains_key(&name) {
+                        return Err(SteelErr::new(
+                            ErrorKind::Generic,
+                            format!("statusline component already registered: {name}"),
+                        ));
+                    }
+                    registry.statusline_components.insert(name, handler);
+                    return Ok(());
+                }
+                if category == "builtin-statusline" {
+                    registry.builtin_statuslines.insert(name.clone());
+                } else if category == "statusline" {
+                    registry.builtin_statuslines.remove(&name);
+                }
                 let entries = match category {
                     "api" => &mut registry.plugins.apis,
                     "event" => &mut registry.plugins.events,
-                    "statusline" => &mut registry.plugins.statuslines,
+                    "statusline" | "builtin-statusline" => &mut registry.plugins.statuslines,
                     _ => unreachable!(),
                 };
 
@@ -64,19 +81,76 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
     }
 
     engine.register_fn(
+        "%make-statusline-region",
+        |function: SteelVal, components: Vec<String>| -> steel::rvals::Result<StatuslineRegion> {
+            if !function.is_function() {
+                return Err(SteelErr::new(
+                    ErrorKind::TypeMismatch,
+                    "statusline region requires a function".into(),
+                ));
+            }
+            Ok(StatuslineRegion {
+                handler: Handler { function },
+                components,
+            })
+        },
+    );
+    engine.register_fn(
+        "%register-statusline-layout",
+        move |kind: SteelVal,
+              left: Option<StatuslineRegion>,
+              center: Option<StatuslineRegion>,
+              right: Option<StatuslineRegion>|
+              -> steel::rvals::Result<()> {
+            let kind = name_string(kind)?;
+            let registry = registry_for(id)?;
+            let mut registry = registry.borrow_mut();
+            let layout = registry.statusline_layouts.entry(kind).or_default();
+            if let Some(left) = left {
+                layout.left = Some(left);
+            }
+            if let Some(center) = center {
+                layout.center = Some(center);
+            }
+            if let Some(right) = right {
+                layout.right = Some(right);
+            }
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "%statusline-component",
+        move |name: String| -> steel::rvals::Result<SteelVal> {
+            registry_for(id)?
+                .borrow()
+                .statusline_components
+                .get(&name)
+                .map(|handler| handler.function.clone())
+                .ok_or_else(|| {
+                    SteelErr::new(
+                        ErrorKind::Generic,
+                        format!("unknown statusline component: {name}"),
+                    )
+                })
+        },
+    );
+
+    engine.register_fn(
             "set-editor-options!",
             move |options: SteelVal| -> steel::rvals::Result<()> {
-                let options = Value::from_steelval(&options)?;
-                let options = options.as_object().ok_or_else(|| SteelErr::new(ErrorKind::TypeMismatch, "editor options must be an object".into()))?;
+                let SteelVal::HashMapV(options) = options else {
+                    return Err(SteelErr::new(ErrorKind::TypeMismatch, "editor options must be an object".into()));
+                };
                 let registry = registry_for(id)?;
                 let mut registry = registry.borrow_mut();
                 let mut configured = registry.plugins.editor_options;
-                for (name, value) in options {
+                for (name, value) in options.iter() {
+                    let name = name_string(name.clone())?;
                     match name.as_str() {
-                        "mouse" => configured.mouse = value.as_bool().ok_or_else(|| SteelErr::new(ErrorKind::TypeMismatch, "mouse must be a boolean".into()))?,
-                        "scroll-lines" => configured.scroll_lines = value.as_u64().and_then(|value| usize::try_from(value).ok()).filter(|value| *value > 0 && *value <= isize::MAX as usize).ok_or_else(|| SteelErr::new(ErrorKind::TypeMismatch, "scroll-lines must be a positive integer no greater than isize::MAX".into()))?,
+                        "mouse" => configured.mouse = bool::from_steelval(value).map_err(|_| SteelErr::new(ErrorKind::TypeMismatch, "mouse must be a boolean".into()))?,
+                        "scroll-lines" => configured.scroll_lines = unsigned_integer(value).and_then(|value| usize::try_from(value).ok()).filter(|value| *value > 0 && *value <= isize::MAX as usize).ok_or_else(|| SteelErr::new(ErrorKind::TypeMismatch, "scroll-lines must be a positive integer no greater than isize::MAX".into()))?,
                         "preview-debounce-ms" => {
-                            let milliseconds = value.as_u64().ok_or_else(|| {
+                            let milliseconds = unsigned_integer(value).ok_or_else(|| {
                                 SteelErr::new(
                                     ErrorKind::TypeMismatch,
                                     "preview-debounce-ms must be a non-negative integer".into(),
@@ -100,6 +174,46 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
         );
 
     engine.register_fn(
+        "set-session-options!",
+        move |options: SteelVal| -> steel::rvals::Result<()> {
+            let SteelVal::HashMapV(options) = options else {
+                return Err(SteelErr::new(
+                    ErrorKind::TypeMismatch,
+                    "session options must be an object".into(),
+                ));
+            };
+            let registry = registry_for(id)?;
+            let mut registry = registry.borrow_mut();
+            let mut on_client_exit = registry.plugins.on_client_exit;
+            for (name, value) in options.iter() {
+                let name = name_string(name.clone())?;
+                match name.as_str() {
+                    "on-client-exit" => {
+                        on_client_exit = match name_string(value.clone())?.as_str() {
+                            "keep" => zess_plugin::OnClientExit::Keep,
+                            "stop-if-unused" => zess_plugin::OnClientExit::StopIfUnused,
+                            _ => {
+                                return Err(SteelErr::new(
+                                    ErrorKind::TypeMismatch,
+                                    "on-client-exit must be keep or stop-if-unused".into(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(SteelErr::new(
+                            ErrorKind::TypeMismatch,
+                            format!("unknown session option {name}"),
+                        ));
+                    }
+                }
+            }
+            registry.plugins.on_client_exit = on_client_exit;
+            Ok(())
+        },
+    );
+
+    engine.register_fn(
         "set-view-options!",
         move |kind: SteelVal, options: SteelVal| -> steel::rvals::Result<()> {
             let kinds = match kind {
@@ -111,7 +225,7 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
                 }
                 kind => vec![name_string(kind)?],
             };
-            let options = Value::from_steelval(&options)?;
+            let options = Json::from_steelval(&options)?.0;
 
             if !options.is_object() {
                 return Err(SteelErr::new(
@@ -280,11 +394,11 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
         "host-call",
         move |operation: SteelVal, argument: SteelVal| -> steel::rvals::Result<SteelVal> {
             let operation = name_string(operation)?;
-            let argument = Value::from_steelval(&argument)?;
+            let argument = Json::from_steelval(&argument)?.0;
             let registry = registry_for(id)?;
             let registry = registry.borrow();
 
-            (registry.host)(operation, argument).into_steelval()
+            Json((registry.host)(operation, argument)).into_steelval()
         },
     );
 
@@ -341,4 +455,12 @@ fn key_sequence(value: SteelVal) -> steel::rvals::Result<Vec<String>> {
     }
 
     Ok(keys)
+}
+
+fn unsigned_integer(value: &SteelVal) -> Option<u64> {
+    match value {
+        SteelVal::IntV(value) => u64::try_from(*value).ok(),
+        SteelVal::BigNum(value) => u64::try_from(value.as_ref()).ok(),
+        _ => None,
+    }
 }

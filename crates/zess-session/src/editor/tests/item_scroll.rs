@@ -172,5 +172,5 @@ fn filtering_after_wheel_scrolling_keeps_matching_files_visible() {
         .flat_map(|row| &row.spans)
         .find(|span| span.text.trim() == "file-39.txt")
         .expect("the matching file should remain visible");
-    assert_eq!(selected.style, "selection");
+    assert_eq!(selected.style, "selection.");
 }

@@ -12,8 +12,8 @@ pub use registry::{BufferBackend, ModeRegistration, Registry};
 
 mod buffer;
 pub use buffer::{
-    ItemNavigation, ItemSelection, OutlineSymbol, PluginContext, PluginInput, PluginOutput,
-    QueryWatch, SelectionChange, TextContext,
+    ItemNavigation, ItemSelection, OperationCompletion, OperationResult, OutlineSymbol,
+    PluginContext, PluginInput, PluginOutput, QueryWatch, SelectionChange, TextContext,
 };
 
 mod host;
@@ -23,7 +23,13 @@ pub use host::{
 };
 
 mod options;
-pub use options::{DEFAULT_PREVIEW_DEBOUNCE, EditorOptions};
+pub use options::{DEFAULT_PREVIEW_DEBOUNCE, EditorOptions, OnClientExit};
+
+mod status;
+pub use status::{
+    DEFAULT_STATUS_FORMATS, StatusContent, StatusContext, StatusLine, StatusPosition,
+    default_status_text, validate_status_formats,
+};
 
 mod count;
 pub use count::CommandCount;
@@ -39,6 +45,10 @@ use anyhow::Result;
 /// selection, layout and rendering, for both native and scripted backends.
 pub trait BufferPlugin {
     fn update(&mut self, input: &PluginInput) -> Result<PluginOutput>;
+
+    fn poll_operations(&mut self) -> Vec<PluginOutput> {
+        Vec::new()
+    }
 
     fn remove_view(&mut self, _view: ViewId) {}
 

@@ -285,6 +285,7 @@ fn historical_directory_diffs_use_commit_files_after_the_directory_is_deleted() 
 
 #[test]
 fn reading_a_diff_and_returning_to_changes_follow_configured_bindings() {
+    let scripts = Fixture::new();
     let (fixture, _) = repository();
     for (read, back, custom) in [("Enter", "Esc", false), ("o", "q", true)] {
         let mut session = fixture.session(&[]);
@@ -293,10 +294,7 @@ fn reading_a_diff_and_returning_to_changes_follow_configured_bindings() {
                 .scripts
                 .as_mut()
                 .unwrap()
-                .load_source(
-                    "map-modal \"git\" \"o\" \"git.open\"\nmap-key \"git-diff\" \"normal\" \"q\" \"preview.return\"",
-                    Path::new("custom-key.w"),
-                )
+                .load(&scripts.write("custom-key.w", "map-modal \"git\" \"o\" \"git.open\"\nmap-key \"git-diff\" \"normal\" \"q\" \"preview.return\""))
                 .unwrap();
         }
         session.command("git").unwrap();
@@ -333,16 +331,17 @@ fn reading_a_diff_and_returning_to_changes_follow_configured_bindings() {
 
 #[test]
 fn enter_can_be_rebound_to_an_edit_layer_that_stays_open_after_write() {
+    let scripts = Fixture::new();
     let (fixture, path) = repository();
     let mut session = fixture.session(&[]);
     session
         .scripts
         .as_mut()
         .unwrap()
-        .load_source(
+        .load(&scripts.write(
+            "custom-key.w",
             "map-modal \"git\" \"Enter\" \"git.edit-layer\"",
-            Path::new("custom-key.w"),
-        )
+        ))
         .unwrap();
     session.command("git").unwrap();
     settle(&mut session);
@@ -350,7 +349,7 @@ fn enter_can_be_rebound_to_an_edit_layer_that_stays_open_after_write() {
     session.input("Enter");
     let layer = session.focus;
     assert_ne!(layer, source);
-    assert_eq!(session.views[&source].layer, Some(layer));
+    assert_eq!(session.views.child(source), Some(layer));
     for key in ["i", "!", "Esc"] {
         session.input(key);
     }
@@ -358,7 +357,7 @@ fn enter_can_be_rebound_to_an_edit_layer_that_stays_open_after_write() {
     settle(&mut session);
     assert_eq!(fs::read_to_string(&path).unwrap(), "!working\n");
     assert_eq!(session.focus, layer);
-    assert_eq!(session.views[&source].layer, Some(layer));
+    assert_eq!(session.views.child(source), Some(layer));
     input_command(&mut session, "q");
     assert_eq!(session.focus, source);
     assert!(!session.views.contains_key(&layer));
@@ -730,7 +729,7 @@ fn unchanged_preview_refresh_keeps_the_active_text_prompt() {
     session
         .request(source, group_request("one two\n", false))
         .unwrap();
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     let preview = session.focus;
     let buffer = session.views[&preview].location.buffer;
     let layout = panes(&session);
@@ -813,7 +812,7 @@ fn replacing_preview_contents_closes_a_text_prompt_whose_selection_was_invalidat
     session
         .request(source, group_request("one two\n", false))
         .unwrap();
-    session.focus_preview().unwrap();
+    session.focus_preview(session.focus).unwrap();
     session.input("s");
     session.input("o");
     assert!(session.prompt.is_some());
@@ -1042,16 +1041,15 @@ fn help_pinned_beside_staged_diff_survives_page_changes_and_closing_its_source()
     assert_eq!(session.focus, source);
     assert!(preview_groups(&session).next().is_none());
     session.command("quit").unwrap();
-    assert_eq!(session.focus, help);
-    assert!(!session.views.contains_key(&source));
-    assert!(preview_groups(&session).next().is_none());
-    assert_eq!(
-        panes(&session)
+    assert!(
+        session
+            .client_actions
             .iter()
-            .map(|(id, ..)| *id)
-            .collect::<Vec<_>>(),
-        [help]
+            .any(|action| matches!(action.kind, zess_protocol::ClientActionKind::Close { .. }))
     );
+    assert!(session.views.contains_key(&source));
+    assert!(preview_groups(&session).next().is_none());
+    assert!(panes(&session).iter().any(|(id, ..)| *id == help));
     session.frame();
 }
 

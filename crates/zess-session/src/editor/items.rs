@@ -1,3 +1,4 @@
+use super::ScrollMode;
 use super::*;
 
 pub(super) struct ItemJump {
@@ -86,8 +87,7 @@ impl View {
 }
 
 impl Session {
-    pub(super) fn data_command(&mut self, command: DataCommand) -> Result<()> {
-        let id = self.focus;
+    pub(super) fn data_command(&mut self, id: ViewId, command: DataCommand) -> Result<()> {
         if !matches!(
             self.buffers[&self.views[&id].location.buffer],
             Buffer::Data { .. } | Buffer::Items { .. }
@@ -95,6 +95,7 @@ impl Session {
             bail!("command requires an item buffer");
         }
         if command == DataCommand::GotoWord {
+            anyhow::ensure!(id == self.focus, "item jump requires the focused view");
             return self.start_item_jump();
         }
         if command == DataCommand::SelectRegister {
@@ -102,6 +103,7 @@ impl Session {
             return Ok(());
         }
         if command == DataCommand::Filter {
+            anyhow::ensure!(id == self.focus, "item filter requires the focused view");
             self.set_mode(id, "filter")?;
             return Ok(());
         }
@@ -110,7 +112,7 @@ impl Session {
         }
         let view = self.views.get_mut(&id).unwrap();
         view.jump = None;
-        view.location.manual_viewport = false;
+        view.location.scroll_mode = ScrollMode::FollowSelection;
         let count = std::mem::take(&mut view.count).value();
         let repeat = count.unwrap_or(1).max(1);
         view.reconcile_selection();
@@ -309,7 +311,7 @@ impl Session {
             view.location.selection.anchor = Some(target.clone());
         }
         view.location.selection.primary = Some(target.clone());
-        view.location.manual_viewport = false;
+        view.location.scroll_mode = ScrollMode::FollowSelection;
         self.dispatch(
             self.focus,
             "select",

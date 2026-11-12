@@ -1,6 +1,53 @@
 use super::*;
 
 #[test]
+fn plain_text_sessions_remain_editable_when_the_syntax_runtime_is_invalid() {
+    if std::env::var_os("ZESS_TEST_PLAIN_TEXT_RUNTIME").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "editor::tests::language::plain_text_sessions_remain_editable_when_the_syntax_runtime_is_invalid",
+            ])
+            .env("ZESS_TEST_PLAIN_TEXT_RUNTIME", "1")
+            .env("ZESS_RUNTIME", "")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let path = fixture.write("notes.txt", "plain text");
+    let mut session = fixture.session(std::slice::from_ref(&path));
+    for key in ["i", "!", "Esc"] {
+        session.input(key);
+    }
+    session.command("w").unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "!plain text");
+    assert!(session.frame().rows.iter().any(|row| {
+        row.spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>()
+            .contains("!plain text")
+    }));
+    session.command("lang rust").unwrap();
+    session.frame();
+    let buffer = session.views[&session.focus].location.buffer;
+    let text = session.buffers.get_mut(&buffer).unwrap().text().unwrap();
+    assert_eq!(
+        text.syntax_error(),
+        Some("ZESS_RUNTIME must name a directory")
+    );
+    assert_eq!(text.text(), "!plain text");
+}
+
+#[test]
 fn language_command_shows_and_changes_the_current_language() {
     let fixture = Fixture::new();
     let path = fixture.0.join("source.rs");
@@ -91,6 +138,7 @@ fn language_command_supports_read_only_text_and_rejects_non_text_buffers() {
     session.buffers.insert(
         buffer,
         Buffer::Items {
+            role: ItemsRole::Standalone,
             kind: "test-items".into(),
             path: "items".into(),
             display: Display::default(),

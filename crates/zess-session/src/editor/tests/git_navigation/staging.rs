@@ -49,9 +49,21 @@ fn a_selected_hunk_can_be_staged_from_the_diff_and_unstaged_from_the_index_pane(
     session
         .execute_command("diff.select-hunk", json!({}))
         .unwrap();
-    session.input("space");
-    session.input("s");
+    assert_eq!(
+        session.begin_operation(
+            "stage-hunk",
+            &zess_protocol::CommandAction::Command {
+                name: "diff.apply-selection".into(),
+                argument: json!({}),
+            }
+        ),
+        None
+    );
     finish_patch(&mut session);
+    assert_eq!(
+        session.take_operation_completions(),
+        vec![("stage-hunk".into(), zess_protocol::CommandOutcome::Applied)]
+    );
     assert_eq!(git(&fixture, &["show", ":note.txt"]), "working");
     assert_eq!(fs::read_to_string(&path).unwrap(), "working\n");
     assert_ne!(session.focus, source);
@@ -69,8 +81,9 @@ fn a_selected_hunk_can_be_staged_from_the_diff_and_unstaged_from_the_index_pane(
     session
         .execute_command("diff.select-hunk", json!({}))
         .unwrap();
-    session.input("space");
-    session.input("s");
+    session
+        .execute_command("diff.apply-selection", json!({}))
+        .unwrap();
     finish_patch(&mut session);
     assert_eq!(git(&fixture, &["show", ":note.txt"]), "historical");
     assert_eq!(fs::read_to_string(&path).unwrap(), "working\n");
@@ -88,8 +101,9 @@ fn staging_one_diff_line_keeps_unselected_changes_out_of_the_index() {
     session.input("Enter");
     settle(&mut session);
     selected_diff_row(&mut session, "+first addition");
-    session.input("space");
-    session.input("s");
+    session
+        .execute_command("diff.apply-selection", json!({}))
+        .unwrap();
     finish_patch(&mut session);
     assert_eq!(
         git(&fixture, &["show", ":note.txt"]),
@@ -197,8 +211,9 @@ fn a_failed_index_update_leaves_the_diff_available_for_retry() {
     session
         .execute_command("diff.select-hunk", json!({}))
         .unwrap();
-    session.input("space");
-    session.input("s");
+    session
+        .execute_command("diff.apply-selection", json!({}))
+        .unwrap();
     wait_until(&mut session, |session| session.git_patch.is_none());
     settle(&mut session);
     assert_eq!(
@@ -217,8 +232,9 @@ fn a_failed_index_update_leaves_the_diff_available_for_retry() {
     session
         .execute_command("diff.select-hunk", json!({}))
         .unwrap();
-    session.input("space");
-    session.input("s");
+    session
+        .execute_command("diff.apply-selection", json!({}))
+        .unwrap();
     finish_patch(&mut session);
     assert_eq!(git(&fixture, &["show", ":note.txt"]), "working");
 }
@@ -233,9 +249,12 @@ fn visual_line_selection_stages_only_the_selected_additions() {
     session.input("Enter");
     settle(&mut session);
     selected_diff_row(&mut session, "+first");
-    for key in ["v", "j", "space", "s"] {
+    for key in ["v", "j"] {
         session.input(key);
     }
+    session
+        .execute_command("diff.apply-selection", json!({}))
+        .unwrap();
     finish_patch(&mut session);
     assert_eq!(
         git(&fixture, &["show", ":note.txt"]),
@@ -555,8 +574,8 @@ fn removing_a_diff_pane_keeps_its_unsaved_file_layer_open_and_returns_to_changes
     });
     assert_eq!(session.focus, editor);
     assert_eq!(session.views[&editor].location.buffer, buffer);
-    assert_eq!(session.views[&editor].parent, Some(source));
-    assert_eq!(session.views[&source].layer, Some(editor));
+    assert_eq!(session.views.parent(editor), Some(source));
+    assert_eq!(session.views.child(source), Some(editor));
     let Buffer::Text(text) = &session.buffers[&buffer] else {
         panic!("expected editor")
     };
@@ -569,7 +588,7 @@ fn removing_a_diff_pane_keeps_its_unsaved_file_layer_open_and_returns_to_changes
     assert_eq!(fs::read_to_string(&path).unwrap(), "!worktree\n");
     session.command("quit").unwrap();
     assert_eq!(session.focus, source);
-    assert!(session.views[&source].layer.is_none());
+    assert!(session.views.child(source).is_none());
     assert!(!session.buffers.contains_key(&buffer));
 }
 
@@ -679,7 +698,7 @@ fn staged_source_navigation_waits_while_the_unstaged_pane_is_loading() {
             session.input(key);
         }
         assert_eq!(session.focus, staged);
-        assert!(session.views[&staged].layer.is_none());
+        assert!(session.views.child(staged).is_none());
         assert_eq!(
             session.message,
             "error: wait for Git previews to finish loading"

@@ -92,7 +92,7 @@ fn invalid_filters_preserve_the_last_results_and_view_position_until_corrected_o
             .location
             .scroll = 3;
         let location = &mut session.views.get_mut(&session.focus).unwrap().location;
-        location.manual_viewport = true;
+        location.scroll_mode = ScrollMode::UserControlled;
         let id = location
             .display
             .rows
@@ -332,5 +332,54 @@ fn git_filters_keep_status_paths_and_commit_rows_as_their_matching_fields() {
                 .header
                 .contains(value)
         );
+    }
+}
+
+#[test]
+fn closing_help_restores_the_filter_draft_and_allows_input_to_continue() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("Alpha.rs"), "alpha").unwrap();
+    fs::write(fixture.0.join("beta.rs"), "beta").unwrap();
+    let mut session = fixture.session(&[]);
+    session.command("files").unwrap();
+    settle(&mut session);
+    let source = session.focus;
+    session.input("/");
+    query(&mut session, Plain, "Alpha");
+    query(&mut session, Regex, "[");
+    session.command("help").unwrap();
+    session.execute_command("help.close", json!({})).unwrap();
+    assert_eq!(session.focus, source);
+    let prompt = session.active_prompt().unwrap();
+    assert!(matches!(prompt.query(), Some((Regex, "["))));
+    assert!(prompt.error.is_some());
+    assert!(session.views[&source].location.mode == ViewMode::Filter);
+    assert_eq!(session.views[&source].item_ids(), ["Alpha.rs"]);
+    session.input("C-u");
+    for key in ["b", "e", "t", "a"] {
+        session.input(key);
+    }
+    assert_eq!(session.views[&source].item_ids(), ["beta.rs"]);
+    session.input("Enter");
+    assert!(session.prompt.is_none());
+    assert!(session.views[&source].location.mode == ViewMode::Normal);
+}
+
+#[test]
+fn splitting_after_filter_input_clones_normal_mode_and_the_last_valid_filter() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("Alpha.rs"), "alpha").unwrap();
+    fs::write(fixture.0.join("beta.rs"), "beta").unwrap();
+    let mut session = fixture.session(&[]);
+    session.command("files").unwrap();
+    settle(&mut session);
+    session.input("/");
+    query(&mut session, Plain, "Alpha");
+    session.command("vsplit").unwrap();
+    assert!(session.prompt.is_none());
+    assert_eq!(session.views.values().count(), 2);
+    for view in session.views.values() {
+        assert!(view.location.mode == ViewMode::Normal);
+        assert_eq!(view.item_ids(), ["Alpha.rs"]);
     }
 }

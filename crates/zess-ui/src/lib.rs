@@ -11,7 +11,14 @@ mod columns;
 pub use columns::{ColumnAlignment, RowColumns, RowLayout};
 
 mod viewport;
-pub use viewport::{HalfPageScroll, ScrollDirection, scroll_limit_with_margin, scroll_with_margin};
+pub use viewport::{
+    HalfPageScroll, ScrollDirection, ScrollMode, scroll_limit_with_margin, scroll_with_margin,
+};
+
+mod presentation;
+pub use presentation::{
+    ContentSource, RenderContent, RenderError, RenderPlan, RenderRow, RenderSpan, render_plan,
+};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct DisplayRow {
@@ -30,7 +37,7 @@ pub struct DisplayCell {
     pub spans: Vec<Span>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayTab {
     pub label: String,
     pub command: String,
@@ -56,9 +63,11 @@ pub struct Display {
     pub header: String,
     #[serde(default)]
     pub status: Value,
+    #[serde(default)]
+    pub status_data: Value,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CursorShape {
     #[default]
@@ -67,7 +76,7 @@ pub enum CursorShape {
     Underline,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MouseContext {
     pub content_revision: u64,
     pub layout_revision: u64,
@@ -91,7 +100,7 @@ pub struct MouseEvent {
     pub row: u16,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Frame {
     #[serde(default)]
     pub styles: std::collections::HashMap<String, TextStyle>,
@@ -109,12 +118,12 @@ pub struct Frame {
     pub prompt: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FrameRow {
     pub spans: Vec<Span>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Span {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_style: Option<String>,
