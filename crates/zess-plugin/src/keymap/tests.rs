@@ -106,6 +106,54 @@ fn a_new_keymap_cannot_resume_another_keymaps_prefix() {
 }
 
 #[test]
+fn an_unchanged_context_preserves_the_pending_sequence() {
+    let mut keymap = Keymap::default();
+    keymap.map(
+        "global",
+        "normal",
+        vec!["g".into(), "x".into()],
+        Some("jump".into()),
+    );
+    let mut state = KeyState::default();
+    assert!(matches!(
+        keymap.advance(&mut state, &["global"], "normal", "g"),
+        KeyResolution::Prefix
+    ));
+    assert!(!keymap.synchronize(&mut state, &["global"], "normal"));
+    assert!(matches!(
+        keymap.advance(&mut state, &["global"], "normal", "x"),
+        KeyResolution::Command("jump")
+    ));
+}
+
+#[test]
+fn changed_bindings_invalidate_the_prefix_before_the_next_key() {
+    let mut keymap = Keymap::default();
+    keymap.map(
+        "global",
+        "normal",
+        vec!["g".into(), "x".into()],
+        Some("old-jump".into()),
+    );
+    let mut state = KeyState::default();
+    assert!(matches!(
+        keymap.advance(&mut state, &["global"], "normal", "g"),
+        KeyResolution::Prefix
+    ));
+    keymap.map(
+        "global",
+        "normal",
+        vec!["x".into()],
+        Some("new-jump".into()),
+    );
+    assert!(keymap.synchronize(&mut state, &["global"], "normal"));
+    assert!(matches!(
+        keymap.advance(&mut state, &["global"], "normal", "x"),
+        KeyResolution::Command("new-jump")
+    ));
+}
+
+#[test]
 fn scoped_mappings_replace_conflicting_sequences_and_preserve_the_winning_scope() {
     let mut keymap = Keymap::default();
     keymap.register_scope("browser", "Files");

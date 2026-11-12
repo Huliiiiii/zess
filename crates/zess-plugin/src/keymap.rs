@@ -199,13 +199,21 @@ impl Keymap {
         self.advance_ids(state, &scopes, mode, key)
     }
 
-    pub fn advance_ids<'a>(
-        &'a self,
-        state: &mut KeyState,
-        scopes: &[KeyScopeId],
-        mode: ModeId,
-        key: &str,
-    ) -> KeyResolution<&'a str> {
+    /// Resets a pending sequence when its effective keymap context changes.
+    pub fn synchronize(&self, state: &mut KeyState, scopes: &[&str], mode: &str) -> bool {
+        let scopes = scopes
+            .iter()
+            .filter_map(|scope| self.identities.scope(scope))
+            .collect::<SmallVec<[_; 4]>>();
+        let Some(mode) = self.identities.mode(mode) else {
+            let changed = state.context.take().is_some();
+            state.reset();
+            return changed;
+        };
+        self.synchronize_ids(state, &scopes, mode)
+    }
+
+    fn synchronize_ids(&self, state: &mut KeyState, scopes: &[KeyScopeId], mode: ModeId) -> bool {
         let current = state.context.as_ref().is_some_and(|context| {
             Rc::ptr_eq(&context.revision, &self.revision)
                 && context.built_at == self.revision.get()
@@ -216,6 +224,17 @@ impl Keymap {
             state.context = Some(self.compiled_context(scopes, mode));
             state.reset();
         }
+        !current
+    }
+
+    pub fn advance_ids<'a>(
+        &'a self,
+        state: &mut KeyState,
+        scopes: &[KeyScopeId],
+        mode: ModeId,
+        key: &str,
+    ) -> KeyResolution<&'a str> {
+        self.synchronize_ids(state, scopes, mode);
         let context = state.context.as_ref().unwrap();
         let Some(next) = context.nodes[state.node.0].children.get(key).copied() else {
             state.reset();
