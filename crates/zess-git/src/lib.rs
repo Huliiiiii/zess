@@ -1,26 +1,40 @@
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
+    collections::HashSet,
+    ffi::{OsStr, OsString},
     path::{Component, Path, PathBuf},
-    process::{Command, Output},
-    sync::{Arc, Mutex, OnceLock},
+    process::Output,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use zess_platform::{FileSystem, NativeFileSystem, ProcessSpec};
 
+pub struct SelectedPath {
+    pub path: String,
+    pub directory: bool,
+}
+
+pub mod ignore;
 pub mod mutation;
 pub mod patch;
 mod renderer;
-pub use renderer::{DiffRenderOptions, DiffRenderer};
+pub use renderer::{DiffRenderOptions, DiffRenderer, PagerCommand};
+mod queries;
 mod stats;
+pub use queries::{GitQueries, NativeGitQueries, RepositoryLocation};
 #[cfg(test)]
 mod tests;
 
 pub trait Execution {
+    /// Returns inherited values from this execution context. Implementations that
+    /// inherit an external environment must expose it here; the default exposes none.
+    fn environment(&self, _name: &OsStr) -> Option<OsString> {
+        None
+    }
     fn check(&self) -> Result<()>;
-    fn output(&self, command: &mut Command) -> Result<Output>;
-    fn output_with_input(&self, command: &mut Command, input: &[u8]) -> Result<Output>;
+    fn output(&self, command: &ProcessSpec) -> Result<Output>;
+    fn output_with_input(&self, command: &ProcessSpec, input: &[u8]) -> Result<Output>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -185,13 +199,6 @@ impl CommitFile {
     }
 }
 
-// Immutable Git blobs can be reused across workspaces and commits. The bound
-// keeps browsing history from retaining every file read during a session.
-type BlobCache = HashMap<(String, String), Arc<Vec<u8>>>;
-static BLOBS: OnceLock<Mutex<BlobCache>> = OnceLock::new();
-const BLOB_LIMIT: usize = 1024 * 1024;
-const CACHE_LIMIT: usize = 8 * BLOB_LIMIT;
-
 pub struct PatchRequest {
     pub path: String,
     pub original_path: Option<String>,
@@ -202,6 +209,8 @@ pub struct PatchRequest {
 
 pub struct Repository {
     root: PathBuf,
+    file_system: Arc<dyn FileSystem>,
+    queries: Arc<dyn GitQueries>,
 }
 
 impl Repository {
@@ -245,12 +254,34 @@ impl Repository {
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root
-            .as_ref()
-            .canonicalize()
+        Self::with_file_system(root, Arc::new(NativeFileSystem))
+    }
+
+    pub fn with_file_system(
+        root: impl AsRef<Path>,
+        file_system: Arc<dyn FileSystem>,
+    ) -> Result<Self> {
+        let queries = Arc::new(NativeGitQueries::new(file_system.clone()));
+        Self::with_backends(root, file_system, queries)
+    }
+
+    pub fn with_backends(
+        root: impl AsRef<Path>,
+        file_system: Arc<dyn FileSystem>,
+        queries: Arc<dyn GitQueries>,
+    ) -> Result<Self> {
+        let root = file_system
+            .canonicalize(root.as_ref())
             .context("cannot open Git workspace")?;
-        anyhow::ensure!(root.is_dir(), "Git workspace must be a directory");
-        Ok(Self { root })
+        anyhow::ensure!(
+            file_system.metadata(&root)?.is_dir(),
+            "Git workspace must be a directory"
+        );
+        Ok(Self {
+            root,
+            file_system,
+            queries,
+        })
     }
 
     pub fn log(&self, cancellation: &impl Execution) -> Result<Vec<Commit>> {
@@ -297,7 +328,7 @@ impl Repository {
             &["."],
             cancellation,
         )?;
-        let mut counts = self.git_commit_counts(oid, cancellation)?;
+        let mut counts = self.queries.commit_counts(&self.root, oid, cancellation)?;
         let mut fields = output
             .split(|byte| *byte == 0)
             .filter(|field| !field.is_empty());
@@ -362,60 +393,7 @@ impl Repository {
         let oid = commit_oid(commit)?;
         validate_relative(path)?;
         cancellation.check()?;
-        let repository = gix::discover(&self.root)?;
-        let repository_root = repository
-            .workdir()
-            .context("Git repository has no working directory")?
-            .canonicalize()?;
-        let prefix = self.root.strip_prefix(&repository_root)?;
-        let tree = repository
-            .find_object(gix::ObjectId::from_hex(oid.as_bytes())?)?
-            .peel_to_tree()?;
-        let entry = match tree.lookup_entry_by_path(prefix.join(path))? {
-            Some(entry) => entry,
-            None => {
-                return Ok(BlobRead::Missing);
-            }
-        };
-        if !matches!(
-            entry.mode().kind(),
-            gix::objs::tree::EntryKind::Blob | gix::objs::tree::EntryKind::BlobExecutable
-        ) {
-            return Ok(BlobRead::UnsupportedObject);
-        }
-        let blob = entry.object_id();
-        let repository_root = repository_root
-            .to_str()
-            .context("Git repository path is not UTF-8")?
-            .to_owned();
-        let key = (repository_root.clone(), blob.to_string());
-        let cache = BLOBS.get_or_init(Mutex::default);
-        let cached = cache.lock().unwrap().get(&key).cloned();
-        let bytes = if let Some(bytes) = cached {
-            bytes
-        } else {
-            cancellation.check()?;
-            if repository.find_header(blob)?.size() > BLOB_LIMIT as u64 {
-                return Ok(BlobRead::TooLarge);
-            }
-            let object = repository.find_blob(blob)?;
-            let bytes = Arc::new(object.detach().data);
-            cancellation.check()?;
-            let mut cache = cache.lock().unwrap();
-            if cache.values().map(|bytes| bytes.len()).sum::<usize>() + bytes.len() > CACHE_LIMIT {
-                cache.clear();
-            }
-            cache.insert(key, bytes.clone());
-            bytes
-        };
-        cancellation.check()?;
-        Ok(BlobRead::File(Blob {
-            repository: repository_root,
-            commit: oid.into(),
-            path: path.into(),
-            oid: blob.to_string(),
-            bytes,
-        }))
+        self.queries.blob(&self.root, oid, path, cancellation)
     }
 
     fn git_checked(&self, args: &[&str], cancellation: &impl Execution) -> Result<Vec<u8>> {
@@ -431,14 +409,7 @@ impl Repository {
     }
 
     fn commit_parent(&self, oid: &str, cancellation: &impl Execution) -> Result<Option<String>> {
-        cancellation.check()?;
-        let repository = gix::discover(&self.root)?;
-        let commit = repository
-            .find_object(gix::ObjectId::from_hex(oid.as_bytes())?)?
-            .peel_to_commit()?;
-        let parent = commit.parent_ids().next().map(|oid| oid.to_string());
-        cancellation.check()?;
-        Ok(parent)
+        self.queries.commit_parent(&self.root, oid, cancellation)
     }
 
     fn commit_diff_output(
@@ -482,15 +453,19 @@ impl Repository {
         let path = self.root.join(relative);
         let mut ancestor = path.as_path();
 
-        while !ancestor.try_exists()? {
-            if ancestor.symlink_metadata().is_ok() {
+        while !self.file_system.try_exists(ancestor)? {
+            if self.file_system.symlink_metadata(ancestor).is_ok() {
                 bail!("broken symbolic link in workspace path");
             }
 
             ancestor = ancestor.parent().context("invalid workspace path")?;
         }
 
-        if !ancestor.canonicalize()?.starts_with(&self.root) {
+        if !self
+            .file_system
+            .canonicalize(ancestor)?
+            .starts_with(&self.root)
+        {
             bail!("symbolic link leaves the workspace");
         }
 
@@ -498,14 +473,45 @@ impl Repository {
     }
 
     fn git(&self, args: &[&str], cancellation: &impl Execution) -> Result<std::process::Output> {
-        let mut command = self.git_command(args, cancellation)?;
+        let mut command = self.git_command();
+        command.args(args);
         cancellation
-            .output(&mut command)
+            .output(&command)
             .with_context(|| format!("run git {}", args.join(" ")))
     }
 
-    fn git_command(&self, args: &[&str], cancellation: &impl Execution) -> Result<Command> {
-        let mut filters = Command::new("git");
+    fn git_command(&self) -> ProcessSpec {
+        let mut command = ProcessSpec::new("git");
+        command
+            .arg("--no-pager")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "diff.suppressBlankEmpty=false",
+            ])
+            .current_dir(&self.root)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        command
+    }
+
+    fn git_worktree(
+        &self,
+        args: &[&str],
+        cancellation: &impl Execution,
+    ) -> Result<std::process::Output> {
+        let mut command = self.git_worktree_command(cancellation)?;
+        command.args(args);
+        cancellation
+            .output(&command)
+            .with_context(|| format!("run git {}", args.join(" ")))
+    }
+
+    fn git_worktree_command(&self, cancellation: &impl Execution) -> Result<ProcessSpec> {
+        let mut filters = ProcessSpec::new("git");
         filters
             .args([
                 "config",
@@ -516,7 +522,7 @@ impl Repository {
             ])
             .current_dir(&self.root);
         let filters = cancellation
-            .output(&mut filters)
+            .output(&filters)
             .context("cannot read git filter configuration")?;
 
         if !filters.status.success() && filters.status.code() != Some(1) {
@@ -538,15 +544,7 @@ impl Repository {
             drivers.insert(driver);
         }
 
-        let mut command = Command::new("git");
-        command.arg("--no-pager").args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-            "-c",
-            "diff.suppressBlankEmpty=false",
-        ]);
+        let mut command = self.git_command();
 
         // Diff's --no-textconv does not disable working-tree clean filters.
         for driver in drivers {
@@ -556,12 +554,6 @@ impl Repository {
 
             command.arg("-c").arg(format!("{driver}.required=false"));
         }
-
-        command
-            .args(args)
-            .current_dir(&self.root)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_OPTIONAL_LOCKS", "0");
 
         Ok(command)
     }
@@ -595,7 +587,8 @@ impl Repository {
         cancellation.check()?;
         progress(&entries);
         let mut counts = self
-            .git_worktree_counts(cancellation)
+            .queries
+            .worktree_counts(&self.root, cancellation)
             .context("count changed lines in working tree")?;
         for entry in &mut entries {
             cancellation.check()?;
@@ -613,22 +606,11 @@ impl Repository {
 
     pub fn decorations(&self, cancellation: &impl Execution) -> Result<Vec<GitDecoration>> {
         cancellation.check()?;
-        let path = match git2::Repository::discover_path(&self.root, std::iter::empty::<&Path>()) {
-            Ok(path) => path,
-            Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("locate Git working tree in {}", self.root.display())
-                });
-            }
+        let Some(location) = self.queries.discover(&self.root)? else {
+            return Ok(Vec::new());
         };
-        let repository = git2::Repository::open(&path)
-            .with_context(|| format!("open Git repository at {}", path.display()))?;
-        let top = repository
-            .workdir()
-            .context("Git repository has no working directory")?;
         Ok(self
-            .status_entries(top, cancellation)?
+            .status_entries(&location.worktree, cancellation)?
             .into_iter()
             .map(|entry| GitDecoration {
                 status: entry.status(),
@@ -640,7 +622,19 @@ impl Repository {
     }
 
     fn status_entries(&self, top: &Path, cancellation: &impl Execution) -> Result<Vec<GitEntry>> {
-        let output = self.git(
+        let top = self.file_system.canonicalize(top)?;
+        // Compare native directory identities, then keep porcelain paths in Git's
+        // slash-separated form, including on Windows with verbatim root paths.
+        let mut prefix = self
+            .root
+            .strip_prefix(&top)?
+            .to_str()
+            .context("Git workspace path is not UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        let output = self.git_worktree(
             &[
                 "status",
                 "--porcelain=v1",
@@ -673,28 +667,25 @@ impl Repository {
                 bail!("invalid git status record");
             }
 
-            let path = top.join(std::str::from_utf8(&record[3..])?);
+            let path = std::str::from_utf8(&record[3..])?;
             let original =
                 if record[0] == b'R' || record[0] == b'C' || record[1] == b'R' || record[1] == b'C'
                 {
-                    Some(top.join(std::str::from_utf8(
+                    Some(std::str::from_utf8(
                         records.next().context("missing git rename source")?,
-                    )?))
+                    )?)
                 } else {
                     None
                 };
-            let Ok(path) = path.strip_prefix(&self.root) else {
+            let Some(path) = path.strip_prefix(&prefix) else {
                 continue;
             };
-            let original = original
-                .as_ref()
-                .and_then(|path| path.strip_prefix(&self.root).ok());
+            let original = original.and_then(|path| path.strip_prefix(&prefix));
 
-            let path = path.to_str().context("git path is not UTF-8")?;
             let untracked = record[0] == b'?' && record[1] == b'?';
             entries.push(GitEntry {
                 path: path.into(),
-                original_path: original.and_then(Path::to_str).map(str::to_owned),
+                original_path: original.map(str::to_owned),
                 index: char::from(record[0]).to_string(),
                 worktree: char::from(record[1]).to_string(),
                 untracked,
@@ -767,7 +758,7 @@ impl Repository {
             && committed.stdout.is_empty()
             && side != Some(DiffSide::Staged)
         {
-            let output = self.git(
+            let output = self.git_worktree(
                 &[
                     "diff",
                     "--no-index",
@@ -796,13 +787,13 @@ impl Repository {
 
             String::from_utf8(output.stdout).context("partial staging requires a UTF-8 patch")?
         } else {
-            let output = self.git(&diff_args, cancellation)?;
+            let output = self.git_worktree(&diff_args, cancellation)?;
 
             if output.status.success() {
                 String::from_utf8(output.stdout)
                     .context("partial staging requires a UTF-8 patch")?
             } else {
-                let staged = self.git(
+                let staged = self.git_worktree(
                     &[
                         "--literal-pathspecs",
                         "diff",
@@ -815,7 +806,7 @@ impl Repository {
                     ],
                     cancellation,
                 )?;
-                let unstaged = self.git(
+                let unstaged = self.git_worktree(
                     &[
                         "--literal-pathspecs",
                         "diff",
@@ -847,7 +838,7 @@ impl Repository {
     }
 
     pub fn diff_colors(&self, cancellation: &impl Execution) -> Result<DiffColors> {
-        let mut command = Command::new("git");
+        let mut command = ProcessSpec::new("git");
         command
             .args([
                 "--no-pager",
@@ -859,7 +850,7 @@ impl Repository {
             ])
             .current_dir(&self.root);
         let output = cancellation
-            .output(&mut command)
+            .output(&command)
             .context("cannot read Git diff colors")?;
         if !output.status.success() && output.status.code() != Some(1) {
             bail!(
@@ -892,9 +883,6 @@ impl Repository {
     }
 
     pub fn apply_patch(&self, request: PatchRequest, cancellation: &impl Execution) -> Result<()> {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
         let text = self.diff(
             &request.path,
             request.original_path.as_deref(),
@@ -913,7 +901,7 @@ impl Repository {
         let repository = std::str::from_utf8(&repository)?
             .strip_suffix('\n')
             .context("invalid Git repository root")?;
-        let mut command = Command::new("git");
+        let mut command = ProcessSpec::new("git");
         command.args([
             "--no-pager",
             "-c",
@@ -928,30 +916,19 @@ impl Repository {
         if !prefix.is_empty() {
             command.arg(format!("--directory={prefix}"));
         }
-        let mut child = command
+        command
             .arg("-")
             .current_dir(repository)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("cannot start git apply")?;
-        let written = child
-            .stdin
-            .take()
-            .context("missing git apply stdin")?
-            .write_all(patch.as_bytes());
-        let output = child
-            .wait_with_output()
-            .context("cannot wait for git apply")?;
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let output = cancellation
+            .output_with_input(&command, patch.as_bytes())
+            .context("cannot apply selected Git patch")?;
         if !output.status.success() {
             bail!(
                 "git apply: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        written.context("cannot send selected patch to git apply")?;
         Ok(())
     }
 }
@@ -974,9 +951,16 @@ fn validate_relative(relative: &str) -> Result<()> {
 }
 
 pub fn metadata_directories(root: &Path) -> Result<Vec<PathBuf>> {
+    metadata_directories_with_file_system(root, &NativeFileSystem)
+}
+
+pub fn metadata_directories_with_file_system(
+    root: &Path,
+    file_system: &dyn FileSystem,
+) -> Result<Vec<PathBuf>> {
     for ancestor in root.ancestors() {
         let marker = ancestor.join(".git");
-        let metadata = match fs::metadata(&marker) {
+        let metadata = match file_system.metadata(&marker) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -986,7 +970,8 @@ pub fn metadata_directories(root: &Path) -> Result<Vec<PathBuf>> {
         let directory = if metadata.is_dir() {
             marker
         } else {
-            let marker_text = fs::read_to_string(&marker)
+            let marker_text = file_system
+                .read_to_string(&marker)
                 .with_context(|| format!("cannot read Git directory from {}", marker.display()))?;
             let directory = marker_text
                 .trim_end_matches(['\r', '\n'])
@@ -994,11 +979,11 @@ pub fn metadata_directories(root: &Path) -> Result<Vec<PathBuf>> {
                 .with_context(|| format!("invalid Git directory file: {}", marker.display()))?;
             ancestor.join(directory)
         };
-        let directory = directory
-            .canonicalize()
+        let directory = file_system
+            .canonicalize(&directory)
             .with_context(|| format!("cannot open Git directory for {}", root.display()))?;
         let common_file = directory.join("commondir");
-        let common = match fs::read_to_string(&common_file) {
+        let common = match file_system.read_to_string(&common_file) {
             Ok(common) => common,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(vec![directory]);
@@ -1008,9 +993,8 @@ pub fn metadata_directories(root: &Path) -> Result<Vec<PathBuf>> {
                     .with_context(|| format!("cannot read {}", common_file.display()));
             }
         };
-        let common = directory
-            .join(common.trim_end_matches(['\r', '\n']))
-            .canonicalize()
+        let common = file_system
+            .canonicalize(&directory.join(common.trim_end_matches(['\r', '\n'])))
             .with_context(|| format!("cannot open Git common directory for {}", root.display()))?;
         return Ok(vec![directory, common]);
     }

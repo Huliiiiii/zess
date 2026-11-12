@@ -43,9 +43,15 @@ struct Subscription {
     path: PathBuf,
     relative: String,
     request: Request,
-    outcome: Option<Outcome>,
+    state: SubscriptionState,
     query: Arc<Query>,
     registration: Arc<Registration>,
+}
+
+enum SubscriptionState {
+    Waiting,
+    Reading,
+    Ready(Outcome),
 }
 
 impl Subscription {
@@ -63,9 +69,23 @@ struct Flight {
 }
 
 #[derive(Default)]
+struct Entry {
+    snapshot: Option<CachedSnapshot>,
+    flight: Option<Flight>,
+}
+
+impl Entry {
+    fn invalidate(&mut self) {
+        self.snapshot = None;
+        if let Some(flight) = self.flight.take() {
+            flight.job.cancel();
+        }
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct FsCache {
-    ready: HashMap<PathBuf, CachedSnapshot>,
-    flights: HashMap<PathBuf, Flight>,
+    entries: HashMap<PathBuf, Entry>,
     subscriptions: HashMap<u64, Subscription>,
     revision: u64,
 }
@@ -76,7 +96,10 @@ impl FsCache {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.ready.len()
+        self.entries
+            .values()
+            .filter(|entry| entry.snapshot.is_some())
+            .count()
     }
 
     pub(crate) fn jobs(&self) -> usize {
@@ -93,8 +116,9 @@ impl FsCache {
         let (relative, request) = Request::from_query(query_request)?;
         let path = key(relative)?;
         let Some(cached) = self
-            .ready
+            .entries
             .get(&path)
+            .and_then(|entry| entry.snapshot.as_ref())
             .filter(|cached| cached.binding.is_current())
         else {
             return Ok(None);
@@ -103,50 +127,55 @@ impl FsCache {
     }
 
     pub(crate) fn invalidate(&mut self) {
-        self.ready.clear();
-        // Dropping each receiver prevents its worker from publishing into a newer flight.
-        for (_, flight) in self.flights.drain() {
-            flight.job.cancel();
+        // Dropping each receiver prevents its worker from publishing into a newer read.
+        for (_, mut entry) in self.entries.drain() {
+            entry.invalidate();
         }
         for subscription in self.subscriptions.values_mut() {
-            subscription.outcome = None;
+            subscription.state = SubscriptionState::Waiting;
         }
         self.revision += 1;
     }
 
     pub(crate) fn invalidate_path(&mut self, path: &Path) {
-        self.ready.remove(path);
-        if let Some(flight) = self.flights.remove(path) {
-            flight.job.cancel();
+        if let Some(mut entry) = self.entries.remove(path) {
+            entry.invalidate();
         }
         for subscription in self.subscriptions.values_mut() {
             if subscription.path == path {
-                subscription.outcome = None;
+                subscription.state = SubscriptionState::Waiting;
             }
         }
     }
 
     pub(crate) fn cancel_all(&mut self) {
-        for (_, flight) in self.flights.drain() {
-            flight.job.cancel();
+        for entry in self.entries.values_mut() {
+            if let Some(flight) = entry.flight.take() {
+                flight.job.cancel();
+            }
         }
         self.subscriptions.clear();
+        self.entries.retain(|_, entry| entry.snapshot.is_some());
+    }
+
+    fn detach(&mut self, handle: u64) -> Option<Subscription> {
+        let subscription = self.subscriptions.remove(&handle)?;
+        if let Some(entry) = self.entries.get_mut(&subscription.path) {
+            if let Some(flight) = &mut entry.flight {
+                flight.subscribers.remove(&handle);
+                if flight.subscribers.is_empty() {
+                    entry.flight.take().unwrap().job.cancel();
+                }
+            }
+            if entry.snapshot.is_none() && entry.flight.is_none() {
+                self.entries.remove(&subscription.path);
+            }
+        }
+        Some(subscription)
     }
 
     pub(crate) fn cancel(&mut self, handle: u64) {
-        let Some(subscription) = self.subscriptions.remove(&handle) else {
-            return;
-        };
-        if let Some(flight) = self.flights.get_mut(&subscription.path) {
-            flight.subscribers.remove(&handle);
-            if flight.subscribers.is_empty() {
-                self.flights
-                    .remove(&subscription.path)
-                    .unwrap()
-                    .job
-                    .cancel();
-            }
-        }
+        self.detach(handle);
     }
 
     pub(crate) fn start(
@@ -160,12 +189,14 @@ impl FsCache {
         let path = key(relative)?;
         self.pump(scheduler);
         let registration = query.registration();
-        let outcome = if registration.ready() == Ok(true) {
-            self.ready
+        let state = if registration.ready() == Ok(true) {
+            self.entries
                 .get(&path)
-                .map(|cached| Ok(cached.snapshot.clone()))
+                .and_then(|entry| entry.snapshot.as_ref())
+                .map(|cached| SubscriptionState::Ready(Ok(cached.snapshot.clone())))
+                .unwrap_or(SubscriptionState::Waiting)
         } else {
-            None
+            SubscriptionState::Waiting
         };
         self.subscriptions.insert(
             handle,
@@ -173,7 +204,7 @@ impl FsCache {
                 path,
                 relative: relative.to_owned(),
                 request,
-                outcome,
+                state,
                 query,
                 registration,
             },
@@ -184,57 +215,55 @@ impl FsCache {
 
     fn attach(&mut self, handle: u64, scheduler: &JobScheduler) {
         let subscription = self.subscriptions.get_mut(&handle).unwrap();
-        if subscription.outcome.is_some() {
+        if !matches!(subscription.state, SubscriptionState::Waiting) {
             return;
         }
         match subscription.ready() {
             Ok(true) => {}
             Ok(false) => return,
             Err(error) => {
-                subscription.outcome = Some(Err(error));
+                subscription.state = SubscriptionState::Ready(Err(error));
                 return;
             }
         }
-        if let Some(flight) = self.flights.get_mut(&subscription.path) {
+        let entry = self.entries.entry(subscription.path.clone()).or_default();
+        if let Some(flight) = &mut entry.flight {
             flight.subscribers.insert(handle);
+            subscription.state = SubscriptionState::Reading;
             return;
         }
         match scheduler.start_fs(subscription.path.to_string_lossy().into_owned()) {
             Ok(Some(job)) => {
-                self.flights.insert(
-                    subscription.path.clone(),
-                    Flight {
-                        job,
-                        subscribers: HashSet::from([handle]),
-                        binding: CacheBinding::new(&subscription.query),
-                    },
-                );
+                entry.flight = Some(Flight {
+                    job,
+                    subscribers: HashSet::from([handle]),
+                    binding: CacheBinding::new(&subscription.query),
+                });
+                subscription.state = SubscriptionState::Reading;
             }
             // A full queue leaves a live subscription to retry on the next poll.
             Ok(None) => {}
             Err(error) => {
-                self.subscriptions.get_mut(&handle).unwrap().outcome =
-                    Some(Err(format!("{error:#}")));
+                subscription.state = SubscriptionState::Ready(Err(format!("{error:#}")));
             }
         }
     }
 
     fn publish(&mut self, path: &Path, outcome: Outcome, binding: CacheBinding) {
         if let Ok(snapshot) = &outcome {
-            self.ready.insert(
-                path.to_owned(),
-                CachedSnapshot {
-                    snapshot: snapshot.clone(),
-                    binding,
-                },
-            );
+            self.entries.entry(path.to_owned()).or_default().snapshot = Some(CachedSnapshot {
+                snapshot: snapshot.clone(),
+                binding,
+            });
         }
         for subscription in self.subscriptions.values_mut() {
-            if subscription.path == path && subscription.outcome.is_none() {
-                subscription.outcome = match subscription.ready() {
-                    Ok(true) => Some(outcome.clone()),
-                    Ok(false) => None,
-                    Err(error) => Some(Err(error)),
+            if subscription.path == path
+                && !matches!(subscription.state, SubscriptionState::Ready(_))
+            {
+                subscription.state = match subscription.ready() {
+                    Ok(true) => SubscriptionState::Ready(outcome.clone()),
+                    Ok(false) => SubscriptionState::Waiting,
+                    Err(error) => SubscriptionState::Ready(Err(error)),
                 };
             }
         }
@@ -242,34 +271,36 @@ impl FsCache {
 
     fn pump(&mut self, scheduler: &JobScheduler) {
         let completed = self
-            .flights
+            .entries
             .iter()
-            .filter_map(|(path, flight)| match flight.job.result.try_recv() {
-                Ok(outcome) => Some((path.clone(), outcome)),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some((
-                    path.clone(),
-                    Err("background service stopped without a result".into()),
-                )),
+            .filter_map(|(path, entry)| {
+                let flight = entry.flight.as_ref()?;
+                let outcome = match flight.job.result.try_recv() {
+                    Ok(outcome) => outcome,
+                    Err(TryRecvError::Empty) => return None,
+                    Err(TryRecvError::Disconnected) => {
+                        Err("background service stopped without a result".into())
+                    }
+                };
+                Some((path.clone(), outcome))
             })
             .collect::<Vec<_>>();
         for (path, outcome) in completed {
-            let flight = self.flights.remove(&path).unwrap();
+            let flight = self.entries.get_mut(&path).unwrap().flight.take().unwrap();
             self.publish(&path, outcome, flight.binding);
         }
-        let mut pending = Vec::new();
-        for (handle, subscription) in &self.subscriptions {
-            if subscription.outcome.is_some() {
-                continue;
-            }
-            if self.flights.contains_key(&subscription.path) {
-                continue;
-            }
-            pending.push(*handle);
-        }
+        let pending = self
+            .subscriptions
+            .iter()
+            .filter_map(|(handle, subscription)| {
+                matches!(subscription.state, SubscriptionState::Waiting).then_some(*handle)
+            })
+            .collect::<Vec<_>>();
         for handle in pending {
             self.attach(handle, scheduler);
         }
+        self.entries
+            .retain(|_, entry| entry.snapshot.is_some() || entry.flight.is_some());
     }
 
     pub(crate) fn poll(&mut self, handle: u64, scheduler: &JobScheduler) -> Option<QueryPoll> {
@@ -277,11 +308,17 @@ impl FsCache {
             return None;
         }
         self.pump(scheduler);
-        if self.subscriptions[&handle].outcome.is_none() {
+        if !matches!(
+            self.subscriptions[&handle].state,
+            SubscriptionState::Ready(_)
+        ) {
             return Some(QueryPoll::Pending);
         }
-        let subscription = self.subscriptions.remove(&handle).unwrap();
-        let result = subscription.outcome.unwrap().and_then(|snapshot| {
+        let subscription = self.detach(handle).unwrap();
+        let SubscriptionState::Ready(outcome) = subscription.state else {
+            unreachable!()
+        };
+        let result = outcome.and_then(|snapshot| {
             snapshot
                 .response(&subscription.relative, subscription.request)
                 .map_err(|error| format!("{error:#}"))
@@ -301,9 +338,17 @@ impl FsCache {
         if refresh {
             self.invalidate();
         }
-        let (outcome, binding) = if let Some(cached) = self.ready.get(&path) {
+        let (outcome, binding) = if let Some(cached) = self
+            .entries
+            .get(&path)
+            .and_then(|entry| entry.snapshot.as_ref())
+        {
             (Ok(cached.snapshot.clone()), cached.binding.clone())
-        } else if let Some(flight) = self.flights.remove(&path) {
+        } else if let Some(flight) = self
+            .entries
+            .get_mut(&path)
+            .and_then(|entry| entry.flight.take())
+        {
             let outcome = flight
                 .job
                 .result

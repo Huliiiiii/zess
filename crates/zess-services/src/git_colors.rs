@@ -47,7 +47,7 @@ impl GitColors {
 
 impl Workspace {
     pub(crate) fn refresh_git_colors(&self, cancellation: &Cancellation) -> Result<()> {
-        let configured = zess_git::Repository::open(&self.root)?.diff_colors(cancellation)?;
+        let configured = self.repository()?.diff_colors(cancellation)?;
         let mut colors = GitColors::default();
         if let Some(added) = configured.added {
             colors.added = parse_style(&added)?;

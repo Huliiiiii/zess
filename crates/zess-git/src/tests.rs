@@ -91,6 +91,111 @@ fn decorations_preserve_staging_and_rename_identity_without_line_counts() {
 }
 
 #[test]
+fn status_and_decorations_preserve_workspace_relative_git_paths() {
+    let repo = Repository::new();
+    fs::create_dir_all(repo.0.join("sub/deep")).unwrap();
+    for name in ["sub/deep/old", "sub/deep/deleted", "outside"] {
+        fs::write(repo.0.join(name), "baseline\n").unwrap();
+    }
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "--quiet", "-m", "baseline"]);
+    repo.git(&["mv", "sub/deep/old", "sub/deep/renamed"]);
+    fs::remove_file(repo.0.join("sub/deep/deleted")).unwrap();
+    fs::write(repo.0.join("sub/deep/untracked"), "new\n").unwrap();
+    fs::write(repo.0.join("outside"), "modified\n").unwrap();
+
+    for (directory, prefix, count) in [("", "sub/", 4), ("sub", "", 3)] {
+        let repository = crate::Repository::open(repo.0.join(directory)).unwrap();
+        let entries = repository.status(&Execute).unwrap();
+        let decorations = repository.decorations(&Execute).unwrap();
+        assert_eq!(entries.len(), count);
+        assert_eq!(decorations.len(), count);
+        for name in ["deleted", "renamed", "untracked"] {
+            let path = format!("{prefix}deep/{name}");
+            let original = (name == "renamed").then(|| format!("{prefix}deep/old"));
+            let entry = entries.iter().find(|entry| entry.path == path).unwrap();
+            assert_eq!(entry.original_path, original);
+            let decoration = decorations.iter().find(|entry| entry.path == path).unwrap();
+            assert_eq!(decoration.original_path, original);
+        }
+    }
+}
+
+#[test]
+fn status_resolves_the_reported_repository_root_before_projecting_paths() {
+    struct ReportedRoot(PathBuf);
+    impl Execution for ReportedRoot {
+        fn check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn output(
+            &self,
+            command: &zess_platform::ProcessSpec,
+        ) -> anyhow::Result<std::process::Output> {
+            let mut output = Execute.output(command)?;
+            if command.args.iter().any(|arg| arg == "--show-toplevel") {
+                output.stdout = format!("{}\n", self.0.display()).into_bytes();
+            }
+            Ok(output)
+        }
+
+        fn output_with_input(
+            &self,
+            command: &zess_platform::ProcessSpec,
+            input: &[u8],
+        ) -> anyhow::Result<std::process::Output> {
+            Execute.output_with_input(command, input)
+        }
+    }
+
+    let repo = Repository::new();
+    repo.commit("baseline\n");
+    fs::create_dir(repo.0.join("sub")).unwrap();
+    fs::write(repo.0.join("file"), "modified\n").unwrap();
+    let repository = crate::Repository::open(&repo.0).unwrap();
+    let entries = repository
+        .status(&ReportedRoot(repo.0.join("sub/..")))
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "file");
+    assert_eq!(entries[0].line_stats.unwrap().additions, 1);
+    assert_eq!(entries[0].line_stats.unwrap().deletions, 1);
+}
+
+#[test]
+fn read_only_queries_do_not_run_required_worktree_filters() {
+    let repo = Repository::new();
+    repo.commit("baseline\n");
+    fs::write(repo.0.join(".gitattributes"), "file filter=blocked\n").unwrap();
+    repo.git(&[
+        "config",
+        "filter.blocked.clean",
+        "zess-nonexistent-clean-filter",
+    ]);
+    repo.git(&[
+        "config",
+        "filter.blocked.process",
+        "zess-nonexistent-process-filter",
+    ]);
+    repo.git(&["config", "filter.blocked.required", "true"]);
+    fs::write(repo.0.join("file"), "modified\n").unwrap();
+
+    let repository = crate::Repository::open(&repo.0).unwrap();
+    let status = repository.status(&Execute).unwrap();
+    assert!(status.iter().any(|entry| entry.path == "file"));
+    let diff = repository
+        .diff("file", None, Some(DiffSide::Unstaged), &Execute)
+        .unwrap();
+    assert!(diff.contains("-baseline\n+modified\n"), "{diff}");
+    let commits = repository.log(&Execute).unwrap();
+    assert_eq!(commits.len(), 1);
+    let files = repository.commit_files(&commits[0].oid, &Execute).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "file");
+}
+
+#[test]
 fn every_unmerged_index_state_is_a_conflict() {
     use std::io::Write;
     use std::process::Stdio;
@@ -141,32 +246,31 @@ fn every_unmerged_index_state_is_a_conflict() {
 }
 
 pub(super) struct Execute;
-impl Execution for Execute {
+impl zess_platform::Cancellation for Execute {
     fn check(&self) -> anyhow::Result<()> {
         Ok(())
     }
-    fn output(&self, command: &mut Command) -> anyhow::Result<std::process::Output> {
-        Ok(command.output()?)
+}
+impl Execution for Execute {
+    fn environment(&self, name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+        use zess_platform::ProcessRunner;
+        zess_platform::SystemProcessRunner.environment(name)
+    }
+
+    fn check(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn output(&self, command: &zess_platform::ProcessSpec) -> anyhow::Result<std::process::Output> {
+        use zess_platform::ProcessRunner;
+        zess_platform::SystemProcessRunner.output(command, None, self)
     }
     fn output_with_input(
         &self,
-        command: &mut Command,
+        command: &zess_platform::ProcessSpec,
         input: &[u8],
     ) -> anyhow::Result<std::process::Output> {
-        use std::io::Write;
-        let mut child = command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
-        let mut stdin = child.stdin.take().unwrap();
-        let writer = std::thread::scope(|scope| {
-            let writer = scope.spawn(move || stdin.write_all(input));
-            let output = child.wait_with_output();
-            writer.join().unwrap().unwrap();
-            output
-        });
-        Ok(writer?)
+        use zess_platform::ProcessRunner;
+        zess_platform::SystemProcessRunner.output(command, Some(input), self)
     }
 }
 
@@ -180,12 +284,19 @@ fn explicit_pager_renders_the_same_patch_as_the_operation_after_worktree_changes
     }
 
     impl Execution for ChangeAfterDiff<'_> {
+        fn environment(&self, name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+            Execute.environment(name)
+        }
+
         fn check(&self) -> anyhow::Result<()> {
             Execute.check()
         }
 
-        fn output(&self, command: &mut Command) -> anyhow::Result<std::process::Output> {
-            let raw_diff = command.get_args().any(|arg| arg == "--no-ext-diff");
+        fn output(
+            &self,
+            command: &zess_platform::ProcessSpec,
+        ) -> anyhow::Result<std::process::Output> {
+            let raw_diff = command.args.iter().any(|arg| arg == "--no-ext-diff");
             let output = Execute.output(command)?;
             if raw_diff && !self.changed.replace(true) {
                 fs::write(self.path, "worktree B\n")?;
@@ -195,7 +306,7 @@ fn explicit_pager_renders_the_same_patch_as_the_operation_after_worktree_changes
 
         fn output_with_input(
             &self,
-            command: &mut Command,
+            command: &zess_platform::ProcessSpec,
             input: &[u8],
         ) -> anyhow::Result<std::process::Output> {
             Execute.output_with_input(command, input)
@@ -231,7 +342,10 @@ fn explicit_pager_renders_the_same_patch_as_the_operation_after_worktree_changes
                 original_path: None,
             }],
             &crate::DiffRenderOptions {
-                pager: Some("sed -n p".into()),
+                pager: Some(crate::PagerCommand {
+                    program: "sed".into(),
+                    args: vec!["-n".into(), "p".into()],
+                }),
                 ..Default::default()
             },
             &execution,

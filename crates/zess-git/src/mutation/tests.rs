@@ -124,7 +124,7 @@ fn conflicts_reject_the_entire_selection_before_changing_the_index() {
     let repo = Fixture::new();
     repo.commit("head\n");
     let head = repo.git(&["rev-parse", "HEAD:file"]);
-    let mut command = std::process::Command::new("git");
+    let mut command = zess_platform::ProcessSpec::new("git");
     command
         .args(["update-index", "--index-info"])
         .current_dir(&repo.0);
@@ -137,7 +137,7 @@ fn conflicts_reject_the_entire_selection_before_changing_the_index() {
     );
     assert!(
         Execute
-            .output_with_input(&mut command, index.as_bytes())
+            .output_with_input(&command, index.as_bytes())
             .unwrap()
             .status
             .success()

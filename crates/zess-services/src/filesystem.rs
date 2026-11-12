@@ -1,11 +1,10 @@
 use std::collections::HashSet;
-use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
 
 use crate::query::{QueryRequest, QueryResult};
 use anyhow::{Context, Result, bail};
-use ignore::WalkBuilder;
+use zess_platform::WalkOptions;
 
 use crate::jobs::Cancellation;
 use crate::workspace::Workspace;
@@ -157,13 +156,19 @@ impl Workspace {
 
     fn read_fs_inner(&self, relative: &str, cancellation: &Cancellation) -> Result<Snapshot> {
         let path = self.path(relative)?;
-        let metadata = fs::metadata(&path).context("cannot inspect preview path")?;
+        let metadata = self
+            .filesystem
+            .metadata(&path)
+            .context("cannot inspect preview path")?;
 
         if metadata.is_dir() {
             return self.read_directory(relative, cancellation);
         }
 
-        let mut file = File::open(&path).context("cannot open preview file")?;
+        let mut file = self
+            .filesystem
+            .open_read(&path)
+            .context("cannot open preview file")?;
         let mut bytes = Vec::with_capacity(PREVIEW_LIMIT.min(metadata.len() as usize));
         let mut chunk = [0; 16 * 1024];
 
@@ -219,39 +224,39 @@ impl Workspace {
 
         cancellation.check()?;
 
-        for entry in WalkBuilder::new(&path)
-            .max_depth(Some(1))
-            .hidden(false)
-            .ignore(false)
-            .require_git(false)
-            .build()
+        for path in self
+            .filesystem
+            .walk_directory(
+                &path,
+                WalkOptions {
+                    max_depth: Some(1),
+                    hidden: false,
+                    ignore: false,
+                    require_git: false,
+                },
+            )
+            .context("cannot read directory ignore rules")?
         {
             cancellation.check()?;
-
-            let entry = entry.context("cannot read directory ignore rules")?;
-
-            if let Some(error) = entry.error() {
-                return Err(error.clone()).context("cannot read directory ignore rules");
-            }
-
-            if entry.depth() == 1 {
-                visible.insert(entry.into_path());
-            }
+            visible.insert(path);
         }
 
         let mut entries = Vec::new();
 
         cancellation.check()?;
 
-        for entry in fs::read_dir(&path).context("cannot list directory")? {
+        for entry in self
+            .filesystem
+            .read_dir(&path)
+            .context("cannot list directory")?
+        {
             cancellation.check()?;
 
-            let entry = entry?;
             let name = entry
                 .file_name()
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("directory contains a filename that is not UTF-8"))?;
-            let metadata = entry.path().symlink_metadata()?;
+            let metadata = self.filesystem.symlink_metadata(&entry.path())?;
             let kind = if metadata.is_dir() {
                 DirectoryEntryKind::Directory
             } else if metadata.is_symlink() {

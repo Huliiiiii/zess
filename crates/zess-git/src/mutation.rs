@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use zess_platform::ProcessSpec;
+
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::{Execution, GitEntry, Repository, StagingStatus, validate_relative};
@@ -102,7 +104,7 @@ impl Repository {
                         restore.insert(original.clone());
                     }
                     if entry.untracked || indexed.is_empty() {
-                        if let Ok(metadata) = path.symlink_metadata() {
+                        if let Ok(metadata) = self.file_system.symlink_metadata(&path) {
                             ensure!(!metadata.is_dir(), "Cannot delete an untracked directory");
                             delete.push(path);
                         }
@@ -114,7 +116,8 @@ impl Repository {
                     self.mutate_paths(&["restore", "--worktree"], &restore, execution)?;
                 }
                 for path in delete {
-                    std::fs::remove_file(&path)
+                    self.file_system
+                        .remove_file(&path)
                         .with_context(|| format!("delete untracked file {}", path.display()))?;
                 }
                 Ok(())
@@ -132,8 +135,8 @@ impl Repository {
 
     // Mutation commands must preserve configured clean/smudge/process filters;
     // Repository::git_command deliberately disables them for read-only diffs.
-    fn file_mutation_command(&self, args: &[&str]) -> std::process::Command {
-        let mut command = std::process::Command::new("git");
+    fn file_mutation_command(&self, args: &[&str]) -> ProcessSpec {
+        let mut command = ProcessSpec::new("git");
         command
             .args([
                 "--no-pager",
@@ -158,12 +161,12 @@ impl Repository {
         let mut args = vec!["--literal-pathspecs"];
         args.extend_from_slice(operation);
         args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
-        let mut command = self.file_mutation_command(&args);
+        let command = self.file_mutation_command(&args);
         let input = paths
             .iter()
             .flat_map(|path| path.bytes().chain([0]))
             .collect::<Vec<_>>();
-        let output = execution.output_with_input(&mut command, &input)?;
+        let output = execution.output_with_input(&command, &input)?;
         if !output.status.success() {
             bail!(
                 "git {}: {}",

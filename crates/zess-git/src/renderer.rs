@@ -1,4 +1,6 @@
-use std::{collections::HashSet, process::Command};
+use std::collections::HashSet;
+
+use zess_platform::ProcessSpec;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -8,10 +10,18 @@ use crate::{DiffSide, DiffSource, DiffTarget, Execution, RenderedDiff, Repositor
 #[cfg(test)]
 mod tests;
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PagerCommand {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DiffRenderOptions {
     pub width: Option<usize>,
-    pub pager: Option<String>,
+    pub pager: Option<PagerCommand>,
     #[serde(default)]
     pub file_header: bool,
 }
@@ -19,7 +29,7 @@ pub struct DiffRenderOptions {
 pub struct DiffRenderer {
     file_header: bool,
     width: Option<usize>,
-    pager: Option<String>,
+    pager: Option<PagerCommand>,
     external: bool,
     textconv_drivers: HashSet<String>,
     external_drivers: HashSet<String>,
@@ -37,34 +47,39 @@ impl Repository {
         );
         cancellation.check()?;
         if let Some(pager) = &options.pager {
-            anyhow::ensure!(!pager.trim().is_empty(), "diff pager must not be empty");
+            anyhow::ensure!(
+                !pager.program.trim().is_empty(),
+                "diff pager program must not be empty"
+            );
+            anyhow::ensure!(
+                !pager.program.contains('\0') && pager.args.iter().all(|arg| !arg.contains('\0')),
+                "diff pager program and arguments must not contain NUL"
+            );
             return Ok(DiffRenderer {
                 file_header: options.file_header,
                 width: options.width,
-                pager: (pager.trim() != "cat").then(|| pager.clone()),
+                pager: Some(pager.clone()),
                 external: false,
                 textconv_drivers: HashSet::new(),
                 external_drivers: HashSet::new(),
             });
         }
-        let mut command = Command::new("git");
+        let mut command = ProcessSpec::new("git");
         command
             .args([
                 "config",
                 "--null",
                 "--get-regexp",
-                r"^(core\.pager|pager\.diff|diff\.external|diff\..*\.(command|textconv))$",
+                r"^(diff\.external|diff\..*\.(command|textconv))$",
             ])
             .current_dir(&self.root);
-        let output = cancellation.output(&mut command)?;
+        let output = cancellation.output(&command)?;
         if !output.status.success() && output.status.code() != Some(1) {
             bail!(
                 "read Git diff renderer configuration: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let mut core_pager = None;
-        let mut diff_pager = None;
         let mut external = false;
         let mut textconv_drivers = HashSet::new();
         let mut external_drivers = HashSet::new();
@@ -77,12 +92,9 @@ impl Repository {
                 .context("Git diff renderer configuration is not UTF-8")?;
             let (key, value) = match record.split_once('\n') {
                 Some(pair) => pair,
-                None if record == "pager.diff" => (record, "true"),
                 None => bail!("Git diff renderer configuration {record} requires a value"),
             };
             match key {
-                "core.pager" => core_pager = Some(value.to_owned()),
-                "pager.diff" => diff_pager = Some(value.to_owned()),
                 "diff.external" => external = !value.is_empty(),
                 _ => {
                     if let Some((driver, option)) = key
@@ -103,59 +115,17 @@ impl Repository {
                 }
             }
         }
-        external |= std::env::var_os("GIT_EXTERNAL_DIFF").is_some();
-        let git_pager = std::env::var_os("GIT_PAGER")
-            .map(|pager| {
-                pager
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("GIT_PAGER is not UTF-8"))
-            })
-            .transpose()?;
-        let pager = select_pager(
-            git_pager,
-            diff_pager,
-            core_pager,
-            std::env::var("PAGER").ok(),
-        );
+        external |= cancellation
+            .environment(std::ffi::OsStr::new("GIT_EXTERNAL_DIFF"))
+            .is_some();
         Ok(DiffRenderer {
             file_header: options.file_header,
             width: options.width,
-            pager: pager.filter(|pager| !pager.trim().is_empty() && pager.trim() != "cat"),
+            pager: None,
             external,
             textconv_drivers,
             external_drivers,
         })
-    }
-}
-
-fn select_pager(
-    git_pager: Option<String>,
-    diff_pager: Option<String>,
-    core_pager: Option<String>,
-    pager: Option<String>,
-) -> Option<String> {
-    if diff_pager.as_deref().is_some_and(|value| {
-        ["false", "no", "off", ""]
-            .into_iter()
-            .any(|disabled| value.eq_ignore_ascii_case(disabled))
-            || value.parse::<i64>() == Ok(0)
-    }) {
-        return None;
-    }
-    if let Some(pager) = git_pager {
-        return Some(pager);
-    }
-    match diff_pager.as_deref() {
-        Some(value)
-            if ["true", "yes", "on"]
-                .into_iter()
-                .any(|enabled| value.eq_ignore_ascii_case(enabled))
-                || value.parse::<i64>().is_ok() =>
-        {
-            core_pager.or(pager)
-        }
-        None => core_pager.or(pager),
-        Some(pager) => Some(pager.to_owned()),
     }
 }
 
@@ -199,10 +169,11 @@ impl DiffRenderer {
         if !external && self.pager.is_none() {
             return Ok(None);
         }
-        let repository_root = gix::discover(&repository.root)?
-            .workdir()
-            .context("Git repository has no working directory")?
-            .canonicalize()?;
+        let git = repository
+            .queries
+            .discover(&repository.root)?
+            .context("Git repository not found")?;
+        let repository_root = repository.file_system.canonicalize(&git.worktree)?;
         let text = if external {
             repository.rendered_git_diff(
                 source,
@@ -221,10 +192,9 @@ impl DiffRenderer {
                 repository_root,
             }));
         };
-        let mut command = Command::new("sh");
+        let mut command = ProcessSpec::new(&pager.program);
         command
-            .arg("-c")
-            .arg(pager)
+            .args(&pager.args)
             .current_dir(&repository.root)
             .env("GIT_PAGER", "cat")
             .env("DELTA_PAGER", "cat")
@@ -238,7 +208,7 @@ impl DiffRenderer {
                 .env("DFT_WIDTH", width.to_string());
         }
         let output = cancellation
-            .output_with_input(&mut command, text.as_bytes())
+            .output_with_input(&command, text.as_bytes())
             .context("run configured Git diff pager")?;
         if !output.status.success() {
             bail!(
@@ -315,17 +285,24 @@ impl Repository {
         if !untracked && let Some(original) = &target.original_path {
             args.push(original);
         }
-        let mut command = self.git_command(&args, cancellation)?;
+        let mut command = match source {
+            DiffSource::Changes { .. } => self.git_worktree_command(cancellation)?,
+            DiffSource::Commit { .. } => self.git_command(),
+        };
+        command.args(&args);
         command.env("OSC1717", "V1");
         if let Some(width) = width {
             command
                 .env("COLUMNS", width.to_string())
                 .env("DFT_WIDTH", width.to_string());
         }
-        if std::env::var_os("DFT_COLOR").is_none() {
+        if cancellation
+            .environment(std::ffi::OsStr::new("DFT_COLOR"))
+            .is_none()
+        {
             command.env("DFT_COLOR", "always");
         }
-        let output = cancellation.output(&mut command)?;
+        let output = cancellation.output(&command)?;
         if !output.status.success() && !(untracked && output.status.code() == Some(1)) {
             bail!(
                 "render configured Git diff: {}",

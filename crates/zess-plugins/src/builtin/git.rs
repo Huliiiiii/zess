@@ -862,11 +862,18 @@ impl BufferPlugin for Git {
             .options
             .get("diff-pager")
             .map(|value| {
-                value
-                    .as_str()
-                    .filter(|pager| !pager.trim().is_empty())
-                    .context("diff-pager must be a non-empty shell command")
-                    .map(str::to_owned)
+                let pager: zess_git::PagerCommand = serde_json::from_value(value.clone())
+                    .context("diff-pager must be an object with a program string and an args array of strings")?;
+                anyhow::ensure!(
+                    !pager.program.trim().is_empty(),
+                    "diff-pager program must not be empty"
+                );
+                anyhow::ensure!(
+                    !pager.program.contains('\0')
+                        && pager.args.iter().all(|arg| !arg.contains('\0')),
+                    "diff-pager program and arguments must not contain NUL"
+                );
+                Ok(pager)
             })
             .transpose()?;
         let diff_file_header = input

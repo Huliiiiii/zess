@@ -1,5 +1,7 @@
 use super::*;
 
+mod environment;
+
 #[test]
 fn renderings_keep_the_repository_root_when_the_workspace_is_a_subdirectory() {
     let fixture = crate::tests::Repository::new();
@@ -11,7 +13,10 @@ fn renderings_keep_the_repository_root_when_the_workspace_is_a_subdirectory() {
         .diff_renderer(&crate::DiffRenderOptions::default(), &crate::tests::Execute)
         .unwrap();
     renderer.external = false;
-    renderer.pager = Some("cat".into());
+    renderer.pager = Some(PagerCommand {
+        program: "cat".into(),
+        args: Vec::new(),
+    });
     let rendered = renderer
         .render(
             &repository,
@@ -42,7 +47,13 @@ fn pagers_receive_the_requested_view_width() {
                 &DiffRenderOptions {
                     file_header: false,
                     width: Some(width),
-                    pager: Some("printf '%s:%s\\n' \"$COLUMNS\" \"$DFT_WIDTH\"; cat".into()),
+                    pager: Some(PagerCommand {
+                        program: "sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            "printf '%s:%s\\n' \"$COLUMNS\" \"$DFT_WIDTH\"; cat".into(),
+                        ],
+                    }),
                 },
                 &crate::tests::Execute,
             )
@@ -81,7 +92,13 @@ fn configured_pagers_filter_the_external_rendering_instead_of_the_applicable_pat
     let mut renderer = repository
         .diff_renderer(&crate::DiffRenderOptions::default(), &crate::tests::Execute)
         .unwrap();
-    renderer.pager = Some("test \"$OSC1717\" = V1 && sed 's/^rendered:/paged:/'".into());
+    renderer.pager = Some(PagerCommand {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            "test \"$OSC1717\" = V1 && sed 's/^rendered:/paged:/'".into(),
+        ],
+    });
     let raw = fixture.diff(DiffSide::Unstaged);
     let rendered = renderer
         .render(
@@ -104,65 +121,68 @@ fn configured_pagers_filter_the_external_rendering_instead_of_the_applicable_pat
 }
 
 #[test]
-fn pager_configuration_respects_git_precedence_and_explicit_disabling() {
-    for (git_pager, diff_pager, core_pager, pager, expected) in [
-        (
-            Some("environment"),
-            Some("diff"),
-            Some("core"),
-            Some("fallback"),
-            Some("environment"),
-        ),
-        (
-            Some(""),
-            Some("diff"),
-            Some("core"),
-            Some("fallback"),
-            Some(""),
-        ),
-        (
-            None,
-            Some("diff"),
-            Some("core"),
-            Some("fallback"),
-            Some("diff"),
-        ),
-        (None, Some("false"), Some("core"), Some("fallback"), None),
-        (
-            Some("environment"),
-            Some("FALSE"),
-            Some("core"),
-            Some("fallback"),
-            None,
-        ),
-        (None, Some(""), Some("core"), Some("fallback"), None),
-        (
-            None,
-            Some("true"),
-            Some("core"),
-            Some("fallback"),
-            Some("core"),
-        ),
-        (None, None, Some("core"), Some("fallback"), Some("core")),
-        (
-            None,
-            Some("2"),
-            Some("core"),
-            Some("fallback"),
-            Some("core"),
-        ),
-        (None, None, None, Some("fallback"), Some("fallback")),
-        (None, None, None, None, None),
-    ] {
-        assert_eq!(
-            select_pager(
-                git_pager.map(str::to_owned),
-                diff_pager.map(str::to_owned),
-                core_pager.map(str::to_owned),
-                pager.map(str::to_owned)
+fn git_pager_configuration_does_not_enable_a_zess_pager() {
+    let fixture = crate::tests::Repository::new();
+    fixture.commit("old\n");
+    fixture.git(&["config", "core.pager", "printf inherited-pager"]);
+    fixture.git(&["config", "pager.diff", "true"]);
+    fixture.git(&["config", "diff.external", ""]);
+    let repository = Repository::open(&fixture.0).unwrap();
+    let renderer = repository
+        .diff_renderer(&DiffRenderOptions::default(), &crate::tests::Execute)
+        .unwrap();
+    assert!(
+        renderer
+            .render(
+                &repository,
+                &DiffSource::Changes {
+                    side: DiffSide::Unstaged
+                },
+                &DiffTarget {
+                    path: "file".into(),
+                    original_path: None
+                },
+                "patch",
+                &crate::tests::Execute
             )
-            .as_deref(),
-            expected
-        );
-    }
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn pager_arguments_are_passed_literally_in_the_repository_directory() {
+    let fixture = crate::tests::Repository::new();
+    fixture.commit("old\n");
+    let name = "literal $HOME; 'quoted file";
+    std::fs::write(fixture.0.join(name), "pager output\n").unwrap();
+    let repository = Repository::open(&fixture.0).unwrap();
+    let renderer = repository
+        .diff_renderer(
+            &DiffRenderOptions {
+                pager: Some(PagerCommand {
+                    program: "cat".into(),
+                    args: vec![name.into()],
+                }),
+                ..Default::default()
+            },
+            &crate::tests::Execute,
+        )
+        .unwrap();
+    let rendered = renderer
+        .render(
+            &repository,
+            &DiffSource::Changes {
+                side: DiffSide::Unstaged,
+            },
+            &DiffTarget {
+                path: "file".into(),
+                original_path: None,
+            },
+            "patch",
+            &crate::tests::Execute,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(rendered.text, "pager output\n");
 }
