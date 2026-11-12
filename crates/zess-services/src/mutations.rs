@@ -1,5 +1,5 @@
 use anyhow::Result;
-use zess_git::mutation::FileMutationRequest;
+use zess_git::{ignore::IgnoreRequest, mutation::FileMutationRequest};
 
 /// Submitted mutations finish once, independently of view and query lifetimes.
 pub struct FileMutationTask {
@@ -31,15 +31,41 @@ impl FileMutationTask {
 }
 
 impl crate::NativeServices {
+    pub fn start_ignore(&self, request: IgnoreRequest) -> Result<FileMutationTask> {
+        let workspace = self.workspace.clone();
+        let (sender, result) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("zess-git-ignore".into())
+            .spawn(move || {
+                let outcome = workspace
+                    .repository()
+                    .and_then(|repository| {
+                        repository.ignore_paths(
+                            request,
+                            &crate::jobs::Cancellation::new(workspace.processes.clone()),
+                        )
+                    })
+                    .map_err(|error| format!("{error:#}"));
+                let _ = sender.send(outcome);
+            })?;
+        Ok(FileMutationTask {
+            state: MutationState::Pending(result),
+        })
+    }
+
     pub fn start_file_mutation(&self, request: FileMutationRequest) -> Result<FileMutationTask> {
         let workspace = self.workspace.clone();
         let (sender, result) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("zess-git-files".into())
             .spawn(move || {
-                let outcome = zess_git::Repository::open(&workspace.root)
+                let outcome = workspace
+                    .repository()
                     .and_then(|repository| {
-                        repository.mutate_files(request, &crate::jobs::Cancellation::default())
+                        repository.mutate_files(
+                            request,
+                            &crate::jobs::Cancellation::new(workspace.processes.clone()),
+                        )
                     })
                     .map_err(|error| format!("{error:#}"));
                 let _ = sender.send(outcome);

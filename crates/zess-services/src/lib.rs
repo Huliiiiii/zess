@@ -1,11 +1,14 @@
 use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use zess_platform::{
+    FileSystem, NativeFileSystem, NativeWatchBackend, ProcessRunner, SystemProcessRunner,
+    WatchBackend,
+};
 
 mod file_watch;
 mod filesystem;
@@ -42,15 +45,46 @@ pub struct NativeServices {
 
 impl NativeServices {
     pub fn new(root: PathBuf) -> Result<Self> {
-        let root = root.canonicalize().context("cannot open workspace")?;
+        Self::with_backends(
+            root,
+            Arc::new(NativeFileSystem),
+            Arc::new(SystemProcessRunner),
+            Arc::new(NativeWatchBackend),
+        )
+    }
 
-        if !root.is_dir() {
+    pub fn with_backends(
+        root: PathBuf,
+        filesystem: Arc<dyn FileSystem>,
+        processes: Arc<dyn ProcessRunner>,
+        watches: Arc<dyn WatchBackend>,
+    ) -> Result<Self> {
+        let git_queries = Arc::new(zess_git::NativeGitQueries::new(filesystem.clone()));
+        Self::with_git_queries(root, filesystem, processes, watches, git_queries)
+    }
+
+    pub fn with_git_queries(
+        root: PathBuf,
+        filesystem: Arc<dyn FileSystem>,
+        processes: Arc<dyn ProcessRunner>,
+        watches: Arc<dyn WatchBackend>,
+        git_queries: Arc<dyn zess_git::GitQueries>,
+    ) -> Result<Self> {
+        let root = filesystem
+            .canonicalize(&root)
+            .context("cannot open workspace")?;
+
+        if !filesystem.metadata(&root)?.is_dir() {
             bail!("workspace must be a directory");
         }
 
         Ok(Self {
             workspace: Workspace {
                 root,
+                filesystem,
+                processes,
+                watches,
+                git_queries,
                 git_colors: Default::default(),
                 #[cfg(test)]
                 read_hook: None,
@@ -61,6 +95,10 @@ impl NativeServices {
             jobs: HashMap::new(),
             scheduler: None,
         })
+    }
+
+    pub fn file_system(&self) -> Arc<dyn FileSystem> {
+        self.workspace.filesystem.clone()
     }
 
     pub fn git_styles(&self) -> HashMap<String, zess_ui::TextStyle> {
@@ -189,17 +227,13 @@ impl NativeServices {
         ) {
             self.filesystem.start(&request, handle, scheduler, query)?;
         } else {
-            let revision = query.revision();
             let registration = query.registration();
             self.jobs.insert(
                 handle,
                 BackgroundJob {
-                    job: None,
-                    registration,
+                    state: BackgroundState::WaitingRegistration { registration },
                     request,
                     query,
-                    revision,
-                    status_progress: None,
                 },
             );
         }
@@ -223,55 +257,11 @@ impl NativeServices {
             .scheduler
             .as_ref()
             .context("background scheduler is unavailable")?;
-        if let Err(error) = state.registration.ready() {
-            self.jobs.remove(&handle);
-            return Ok(QueryPoll::Ready(Err(error)));
-        }
-        let registration = state.query.registration();
-        if !Arc::ptr_eq(&registration, &state.registration) {
-            state.registration = registration;
-            state.status_progress = None;
-            if let Some(previous) = state.job.take() {
-                previous.cancel();
-            }
-        }
-        match state.registration.ready() {
-            Ok(true) => {}
-            Ok(false) => return Ok(QueryPoll::Pending),
-            Err(error) => {
+        match state.poll(scheduler) {
+            Ok(QueryPoll::Pending) => Ok(QueryPoll::Pending),
+            result => {
                 self.jobs.remove(&handle);
-                return Ok(QueryPoll::Ready(Err(error)));
-            }
-        }
-        if state.revision != state.query.revision() {
-            state.status_progress = None;
-            if let Some(previous) = state.job.take() {
-                previous.cancel();
-            }
-            state.revision = state.query.revision();
-        }
-        if state.job.is_none() {
-            let progress = if matches!(state.request, QueryRequest::Status {}) {
-                let (sender, receiver) = std::sync::mpsc::channel();
-                state.status_progress = Some(receiver);
-                Some(sender)
-            } else {
-                None
-            };
-            state.job = scheduler.try_start(state.request.clone(), progress)?;
-        }
-        let Some(job) = &state.job else {
-            return Ok(QueryPoll::Pending);
-        };
-        match job.result.try_recv() {
-            Ok(result) => {
-                self.jobs.remove(&handle);
-                Ok(QueryPoll::Ready(result))
-            }
-            Err(TryRecvError::Empty) => Ok(QueryPoll::Pending),
-            Err(TryRecvError::Disconnected) => {
-                self.jobs.remove(&handle);
-                bail!("background service stopped without a result");
+                result
             }
         }
     }
@@ -281,12 +271,19 @@ impl NativeServices {
             .jobs
             .get_mut(&handle)
             .context("unknown or completed job handle")?;
-        if state.revision != state.query.revision()
-            || !state.query.cache_is_current(&state.registration)
-        {
+        let BackgroundState::Running {
+            registration,
+            revision,
+            status_progress,
+            ..
+        } = &state.state
+        else {
+            return Ok(None);
+        };
+        if *revision != state.query.revision() || !state.query.cache_is_current(registration) {
             return Ok(None);
         }
-        let Some(progress) = &state.status_progress else {
+        let Some(progress) = status_progress else {
             return Ok(None);
         };
         match progress.try_recv() {
@@ -375,7 +372,10 @@ impl NativeServices {
             }
             "text.read" => {
                 let relative = string(args, "path")?;
-                let text = fs::read_to_string(self.workspace.path(relative)?)
+                let text = self
+                    .workspace
+                    .filesystem
+                    .read_to_string(&self.workspace.path(relative)?)
                     .context("cannot read UTF-8 file")?;
 
                 Ok(json!({"path": relative, "text": text}))
@@ -386,7 +386,10 @@ impl NativeServices {
                 let query = self.acquire_query(&request)?;
                 self.wait_for_registration(&query)?;
                 self.workspace
-                    .query(&request, &Cancellation::default())
+                    .query(
+                        &request,
+                        &Cancellation::new(self.workspace.processes.clone()),
+                    )
                     .map(|result| result.into_value(handle))
             }
             _ => bail!("unknown host operation: {operation}"),
@@ -395,19 +398,125 @@ impl NativeServices {
 }
 
 struct BackgroundJob {
-    registration: Arc<Registration>,
-    job: Option<Job<Result<QueryResult, String>>>,
     request: QueryRequest,
     query: Arc<Query>,
-    revision: u64,
-    status_progress: Option<std::sync::mpsc::Receiver<Vec<zess_git::GitEntry>>>,
+    state: BackgroundState,
+}
+
+enum BackgroundState {
+    WaitingRegistration {
+        registration: Arc<Registration>,
+    },
+    WaitingQueue {
+        registration: Arc<Registration>,
+        revision: u64,
+    },
+    Running {
+        registration: Arc<Registration>,
+        revision: u64,
+        job: Job<Result<QueryResult, String>>,
+        status_progress: Option<std::sync::mpsc::Receiver<Vec<zess_git::GitEntry>>>,
+    },
+}
+
+impl BackgroundState {
+    fn registration(&self) -> &Arc<Registration> {
+        match self {
+            Self::WaitingRegistration { registration }
+            | Self::WaitingQueue { registration, .. }
+            | Self::Running { registration, .. } => registration,
+        }
+    }
+
+    fn cancel(&self) {
+        if let Self::Running { job, .. } = self {
+            job.cancel();
+        }
+    }
 }
 
 impl BackgroundJob {
-    fn cancel(self) {
-        if let Some(job) = self.job {
-            job.cancel();
+    fn poll(&mut self, scheduler: &JobScheduler) -> Result<QueryPoll> {
+        // Preserve a failed attempt for its original consumer even when another
+        // consumer has already requested a fresh registration.
+        if let Err(error) = self.state.registration().ready() {
+            self.state.cancel();
+            return Ok(QueryPoll::Ready(Err(error)));
         }
+        let registration = self.query.registration();
+        if !Arc::ptr_eq(&registration, self.state.registration()) {
+            self.state.cancel();
+            self.state = BackgroundState::WaitingRegistration { registration };
+        }
+        if let BackgroundState::WaitingRegistration { registration } = &self.state {
+            match registration.ready() {
+                Ok(true) => {
+                    self.state = BackgroundState::WaitingQueue {
+                        registration: registration.clone(),
+                        revision: self.query.revision(),
+                    };
+                }
+                Ok(false) => return Ok(QueryPoll::Pending),
+                Err(error) => return Ok(QueryPoll::Ready(Err(error))),
+            }
+        }
+        match &self.state {
+            BackgroundState::WaitingQueue {
+                registration,
+                revision,
+            }
+            | BackgroundState::Running {
+                registration,
+                revision,
+                ..
+            } if *revision != self.query.revision() => {
+                self.state.cancel();
+                self.state = BackgroundState::WaitingQueue {
+                    registration: registration.clone(),
+                    revision: self.query.revision(),
+                };
+            }
+            BackgroundState::WaitingRegistration { .. }
+            | BackgroundState::WaitingQueue { .. }
+            | BackgroundState::Running { .. } => {}
+        }
+        if let BackgroundState::WaitingQueue {
+            registration,
+            revision,
+        } = &self.state
+        {
+            let (sender, status_progress) = if matches!(self.request, QueryRequest::Status {}) {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
+            let Some(job) = scheduler.try_start(self.request.clone(), sender)? else {
+                return Ok(QueryPoll::Pending);
+            };
+            self.state = BackgroundState::Running {
+                registration: registration.clone(),
+                revision: *revision,
+                job,
+                status_progress,
+            };
+        }
+        match &self.state {
+            BackgroundState::Running { job, .. } => match job.result.try_recv() {
+                Ok(result) => Ok(QueryPoll::Ready(result)),
+                Err(TryRecvError::Empty) => Ok(QueryPoll::Pending),
+                Err(TryRecvError::Disconnected) => {
+                    bail!("background service stopped without a result")
+                }
+            },
+            BackgroundState::WaitingRegistration { .. } | BackgroundState::WaitingQueue { .. } => {
+                Ok(QueryPoll::Pending)
+            }
+        }
+    }
+
+    fn cancel(self) {
+        self.state.cancel();
     }
 }
 

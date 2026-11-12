@@ -141,32 +141,31 @@ fn every_unmerged_index_state_is_a_conflict() {
 }
 
 pub(super) struct Execute;
-impl Execution for Execute {
+impl zess_platform::Cancellation for Execute {
     fn check(&self) -> anyhow::Result<()> {
         Ok(())
     }
-    fn output(&self, command: &mut Command) -> anyhow::Result<std::process::Output> {
-        Ok(command.output()?)
+}
+impl Execution for Execute {
+    fn environment(&self, name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+        use zess_platform::ProcessRunner;
+        zess_platform::SystemProcessRunner.environment(name)
+    }
+
+    fn check(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn output(&self, command: &zess_platform::ProcessSpec) -> anyhow::Result<std::process::Output> {
+        use zess_platform::ProcessRunner;
+        zess_platform::SystemProcessRunner.output(command, None, self)
     }
     fn output_with_input(
         &self,
-        command: &mut Command,
+        command: &zess_platform::ProcessSpec,
         input: &[u8],
     ) -> anyhow::Result<std::process::Output> {
-        use std::io::Write;
-        let mut child = command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
-        let mut stdin = child.stdin.take().unwrap();
-        let writer = std::thread::scope(|scope| {
-            let writer = scope.spawn(move || stdin.write_all(input));
-            let output = child.wait_with_output();
-            writer.join().unwrap().unwrap();
-            output
-        });
-        Ok(writer?)
+        use zess_platform::ProcessRunner;
+        zess_platform::SystemProcessRunner.output(command, Some(input), self)
     }
 }
 
@@ -180,12 +179,19 @@ fn explicit_pager_renders_the_same_patch_as_the_operation_after_worktree_changes
     }
 
     impl Execution for ChangeAfterDiff<'_> {
+        fn environment(&self, name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+            Execute.environment(name)
+        }
+
         fn check(&self) -> anyhow::Result<()> {
             Execute.check()
         }
 
-        fn output(&self, command: &mut Command) -> anyhow::Result<std::process::Output> {
-            let raw_diff = command.get_args().any(|arg| arg == "--no-ext-diff");
+        fn output(
+            &self,
+            command: &zess_platform::ProcessSpec,
+        ) -> anyhow::Result<std::process::Output> {
+            let raw_diff = command.args.iter().any(|arg| arg == "--no-ext-diff");
             let output = Execute.output(command)?;
             if raw_diff && !self.changed.replace(true) {
                 fs::write(self.path, "worktree B\n")?;
@@ -195,7 +201,7 @@ fn explicit_pager_renders_the_same_patch_as_the_operation_after_worktree_changes
 
         fn output_with_input(
             &self,
-            command: &mut Command,
+            command: &zess_platform::ProcessSpec,
             input: &[u8],
         ) -> anyhow::Result<std::process::Output> {
             Execute.output_with_input(command, input)
@@ -231,7 +237,10 @@ fn explicit_pager_renders_the_same_patch_as_the_operation_after_worktree_changes
                 original_path: None,
             }],
             &crate::DiffRenderOptions {
-                pager: Some("sed -n p".into()),
+                pager: Some(crate::PagerCommand {
+                    program: "sed".into(),
+                    args: vec!["-n".into(), "p".into()],
+                }),
                 ..Default::default()
             },
             &execution,

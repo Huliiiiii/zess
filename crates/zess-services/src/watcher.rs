@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::TryRecvError;
@@ -7,9 +6,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 use zess_git::{DiffSource, DiffTarget};
+use zess_platform::{FileSystem, WatchBackend, WatchEvent, WatchEventKind, WatchHandle};
 
 use crate::QueryRequest;
 use crate::fs_cache;
@@ -17,6 +16,9 @@ use crate::jobs::{Cancellation, Job, JobScheduler};
 use crate::workspace::Workspace;
 
 const INVALIDATION_INTERVAL: Duration = Duration::from_millis(100);
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) enum QueryKey {
@@ -148,8 +150,21 @@ impl QueryKey {
 
 #[derive(Default)]
 struct Signal {
-    dirty: AtomicBool,
+    invalidation: Mutex<Invalidation>,
     revision: AtomicU64,
+}
+
+#[derive(Default)]
+enum Invalidation {
+    #[default]
+    Clean,
+    Dependencies,
+}
+
+impl Signal {
+    fn invalidate(&self) {
+        *self.invalidation.lock().unwrap() = Invalidation::Dependencies;
+    }
 }
 
 pub(crate) struct Query {
@@ -171,7 +186,10 @@ impl Query {
         let binding = self.binding.lock().unwrap();
         Arc::ptr_eq(&binding.registration, registration)
             && registration.ready() == Ok(true)
-            && !self.signal.dirty.load(Ordering::Relaxed)
+            && matches!(
+                *self.signal.invalidation.lock().unwrap(),
+                Invalidation::Clean
+            )
             && binding
                 .watches
                 .iter()
@@ -235,10 +253,56 @@ struct Binding {
     last_invalidation: Option<Instant>,
 }
 
-struct Preparation {
+struct RegistrationAttempt {
     query: Weak<Query>,
     registration: Arc<Registration>,
-    job: Job<Result<Vec<WatchLease>, String>>,
+}
+
+impl RegistrationAttempt {
+    fn new(query: &Arc<Query>) -> Self {
+        Self {
+            query: Arc::downgrade(query),
+            registration: query.registration(),
+        }
+    }
+
+    fn publish(self, result: Result<Vec<WatchLease>, String>) -> Result<(), String> {
+        let Some(query) = self.query.upgrade() else {
+            return Ok(());
+        };
+        let mut binding = query.binding.lock().unwrap();
+        if !Arc::ptr_eq(&binding.registration, &self.registration) {
+            return Ok(());
+        }
+        match result {
+            Ok(watches) => {
+                // Keep the previous leases until all replacement watches succeeded.
+                binding.watches = watches;
+                *self.registration.0.lock().unwrap() = RegistrationState::Ready;
+                // Editor files are read before registration and need an initial refresh.
+                if binding.last_invalidation.is_none() && matches!(query.key, QueryKey::OpenFile(_))
+                {
+                    query.signal.revision.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                *self.registration.0.lock().unwrap() = RegistrationState::Failed(error.clone());
+                Err(error)
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+enum Preparation {
+    #[default]
+    Idle,
+    WaitingQueue(RegistrationAttempt),
+    Running {
+        attempt: RegistrationAttempt,
+        job: Job<Result<Vec<WatchLease>, String>>,
+    },
 }
 
 pub(crate) struct WatchRequest {
@@ -269,7 +333,12 @@ impl WatchRequest {
         let mut watches = Vec::new();
         for dependency in plan.dependencies {
             check()?;
-            watches.push(registry.subscribe(dependency, &self.signal, metadata.clone())?);
+            watches.push(registry.subscribe(
+                dependency,
+                &self.signal,
+                metadata.clone(),
+                workspace.watches.as_ref(),
+            )?);
         }
         check()?;
         Ok(watches)
@@ -279,8 +348,8 @@ impl WatchRequest {
 pub(crate) struct Queries {
     entries: HashMap<QueryKey, Weak<Query>>,
     registry: Arc<Mutex<WatchRegistry>>,
-    pending: VecDeque<Weak<Query>>,
-    preparation: Option<Preparation>,
+    pending: VecDeque<RegistrationAttempt>,
+    preparation: Preparation,
     errors: VecDeque<String>,
     backend_error: Arc<Mutex<Option<String>>>,
     watched_paths: Arc<AtomicUsize>,
@@ -298,7 +367,7 @@ impl Default for Queries {
                 ..WatchRegistry::default()
             })),
             pending: VecDeque::new(),
-            preparation: None,
+            preparation: Preparation::Idle,
             errors: VecDeque::new(),
             backend_error,
             watched_paths,
@@ -316,7 +385,7 @@ impl Queries {
         if let Some(query) = self.entries.get(&key).and_then(Weak::upgrade) {
             if query.registration().ready().is_err() {
                 query.binding.lock().unwrap().registration = Arc::new(Registration::new());
-                self.pending.push_back(Arc::downgrade(&query));
+                self.pending.push_back(RegistrationAttempt::new(&query));
             }
             self.advance(scheduler);
             return Ok((query, false));
@@ -331,78 +400,67 @@ impl Queries {
             }),
         });
         self.entries.insert(key, Arc::downgrade(&query));
-        self.pending.push_back(Arc::downgrade(&query));
+        self.pending.push_back(RegistrationAttempt::new(&query));
         self.advance(scheduler);
         Ok((query, true))
     }
 
     pub(crate) fn advance(&mut self, scheduler: &JobScheduler) {
-        if let Some(preparation) = &self.preparation {
-            if preparation.query.strong_count() == 0 {
-                preparation.job.cancel();
+        if let Preparation::Running { attempt, job } = &self.preparation {
+            if attempt.query.strong_count() == 0 {
+                job.cancel();
             }
-            let result = match preparation.job.result.try_recv() {
+            let result = match job.result.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => {
                     Some(Err("watch preparation stopped without a result".into()))
                 }
             };
-            if let Some(result) = result {
-                let preparation = self.preparation.take().unwrap();
-                if let Some(query) = preparation.query.upgrade() {
-                    match result {
-                        Ok(watches) => {
-                            let mut binding = query.binding.lock().unwrap();
-                            binding.watches = watches;
-                            *preparation.registration.0.lock().unwrap() = RegistrationState::Ready;
-                            // Queries take their first snapshot after registration. Editor files
-                            // are read before registration, so they also need an initial refresh.
-                            if binding.last_invalidation.is_none()
-                                && matches!(query.key, QueryKey::OpenFile(_))
-                            {
-                                query.signal.revision.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Err(error) => {
-                            *preparation.registration.0.lock().unwrap() =
-                                RegistrationState::Failed(error.clone());
-                            self.errors.push_back(error);
-                        }
-                    }
-                }
+            let Some(result) = result else {
+                return;
+            };
+            let Preparation::Running { attempt, .. } = std::mem::take(&mut self.preparation) else {
+                unreachable!()
+            };
+            if let Err(error) = attempt.publish(result) {
+                self.errors.push_back(error);
             }
         }
-        if self.preparation.is_some() {
-            return;
-        }
-        while let Some(pending) = self.pending.pop_front() {
-            let Some(query) = pending.upgrade() else {
+        loop {
+            let attempt = match std::mem::take(&mut self.preparation) {
+                Preparation::Idle => {
+                    let Some(attempt) = self.pending.pop_front() else {
+                        return;
+                    };
+                    attempt
+                }
+                Preparation::WaitingQueue(attempt) => attempt,
+                Preparation::Running { .. } => unreachable!(),
+            };
+            let Some(query) = attempt.query.upgrade() else {
                 continue;
             };
-            let registration = query.registration();
+            if !Arc::ptr_eq(&query.registration(), &attempt.registration) {
+                continue;
+            }
             let request = WatchRequest {
                 registry: self.registry.clone(),
-                query: pending.clone(),
+                query: attempt.query.clone(),
                 signal: query.signal.clone(),
                 key: query.key.clone(),
             };
-            match scheduler.start_watch(request) {
-                Ok(Some(job)) => {
-                    self.preparation = Some(Preparation {
-                        query: pending,
-                        registration,
-                        job,
-                    })
-                }
-                Ok(None) => self.pending.push_front(pending),
+            self.preparation = match scheduler.start_watch(request) {
+                Ok(Some(job)) => Preparation::Running { attempt, job },
+                Ok(None) => Preparation::WaitingQueue(attempt),
                 Err(error) => {
-                    let error = format!("{error:#}");
-                    *registration.0.lock().unwrap() = RegistrationState::Failed(error.clone());
-                    self.errors.push_back(error);
+                    if let Err(error) = attempt.publish(Err(format!("{error:#}"))) {
+                        self.errors.push_back(error);
+                    }
+                    Preparation::Idle
                 }
-            }
-            break;
+            };
+            return;
         }
     }
 
@@ -421,13 +479,21 @@ impl Queries {
                 || binding
                     .last_invalidation
                     .is_some_and(|last| last.elapsed() < INVALIDATION_INTERVAL)
-                || !query.signal.dirty.swap(false, Ordering::Relaxed)
             {
                 continue;
             }
-            binding.registration = Arc::new(Registration::new());
+            let invalidation = std::mem::take(&mut *query.signal.invalidation.lock().unwrap());
+            match invalidation {
+                Invalidation::Clean => continue,
+                Invalidation::Dependencies => {
+                    binding.registration = Arc::new(Registration::new());
+                    self.pending.push_back(RegistrationAttempt {
+                        query: Arc::downgrade(&query),
+                        registration: binding.registration.clone(),
+                    });
+                }
+            }
             binding.last_invalidation = Some(Instant::now());
-            self.pending.push_back(Arc::downgrade(&query));
             query.signal.revision.fetch_add(1, Ordering::Relaxed);
             changed.push(query.key.clone());
         }
@@ -456,8 +522,8 @@ impl Queries {
 
 impl Drop for Queries {
     fn drop(&mut self) {
-        if let Some(preparation) = &self.preparation {
-            preparation.job.cancel();
+        if let Preparation::Running { job, .. } = &self.preparation {
+            job.cancel();
         }
     }
 }
@@ -498,29 +564,30 @@ struct Listener {
 }
 
 impl Listener {
-    fn accepts(&self, event: &Event) -> bool {
-        if event.need_rescan() || event.paths.is_empty() {
-            return true;
+    fn notify(&self, event: &WatchEvent) {
+        let accepted = event.rescan
+            || event.paths.is_empty()
+            || event.paths.iter().any(|path| {
+                let git_metadata = self
+                    .metadata
+                    .iter()
+                    .any(|directory| path.starts_with(directory));
+                let lock_file = path
+                    .file_name()
+                    .is_some_and(|name| name.as_encoded_bytes().ends_with(b".lock"));
+                !(git_metadata && lock_file) && self.filter.matches(path)
+            });
+        if accepted && let Some(signal) = self.signal.upgrade() {
+            // Rescan can hide path-identity changes, including symlink retargets.
+            // Rebuild logical dependencies while reusing valid physical watches.
+            signal.invalidate();
         }
-        event.paths.iter().any(|path| {
-            let git_metadata = self
-                .metadata
-                .iter()
-                .any(|directory| path.starts_with(directory));
-            let lock_file = path
-                .file_name()
-                .is_some_and(|name| name.as_encoded_bytes().ends_with(b".lock"));
-            if git_metadata && lock_file {
-                return false;
-            }
-            self.filter.matches(path)
-        })
     }
 }
 
 struct PhysicalWatch {
     watched_paths: Arc<AtomicUsize>,
-    watcher: Mutex<RecommendedWatcher>,
+    watcher: Mutex<Box<dyn WatchHandle>>,
     stale: Arc<AtomicBool>,
     listeners: Arc<Mutex<HashMap<u64, Listener>>>,
 }
@@ -556,12 +623,13 @@ impl WatchRegistry {
         dependency: Dependency,
         signal: &Arc<Signal>,
         metadata: Arc<[PathBuf]>,
+        backend: &dyn WatchBackend,
     ) -> Result<WatchLease> {
         self.entries.retain(|_, watch| watch.strong_count() > 0);
         let spec = dependency.spec;
         let owner = if let Some(owner) = self.entries.get(&spec).and_then(Weak::upgrade) {
             if owner.stale.swap(false, Ordering::Relaxed)
-                && let Err(error) = owner.watcher.lock().unwrap().watch(&spec.path, mode(&spec))
+                && let Err(error) = owner.watcher.lock().unwrap().refresh()
             {
                 owner.stale.store(true, Ordering::Relaxed);
                 return Err(error).with_context(|| {
@@ -576,54 +644,51 @@ impl WatchRegistry {
             let path = spec.path.clone();
             let stale = Arc::new(AtomicBool::new(false));
             let changed_inode = stale.clone();
-            let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
-                let listeners = incoming.lock().unwrap();
-                match event {
-                    Ok(event) => {
-                        if matches!(event.kind, EventKind::Access(_)) {
-                            return;
-                        }
-                        if matches!(
-                            event.kind,
-                            EventKind::Remove(_)
-                                | EventKind::Modify(notify::event::ModifyKind::Name(_))
-                        ) && event.paths.contains(&path)
-                        {
-                            changed_inode.store(true, Ordering::Relaxed);
-                        }
-                        for listener in listeners.values() {
-                            if !listener.accepts(&event) {
-                                continue;
+            let watcher = backend
+                .watch(
+                    &spec.path,
+                    spec.recursive,
+                    Box::new(move |event| {
+                        let listeners = incoming.lock().unwrap();
+                        match event {
+                            Ok(event) => {
+                                if matches!(event.kind, WatchEventKind::Access) {
+                                    return;
+                                }
+                                if !event.rescan
+                                    && matches!(
+                                        event.kind,
+                                        WatchEventKind::Remove | WatchEventKind::Rename
+                                    )
+                                    && event.paths.contains(&path)
+                                {
+                                    changed_inode.store(true, Ordering::Relaxed);
+                                }
+                                for listener in listeners.values() {
+                                    listener.notify(&event);
+                                }
                             }
-                            let Some(signal) = listener.signal.upgrade() else {
-                                continue;
-                            };
-                            signal.dirty.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    Err(cause) => {
-                        changed_inode.store(true, Ordering::Relaxed);
-                        *error.lock().unwrap() = Some(format!(
-                            "filesystem watcher failed for {}: {cause}",
-                            path.display()
-                        ));
-                        for listener in listeners.values() {
-                            if let Some(signal) = listener.signal.upgrade() {
-                                signal.dirty.store(true, Ordering::Relaxed);
+                            Err(cause) => {
+                                changed_inode.store(true, Ordering::Relaxed);
+                                *error.lock().unwrap() = Some(format!(
+                                    "filesystem watcher failed for {}: {cause}",
+                                    path.display()
+                                ));
+                                for listener in listeners.values() {
+                                    if let Some(signal) = listener.signal.upgrade() {
+                                        signal.invalidate();
+                                    }
+                                }
                             }
                         }
-                    }
-                }
-            })
-            .with_context(|| {
-                format!(
-                    "cannot create filesystem watcher for {}",
-                    spec.path.display()
+                    }),
                 )
-            })?;
-            watcher.watch(&spec.path, mode(&spec)).with_context(|| {
-                format!("cannot watch filesystem changes in {}", spec.path.display())
-            })?;
+                .with_context(|| {
+                    format!(
+                        "cannot create filesystem watcher for {}",
+                        spec.path.display()
+                    )
+                })?;
             self.watched_paths.fetch_add(1, Ordering::Relaxed);
             let owner = Arc::new(PhysicalWatch {
                 watched_paths: self.watched_paths.clone(),
@@ -648,15 +713,8 @@ impl WatchRegistry {
     }
 }
 
-fn mode(spec: &WatchSpec) -> RecursiveMode {
-    if spec.recursive {
-        RecursiveMode::Recursive
-    } else {
-        RecursiveMode::NonRecursive
-    }
-}
-
 struct Plan {
+    filesystem: Arc<dyn FileSystem>,
     dependencies: Vec<Dependency>,
     metadata: Vec<PathBuf>,
 }
@@ -664,33 +722,39 @@ struct Plan {
 impl Plan {
     fn new(workspace: &Workspace, key: &QueryKey) -> Result<Self> {
         let mut plan = Self {
+            filesystem: workspace.filesystem.clone(),
             dependencies: Vec::new(),
             metadata: Vec::new(),
         };
         match key {
             QueryKey::OpenFile(path) => {
                 plan.exact(path)?;
-                if let Ok(target) = path.canonicalize()
+                if let Ok(target) = plan.filesystem.canonicalize(path)
                     && target != *path
                 {
                     plan.exact(&target)?;
                 }
             }
             QueryKey::Filesystem(relative) => {
-                let path = if workspace.root.try_exists()? {
+                let path = if workspace.filesystem.try_exists(&workspace.root)? {
                     workspace.path(relative.to_str().context("filesystem path is not UTF-8")?)?
                 } else {
                     workspace.root.join(relative)
                 };
                 plan.exact(&path)?;
-                if path.is_dir() {
+                if plan
+                    .filesystem
+                    .metadata(&path)
+                    .is_ok_and(|metadata| metadata.is_dir())
+                {
                     plan.directory(&path, false)?;
-                    let directory = path
-                        .canonicalize()
+                    let directory = plan
+                        .filesystem
+                        .canonicalize(&path)
                         .with_context(|| format!("cannot resolve {}", path.display()))?;
                     // require_git(false) also applies rules above the repository.
                     plan.ignore_rules(&directory, None)?;
-                } else if let Ok(target) = path.canonicalize()
+                } else if let Ok(target) = plan.filesystem.canonicalize(&path)
                     && target != path
                     && target.starts_with(&workspace.root)
                 {
@@ -711,10 +775,17 @@ impl Plan {
                 source: DiffSource::Changes { .. },
                 ..
             } => {
-                plan.metadata = zess_git::metadata_directories(&workspace.root)?;
+                plan.metadata = zess_git::metadata_directories_with_file_system(
+                    &workspace.root,
+                    workspace.filesystem.as_ref(),
+                )?;
                 for directory in plan.metadata.clone() {
                     plan.exact(&directory)?;
-                    if directory.is_dir() {
+                    if plan
+                        .filesystem
+                        .metadata(&directory)
+                        .is_ok_and(|metadata| metadata.is_dir())
+                    {
                         plan.directory(&directory, true)?;
                     }
                 }
@@ -722,7 +793,7 @@ impl Plan {
                 for ancestor in workspace.root.ancestors() {
                     let marker = ancestor.join(".git");
                     plan.exact(&marker)?;
-                    if marker.exists() {
+                    if plan.filesystem.metadata(&marker).is_ok() {
                         repository = Some(ancestor);
                         break;
                     }
@@ -730,7 +801,11 @@ impl Plan {
                 match key {
                     QueryKey::GitStatus => {
                         plan.exact(&workspace.root)?;
-                        if workspace.root.is_dir() {
+                        if workspace
+                            .filesystem
+                            .metadata(&workspace.root)
+                            .is_ok_and(|metadata| metadata.is_dir())
+                        {
                             plan.directory(&workspace.root, true)?;
                         }
                         if let Some(repository) = repository {
@@ -741,14 +816,22 @@ impl Plan {
                         let path =
                             workspace.path(path.to_str().context("Git path is not UTF-8")?)?;
                         plan.exact(&path)?;
-                        if path.is_dir() {
+                        if plan
+                            .filesystem
+                            .metadata(&path)
+                            .is_ok_and(|metadata| metadata.is_dir())
+                        {
                             plan.directory(&path, true)?;
                         }
                         if let Some(original) = original {
                             let original = workspace
                                 .path(original.to_str().context("Git path is not UTF-8")?)?;
                             plan.exact(&original)?;
-                            if original.is_dir() {
+                            if plan
+                                .filesystem
+                                .metadata(&original)
+                                .is_ok_and(|metadata| metadata.is_dir())
+                            {
                                 plan.directory(&original, true)?;
                             }
                         }
@@ -785,8 +868,9 @@ impl Plan {
     }
 
     fn directory(&mut self, path: &Path, recursive: bool) -> Result<()> {
-        let path = path
-            .canonicalize()
+        let path = self
+            .filesystem
+            .canonicalize(path)
             .with_context(|| format!("cannot resolve watch directory {}", path.display()))?;
         let spec = WatchSpec {
             path: path.to_owned(),
@@ -807,13 +891,12 @@ impl Plan {
         while let Some(path) = pending.pop() {
             self.exact_entry(&path)?;
             for ancestor in path.ancestors() {
-                let Ok(target) = fs::read_link(ancestor) else {
+                let Ok(target) = self.filesystem.read_link(ancestor) else {
                     continue;
                 };
-                let parent = ancestor
-                    .parent()
-                    .context("symbolic link has no parent")?
-                    .canonicalize()
+                let parent = self
+                    .filesystem
+                    .canonicalize(ancestor.parent().context("symbolic link has no parent")?)
                     .with_context(|| {
                         format!("cannot resolve symbolic link parent {}", ancestor.display())
                     })?;
@@ -832,8 +915,9 @@ impl Plan {
             return self.directory(path, false);
         }
         if path.file_name().is_none() {
-            let target = path
-                .canonicalize()
+            let target = self
+                .filesystem
+                .canonicalize(path)
                 .with_context(|| format!("cannot resolve watch path {}", path.display()))?;
             return self.exact_entry(&target);
         }
@@ -842,7 +926,7 @@ impl Plan {
             .parent()
             .context("cannot watch a path without a parent")?;
         loop {
-            match fs::metadata(directory) {
+            match self.filesystem.metadata(directory) {
                 Ok(metadata) if metadata.is_dir() => break,
                 Ok(_) => {}
                 Err(error)
@@ -862,8 +946,9 @@ impl Plan {
                 .context("cannot find an existing watch directory")?;
         }
         let target = target.strip_prefix(directory)?;
-        let directory = directory
-            .canonicalize()
+        let directory = self
+            .filesystem
+            .canonicalize(directory)
             .with_context(|| format!("cannot resolve watch directory {}", directory.display()))?;
         self.push(Dependency {
             spec: WatchSpec {

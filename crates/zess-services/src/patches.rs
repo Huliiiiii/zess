@@ -26,9 +26,13 @@ impl crate::NativeServices {
         std::thread::Builder::new()
             .name("zess-git-patch".into())
             .spawn(move || {
-                let outcome = zess_git::Repository::open(&workspace.root)
+                let outcome = workspace
+                    .repository()
                     .and_then(|repository| {
-                        repository.apply_patch(request, &crate::jobs::Cancellation::default())
+                        repository.apply_patch(
+                            request,
+                            &crate::jobs::Cancellation::new(workspace.processes.clone()),
+                        )
                     })
                     .map_err(|error| format!("{error:#}"));
                 let _ = sender.send(outcome);
