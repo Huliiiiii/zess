@@ -47,6 +47,12 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         if let Ok(mut stream) = UnixStream::connect(&self.socket) {
+            let _ = framing::write(
+                &mut stream,
+                &ClientMessage::Hello {
+                    build_id: zess_build::BUILD_ID.into(),
+                },
+            );
             let _ = framing::write(&mut stream, &ClientMessage::Stop { force: true });
         }
         if let Some(thread) = self.thread.take() {
@@ -80,7 +86,21 @@ impl Client {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         framing::write(
             &mut stream,
+            &ClientMessage::Hello {
+                build_id: zess_build::BUILD_ID.into(),
+            },
+        )
+        .unwrap();
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&hello).unwrap(),
+            ServerMessage::Hello { .. }
+        ));
+        framing::write(
+            &mut stream,
             &ClientMessage::Attach {
+                expected_session: None,
                 client_id: client_id.into(),
                 width: 80,
                 height: 24,
@@ -135,7 +155,7 @@ impl Client {
         message
     }
 
-    fn result(&mut self, request: &str) -> CommandOutcome {
+    fn result(&mut self, request: RequestId) -> CommandOutcome {
         loop {
             if let ServerMessage::CommandResult {
                 request_id,
@@ -143,7 +163,7 @@ impl Client {
                 ..
             } = self.receive()
             {
-                if request_id.0 == request {
+                if request_id == request {
                     return outcome;
                 }
             }
@@ -198,7 +218,7 @@ fn changing_clients_cancels_a_clipboard_read_while_the_same_client_can_resume_it
         });
     }
     first.send(ClientMessage::TrackedInput {
-        request_id: RequestId("paste".into()),
+        request_id: RequestId(1),
         server_instance: first.instance.clone(),
         sequence: 3,
         key: "p".into(),
@@ -229,14 +249,81 @@ fn changing_clients_cancels_a_clipboard_read_while_the_same_client_can_resume_it
         text: Some("B clipboard".into()),
         error: None,
     });
+    second.send(ClientMessage::ResultAck {
+        request_id: RequestId(1),
+        server_instance: second.instance.clone(),
+    });
+    second.send(ClientMessage::Command {
+        request_id: RequestId(1),
+        server_instance: second.instance.clone(),
+        action: CommandAction::Command {
+            name: "text.move-left".into(),
+            argument: serde_json::json!({}),
+        },
+    });
+    assert_eq!(second.result(RequestId(1)), CommandOutcome::Applied);
     let state = second.snapshot_without_device_requests();
     assert_eq!(document(&state), document(&original));
     assert!(!state.modified);
     second.detach();
     let (mut first, _) = Client::attach(&server, "A", Some(first_epoch));
     assert!(
-        matches!(first.result("paste"), CommandOutcome::Failed { message } if message.contains("another client attached"))
+        matches!(first.result(RequestId(1)), CommandOutcome::Failed { message } if message.contains("another client attached"))
     );
+}
+
+#[test]
+fn a_pending_clipboard_command_survives_early_acknowledgment_and_replay() {
+    let server = Server::start();
+    let client_id = "clipboard:resume";
+    let (mut client, _) = Client::attach(&server, client_id, None);
+    for (sequence, key) in [(1, "\""), (2, "+")] {
+        client.send(ClientMessage::Input {
+            sequence,
+            key: key.into(),
+            context_epoch: client.epoch,
+        });
+    }
+    let request_id = RequestId(1);
+    let instance = client.instance.clone();
+    let paste = || ClientMessage::Command {
+        request_id,
+        server_instance: instance.clone(),
+        action: CommandAction::Command {
+            name: "text.paste-after".into(),
+            argument: serde_json::json!({}),
+        },
+    };
+    client.send(paste());
+    let read_id = loop {
+        if let ServerMessage::ClipboardRead { id, .. } = client.receive() {
+            break id;
+        }
+    };
+    client.send(ClientMessage::ResultAck {
+        request_id,
+        server_instance: instance.clone(),
+    });
+    let epoch = client.epoch;
+    client.detach();
+
+    let (mut client, _) = Client::attach(&server, client_id, Some(epoch));
+    assert!(matches!(client.receive(), ServerMessage::CommandResult {
+        request_id: received, result: OperationResult::Pending, ..
+    } if received == request_id));
+    assert!(matches!(client.receive(), ServerMessage::ClipboardRead { id, .. } if id == read_id));
+
+    client.send(paste());
+    assert!(matches!(client.receive(), ServerMessage::ClipboardRead { id, .. } if id == read_id));
+    assert!(matches!(client.receive(), ServerMessage::CommandResult {
+        request_id: received, result: OperationResult::Pending, ..
+    } if received == request_id));
+    client.send(ClientMessage::ClipboardResponse {
+        id: read_id,
+        text: Some("paste".into()),
+        error: None,
+    });
+    assert_eq!(client.result(request_id), CommandOutcome::Applied);
 }
 
 #[test]
@@ -266,7 +353,7 @@ fn clipboard_effects_arrive_before_the_input_or_command_result() {
             let key = if read { "p" } else { "y" }.to_owned();
             client.send(if tracked {
                 ClientMessage::TrackedInput {
-                    request_id: RequestId("clipboard".into()),
+                    request_id: RequestId(1),
                     server_instance: client.instance.clone(),
                     sequence: 3,
                     key,
@@ -295,9 +382,10 @@ fn clipboard_effects_arrive_before_the_input_or_command_result() {
                             break;
                         }
                     }
-                    ServerMessage::CommandResult { request_id, .. }
-                        if request_id.0 == "clipboard" =>
-                    {
+                    ServerMessage::CommandResult {
+                        request_id: RequestId(1),
+                        ..
+                    } => {
                         assert!(
                             effect_received,
                             "the tracked result must follow its clipboard effect"

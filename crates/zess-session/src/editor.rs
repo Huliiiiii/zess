@@ -562,6 +562,7 @@ pub struct Session {
     script_compiler: Arc<dyn ScriptCompiler>,
     file_watches: BTreeMap<BufferId, files::FileWatch>,
     workspace: PathBuf,
+    name: Option<String>,
     config: Option<PathBuf>,
     services: Rc<RefCell<NativeServices>>,
     fs_revision: u64,
@@ -646,6 +647,7 @@ impl Session {
             script_compiler,
             file_watches: BTreeMap::new(),
             workspace,
+            name: None,
             config,
             builtins: BuiltinPlugins::new(services.clone()),
             services,
@@ -760,6 +762,14 @@ impl Session {
 
     pub fn workspace(&self) -> &Path {
         &self.workspace
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.name = Some(name);
     }
 
     pub fn modified(&self) -> bool {

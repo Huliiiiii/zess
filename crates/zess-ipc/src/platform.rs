@@ -4,11 +4,12 @@ use std::{
     io,
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
 
-use crate::SocketPath;
+use crate::{LocalIpc, SocketPath, Stream};
 
 #[cfg(unix)]
 #[path = "unix/daemon.rs"]
@@ -17,7 +18,7 @@ mod backend;
 #[path = "windows/daemon.rs"]
 mod backend;
 
-pub use backend::{detach, stop};
+pub use backend::detach;
 
 pub struct DaemonSpec {
     pub program: PathBuf,
@@ -38,9 +39,24 @@ impl DaemonHandle {
     }
 }
 
+pub trait ProcessWait: Send {
+    fn wait(&self, timeout: Duration) -> io::Result<bool>;
+}
+
+pub trait ProcessStop: ProcessWait {
+    fn is_peer(&self, stream: &Stream) -> Result<bool>;
+    /// Terminates the process and waits for it to exit.
+    fn terminate(&self) -> Result<()>;
+}
+
 pub trait DaemonControl: Send + Sync {
-    fn stop(&self, endpoint: &SocketPath) -> Result<()>;
+    fn connect_for_stop(
+        &self,
+        ipc: &dyn LocalIpc,
+        endpoint: &SocketPath,
+    ) -> Result<(Stream, Box<dyn ProcessStop>)>;
     fn spawn(&self, specification: &DaemonSpec) -> Result<DaemonHandle>;
+    fn watch(&self, stream: &Stream) -> Result<Box<dyn ProcessWait>>;
 }
 
 #[cfg(unix)]
@@ -54,8 +70,16 @@ pub use UnixDaemonControl as NativeDaemonControl;
 pub use WindowsDaemonControl as NativeDaemonControl;
 
 impl DaemonControl for NativeDaemonControl {
-    fn stop(&self, endpoint: &SocketPath) -> Result<()> {
-        stop(endpoint)
+    fn watch(&self, stream: &Stream) -> Result<Box<dyn ProcessWait>> {
+        backend::watch(stream)
+    }
+
+    fn connect_for_stop(
+        &self,
+        ipc: &dyn LocalIpc,
+        endpoint: &SocketPath,
+    ) -> Result<(Stream, Box<dyn ProcessStop>)> {
+        backend::connect_for_stop(ipc, endpoint)
     }
 
     fn spawn(&self, specification: &DaemonSpec) -> Result<DaemonHandle> {

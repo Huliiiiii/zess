@@ -76,11 +76,19 @@ fn the_pipe_acl_grants_access_only_to_the_current_user() {
 
 #[test]
 fn forced_stop_refuses_to_terminate_its_own_process() {
+    use crate::{
+        NativeLocalIpc,
+        platform::{DaemonControl, NativeDaemonControl},
+    };
+
     let socket = SocketPath::from(PathBuf::from(format!(
         "zess-self-stop-test-{}",
         std::process::id()
     )));
     let _listener = Listener::bind(&socket).unwrap();
-    let error = crate::platform::stop(&socket).unwrap_err();
+    let (_stream, process) = NativeDaemonControl
+        .connect_for_stop(&NativeLocalIpc, &socket)
+        .unwrap();
+    let error = process.terminate().unwrap_err();
     assert!(error.to_string().contains("invalid server process"));
 }

@@ -1,4 +1,5 @@
 mod clipboard;
+mod lifecycle;
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -30,7 +31,7 @@ fn a_limit_sized_input_and_the_next_message_can_share_a_socket_read() {
         let (server, mut client) = stream_pair();
         let mut connection = Connection::new(server).unwrap();
         let envelope = framing::encode(&ClientMessage::Command {
-            request_id: RequestId("paste".into()),
+            request_id: RequestId(1),
             server_instance: ServerInstanceId("instance".into()),
             action: CommandAction::Paste {
                 text: String::new(),
@@ -40,7 +41,7 @@ fn a_limit_sized_input_and_the_next_message_can_share_a_socket_read() {
         .len();
         let text = "x".repeat(MAX_INPUT_BYTES - envelope);
         let message = framing::encode(&ClientMessage::Command {
-            request_id: RequestId("paste".into()),
+            request_id: RequestId(1),
             server_instance: ServerInstanceId("instance".into()),
             action: CommandAction::Paste { text: text.clone() },
         })
@@ -70,7 +71,7 @@ fn a_limit_sized_input_and_the_next_message_can_share_a_socket_read() {
         assert_eq!(messages.len(), 2);
         assert!(matches!(&messages[0], ClientMessage::Command {
             request_id, server_instance, action: CommandAction::Paste { text: actual },
-        } if request_id.0 == "paste" && server_instance.0 == "instance" && actual == &text));
+        } if *request_id == RequestId(1) && server_instance.0 == "instance" && actual == &text));
         assert!(matches!(&messages[1], ClientMessage::Input {
             sequence: 2, key, context_epoch: 17,
         } if key == "Esc"));
@@ -83,7 +84,7 @@ fn an_input_message_over_the_limit_is_rejected() {
     let (server, mut client) = stream_pair();
     let mut connection = Connection::new(server).unwrap();
     let message = framing::encode(&ClientMessage::Command {
-        request_id: RequestId("paste".into()),
+        request_id: RequestId(1),
         server_instance: ServerInstanceId("instance".into()),
         action: CommandAction::Paste {
             text: "x".repeat(MAX_INPUT_BYTES),
@@ -245,6 +246,13 @@ fn mouse_input_is_applied_once_only_in_the_attached_context() {
     impl Drop for RunningServer {
         fn drop(&mut self) {
             if let Ok(mut stream) = UnixStream::connect(&self.socket) {
+                framing::write(
+                    &mut stream,
+                    &ClientMessage::Hello {
+                        build_id: zess_build::BUILD_ID.into(),
+                    },
+                )
+                .unwrap();
                 serde_json::to_writer(&mut stream, &ClientMessage::Stop { force: true }).unwrap();
                 stream.write_all(b"\n").unwrap();
             }
@@ -255,13 +263,31 @@ fn mouse_input_is_applied_once_only_in_the_attached_context() {
         }
     }
     fn send(stream: &mut UnixStream, message: &ClientMessage) {
+        if matches!(
+            message,
+            ClientMessage::Attach { .. } | ClientMessage::Status | ClientMessage::Stop { .. }
+        ) {
+            framing::write(
+                stream,
+                &ClientMessage::Hello {
+                    build_id: zess_build::BUILD_ID.into(),
+                },
+            )
+            .unwrap();
+        }
         serde_json::to_writer(&mut *stream, message).unwrap();
         stream.write_all(b"\n").unwrap();
     }
     fn receive(reader: &mut BufReader<UnixStream>) -> ServerMessage {
         let mut line = String::new();
         assert!(reader.read_line(&mut line).unwrap() > 0);
-        serde_json::from_str(&line).unwrap()
+        let message = serde_json::from_str(&line).unwrap();
+        if let ServerMessage::Hello { build_id } = message {
+            zess_protocol::check_build_id(&build_id).unwrap();
+            receive(reader)
+        } else {
+            message
+        }
     }
     fn acknowledged(reader: &mut BufReader<UnixStream>, sequence: u64) {
         loop {
@@ -316,6 +342,7 @@ fn mouse_input_is_applied_once_only_in_the_attached_context() {
     send(
         &mut stream,
         &ClientMessage::Attach {
+            expected_session: None,
             client_id: "mouse-test".into(),
             width: 80,
             height: 24,
@@ -481,7 +508,7 @@ fn disconnecting_a_rejected_attached_client_releases_the_attachment() {
 }
 
 #[test]
-fn reconnecting_retains_command_results_without_repeating_the_command() {
+fn reconnecting_recovers_unacknowledged_results_without_repeating_commands() {
     struct IdentityPlatform;
     impl Platform for IdentityPlatform {
         fn host_info(&self) -> zess_platform::HostInfo {
@@ -514,6 +541,12 @@ fn reconnecting_retains_command_results_without_repeating_the_command() {
     impl Drop for RunningServer {
         fn drop(&mut self) {
             if let Ok(mut stream) = UnixStream::connect(&self.socket) {
+                let _ = framing::write(
+                    &mut stream,
+                    &ClientMessage::Hello {
+                        build_id: zess_build::BUILD_ID.into(),
+                    },
+                );
                 let _ = framing::write(&mut stream, &ClientMessage::Stop { force: true });
             }
             if let Some(thread) = self.thread.take() {
@@ -523,13 +556,42 @@ fn reconnecting_retains_command_results_without_repeating_the_command() {
         }
     }
     fn send(stream: &mut UnixStream, message: &ClientMessage) {
+        if matches!(
+            message,
+            ClientMessage::Attach { .. } | ClientMessage::Status | ClientMessage::Stop { .. }
+        ) {
+            framing::write(
+                stream,
+                &ClientMessage::Hello {
+                    build_id: zess_build::BUILD_ID.into(),
+                },
+            )
+            .unwrap();
+        }
         serde_json::to_writer(&mut *stream, message).unwrap();
         stream.write_all(b"\n").unwrap();
     }
     fn receive(reader: &mut BufReader<UnixStream>) -> ServerMessage {
         let mut line = String::new();
         assert!(reader.read_line(&mut line).unwrap() > 0);
-        serde_json::from_str(&line).unwrap()
+        let message = serde_json::from_str(&line).unwrap();
+        if let ServerMessage::Hello { build_id } = message {
+            zess_protocol::check_build_id(&build_id).unwrap();
+            receive(reader)
+        } else {
+            message
+        }
+    }
+    fn receive_result(reader: &mut BufReader<UnixStream>, expected: RequestId) -> OperationResult {
+        loop {
+            if let ServerMessage::CommandResult {
+                request_id, result, ..
+            } = receive(reader)
+            {
+                assert_eq!(request_id, expected);
+                return result;
+            }
+        }
     }
     fn attach(
         socket: &std::path::Path,
@@ -548,6 +610,7 @@ fn reconnecting_retains_command_results_without_repeating_the_command() {
         send(
             &mut stream,
             &ClientMessage::Attach {
+                expected_session: None,
                 client_id: "command-reconnect".into(),
                 width: 80,
                 height: 24,
@@ -610,31 +673,52 @@ fn reconnecting_retains_command_results_without_repeating_the_command() {
     );
     let (mut stream, mut reader, instance, session_id, before) = attach(&server.socket);
     assert_eq!(instance.0, "4242-9000");
-    let request_id = RequestId("open-new-buffer".into());
+    let request_id = RequestId(3);
     let command = ClientMessage::Command {
-        request_id: request_id.clone(),
+        request_id,
         server_instance: instance.clone(),
         action: CommandAction::CommandLine { text: "new".into() },
     };
     send(&mut stream, &command);
-    let original_result = loop {
-        if let ServerMessage::CommandResult {
-            request_id: received,
-            result,
+    let original_result = receive_result(&mut reader, request_id);
+    assert!(matches!(
+        original_result,
+        OperationResult::Completed {
+            outcome: CommandOutcome::Applied,
             ..
-        } = receive(&mut reader)
-        {
-            assert_eq!(received, request_id);
-            assert!(matches!(
-                result,
-                OperationResult::Completed {
-                    outcome: CommandOutcome::Applied,
-                    ..
-                }
-            ));
-            break result;
         }
-    };
+    ));
+
+    let newer = RequestId(5);
+    send(
+        &mut stream,
+        &ClientMessage::Command {
+            request_id: newer,
+            server_instance: instance.clone(),
+            action: CommandAction::CommandLine { text: "new".into() },
+        },
+    );
+    assert!(matches!(
+        receive_result(&mut reader, newer),
+        OperationResult::Completed {
+            outcome: CommandOutcome::Applied,
+            ..
+        }
+    ));
+    send(
+        &mut stream,
+        &ClientMessage::ResultAck {
+            request_id: newer,
+            server_instance: instance.clone(),
+        },
+    );
+    send(
+        &mut stream,
+        &ClientMessage::ResultAck {
+            request_id,
+            server_instance: ServerInstanceId("another-instance".into()),
+        },
+    );
     send(&mut stream, &ClientMessage::Detach);
     let mut remaining = String::new();
     while reader.read_line(&mut remaining).unwrap() != 0 {
@@ -651,18 +735,51 @@ fn reconnecting_retains_command_results_without_repeating_the_command() {
         matches!(receive(&mut reader), ServerMessage::CommandResult { request_id: received, result, .. }
         if received == request_id && result == original_result)
     );
-    send(
-        &mut stream,
-        &ClientMessage::ResultAck {
-            request_id: request_id.clone(),
-            server_instance: instance,
-        },
-    );
     send(&mut stream, &command);
     assert!(
         matches!(receive(&mut reader), ServerMessage::CommandResult { request_id: received, result, .. }
         if received == request_id && result == original_result)
     );
+
+    for request_id in [request_id, request_id, RequestId(7)] {
+        send(
+            &mut stream,
+            &ClientMessage::ResultAck {
+                request_id,
+                server_instance: instance.clone(),
+            },
+        );
+    }
+    send(
+        &mut stream,
+        &ClientMessage::QueryOperation {
+            request_id,
+            server_instance: instance.clone(),
+        },
+    );
+    assert!(
+        matches!(receive(&mut reader), ServerMessage::CommandResult {
+        request_id: received, result: OperationResult::Unknown, ..
+    } if received == request_id)
+    );
+
+    send(&mut stream, &command);
+    let skipped = RequestId(2);
+    send(
+        &mut stream,
+        &ClientMessage::Command {
+            request_id: skipped,
+            server_instance: instance.clone(),
+            action: CommandAction::CommandLine { text: "new".into() },
+        },
+    );
+    for retired in [request_id, skipped] {
+        assert!(
+            matches!(receive(&mut reader), ServerMessage::CommandResult {
+            request_id: received, result: OperationResult::Unknown, ..
+        } if received == retired)
+        );
+    }
     send(
         &mut stream,
         &ClientMessage::Resync {
@@ -675,6 +792,21 @@ fn reconnecting_retains_command_results_without_repeating_the_command() {
     };
     assert_eq!(
         state, after,
-        "replaying an acknowledged request must not create another buffer"
+        "retired request IDs must not create another buffer"
     );
+    send(
+        &mut stream,
+        &ClientMessage::Command {
+            request_id: RequestId(6),
+            server_instance: instance,
+            action: CommandAction::CommandLine { text: "new".into() },
+        },
+    );
+    assert!(matches!(
+        receive_result(&mut reader, RequestId(6)),
+        OperationResult::Completed {
+            outcome: CommandOutcome::Applied,
+            ..
+        }
+    ));
 }

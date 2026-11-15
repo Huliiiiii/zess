@@ -9,13 +9,15 @@ use std::{
     path::PathBuf,
     process::Command,
     ptr::null_mut,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::{
     Foundation::{
-        FILETIME, HANDLE, LocalFree, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
-        STATUS_INFO_LENGTH_MISMATCH, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CompareObjectHandles, FILETIME, HANDLE, LocalFree, STATUS_BUFFER_OVERFLOW,
+        STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH, UNICODE_STRING, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     },
     System::{
         JobObjects::{
@@ -36,7 +38,51 @@ use windows_sys::Win32::{
     UI::Shell::CommandLineToArgvW,
 };
 
-use crate::{SocketPath, Stream, windows::security};
+use crate::{
+    LocalIpc, SocketPath, Stream,
+    platform::{ProcessStop, ProcessWait},
+    windows::security,
+};
+
+struct PeerProcess(OwnedHandle);
+
+impl ProcessWait for PeerProcess {
+    fn wait(&self, timeout: Duration) -> io::Result<bool> {
+        let millis = timeout.as_millis() + u128::from(timeout.subsec_nanos() % 1_000_000 != 0);
+        let timeout = millis.min((u32::MAX - 1) as u128) as u32;
+        // SAFETY: the owned process handle has SYNCHRONIZE access and remains live.
+        match unsafe { WaitForSingleObject(self.0.as_raw_handle(), timeout) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+fn pipe_peer_pid(stream: &Stream) -> Result<u32> {
+    let pipe = stream.handle()?;
+    let mut pid = 0;
+    // SAFETY: the connected pipe handle is live and pid is writable.
+    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
+        return Err(io::Error::last_os_error()).context("identify pipe server process");
+    }
+    Ok(pid)
+}
+
+fn open_process(pid: u32, access: u32) -> Result<OwnedHandle> {
+    // SAFETY: the arguments are a PID and desired rights. The returned handle is checked.
+    let raw = unsafe { OpenProcess(access, 0, pid) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error()).context("open pipe server process");
+    }
+    // SAFETY: successful OpenProcess transferred unique handle ownership.
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
+
+pub fn watch(stream: &Stream) -> Result<Box<dyn ProcessWait>> {
+    let process = open_process(pipe_peer_pid(stream)?, PROCESS_SYNCHRONIZE)?;
+    Ok(Box::new(PeerProcess(process)))
+}
 
 pub fn detach(command: &mut Command) -> Result<()> {
     let mut flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
@@ -79,37 +125,11 @@ pub fn detach(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-pub fn stop(socket: &SocketPath) -> Result<()> {
-    // SAFETY: FILETIME is a pair of zero-valid integer fields.
-    let mut connected_before: FILETIME = unsafe { zeroed() };
-    // SAFETY: output points to an initialized writable FILETIME.
-    unsafe {
-        GetSystemTimeAsFileTime(&mut connected_before);
-    }
-    let stream = Stream::connect(socket).context("connect to server for process identification")?;
-    let pipe = stream.handle()?;
-    let mut pid = 0;
-    // SAFETY: stream owns a connected pipe handle and pid is writable.
-    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
-        return Err(io::Error::last_os_error()).context("identify pipe server process");
-    }
-    if pid == 0 || pid == std::process::id() {
-        bail!("refusing to terminate an invalid server process");
-    }
-    // SAFETY: pid came from the connected pipe. The result is validated before
-    // becoming an OwnedHandle, and is retained through termination and waiting.
-    let raw = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
-            0,
-            pid,
-        )
-    };
-    if raw.is_null() {
-        return Err(io::Error::last_os_error()).context("open pipe server process");
-    }
-    // SAFETY: successful OpenProcess transferred unique handle ownership.
-    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+fn filetime(time: FILETIME) -> u64 {
+    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+}
+
+fn process_creation_time(process: &OwnedHandle) -> Result<u64> {
     // SAFETY: FILETIME contains only integer fields.
     let (mut created, mut exited, mut kernel, mut user): (FILETIME, FILETIME, FILETIME, FILETIME) =
         unsafe { zeroed() };
@@ -126,49 +146,7 @@ pub fn stop(socket: &SocketPath) -> Result<()> {
     {
         return Err(io::Error::last_os_error()).context("read server process identity");
     }
-    let filetime =
-        |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
-    if filetime(created) > filetime(connected_before) {
-        bail!("pipe server exited before identification; refusing to signal a reused PID");
-    }
-    if security::process_user_sid(process.as_raw_handle())? != security::current_user_sid()? {
-        bail!("refusing to stop a server owned by another user");
-    }
-    let mut image = vec![0u16; 32768];
-    let mut length = image.len() as u32;
-    // SAFETY: image owns the declared writable UTF-16 capacity.
-    if unsafe {
-        QueryFullProcessImageNameW(process.as_raw_handle(), 0, image.as_mut_ptr(), &mut length)
-    } == 0
-    {
-        return Err(io::Error::last_os_error()).context("read pipe server executable");
-    }
-    let image = PathBuf::from(std::ffi::OsString::from_wide(&image[..length as usize]));
-    let name = image
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    if !name.eq_ignore_ascii_case("zess.exe") || !has_server_argument(process.as_raw_handle())? {
-        bail!("refusing to terminate pipe peer {pid}: it is not a Zess server");
-    }
-    let mut verified_pid = 0;
-    // SAFETY: the connection remains live and output is writable.
-    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut verified_pid) } == 0
-        || verified_pid != pid
-    {
-        bail!("pipe server identity changed during identification");
-    }
-    // SAFETY: process is the owned, validated process handle; handle ownership
-    // prevents PID reuse from redirecting this termination to another process.
-    if unsafe { TerminateProcess(process.as_raw_handle(), 1) } == 0 {
-        return Err(io::Error::last_os_error()).context("terminate server process");
-    }
-    // SAFETY: process handle has SYNCHRONIZE access and remains live.
-    match unsafe { WaitForSingleObject(process.as_raw_handle(), 2000) } {
-        WAIT_OBJECT_0 => Ok(()),
-        WAIT_TIMEOUT => bail!("server {pid} did not exit after termination"),
-        _ => Err(io::Error::last_os_error()).context("wait for server exit"),
-    }
+    Ok(filetime(created))
 }
 
 fn has_server_argument(process: HANDLE) -> Result<bool> {
@@ -273,4 +251,100 @@ fn has_server_argument(process: HANDLE) -> Result<bool> {
         LocalFree(arguments.cast());
     }
     Ok(server)
+}
+
+struct StopPeer {
+    process: PeerProcess,
+    pid: u32,
+}
+
+impl ProcessWait for StopPeer {
+    fn wait(&self, timeout: Duration) -> io::Result<bool> {
+        self.process.wait(timeout)
+    }
+}
+
+impl ProcessStop for StopPeer {
+    fn is_peer(&self, stream: &Stream) -> Result<bool> {
+        Ok(pipe_peer_pid(stream)? == self.pid && !self.wait(Duration::ZERO)?)
+    }
+
+    fn terminate(&self) -> Result<()> {
+        if self.wait(Duration::ZERO)? {
+            return Ok(());
+        }
+        let pid = self.pid;
+        if pid == 0 || pid == std::process::id() {
+            bail!("refusing to terminate an invalid server process");
+        }
+        let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE)?;
+        // SAFETY: both owned process handles remain live during the comparison.
+        if unsafe { CompareObjectHandles(self.process.0.as_raw_handle(), process.as_raw_handle()) }
+            == 0
+        {
+            bail!("pipe server process changed before termination");
+        }
+        if security::process_user_sid(process.as_raw_handle())? != security::current_user_sid()? {
+            bail!("refusing to stop a server owned by another user");
+        }
+        let mut image = vec![0u16; 32768];
+        let mut length = image.len() as u32;
+        // SAFETY: image owns the declared writable UTF-16 capacity.
+        if unsafe {
+            QueryFullProcessImageNameW(process.as_raw_handle(), 0, image.as_mut_ptr(), &mut length)
+        } == 0
+        {
+            return Err(io::Error::last_os_error()).context("read pipe server executable");
+        }
+        let image = PathBuf::from(std::ffi::OsString::from_wide(&image[..length as usize]));
+        let name = image
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if !name.eq_ignore_ascii_case("zess.exe") || !has_server_argument(process.as_raw_handle())?
+        {
+            bail!("refusing to terminate pipe peer {pid}: it is not a Zess server");
+        }
+
+        // SAFETY: process is the owned, validated process handle; handle ownership
+        // prevents PID reuse from redirecting this termination to another process.
+        if unsafe { TerminateProcess(process.as_raw_handle(), 1) } == 0 {
+            return Err(io::Error::last_os_error()).context("terminate server process");
+        }
+        if !self
+            .wait(Duration::from_secs(2))
+            .context("wait for server exit")?
+        {
+            bail!("server {pid} did not exit after termination");
+        }
+        Ok(())
+    }
+}
+
+pub fn connect_for_stop(
+    ipc: &dyn LocalIpc,
+    socket: &SocketPath,
+) -> Result<(Stream, Box<dyn ProcessStop>)> {
+    // SAFETY: FILETIME is a pair of zero-valid integer fields.
+    let mut connected_before: FILETIME = unsafe { zeroed() };
+    // SAFETY: output points to an initialized writable FILETIME.
+    unsafe {
+        GetSystemTimeAsFileTime(&mut connected_before);
+    }
+    let stream = ipc.connect(socket).context("connect session")?;
+    let pid = pipe_peer_pid(&stream)?;
+    let process = open_process(pid, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)?;
+    if process_creation_time(&process)? > filetime(connected_before) {
+        bail!("pipe server exited before identification; refusing to watch a reused PID");
+    }
+    if pipe_peer_pid(&stream)? != pid {
+        bail!("pipe server identity changed during identification");
+    }
+    Ok((
+        stream,
+        Box::new(StopPeer {
+            process: PeerProcess(process),
+            pid,
+        }),
+    ))
 }

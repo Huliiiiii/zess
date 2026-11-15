@@ -3,19 +3,19 @@ use std::{
     net::Shutdown,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use zess_ipc::{SocketPath, Stream};
+use zess_ipc::{SocketPath, Stream, platform::ProcessWait};
 use zess_platform::{CancellationToken, FileSystem, Platform, SystemProcessRunner};
 use zess_remote::{
-    ArtifactCatalog, Connector, ProxyHandshake, ProxyOperation, ProxyRequest, SshBootstrap,
-    SshConnection, SshConnector, SshTarget,
+    Connector, ProxyHandshake, ProxyOperation, ProxyRequest, SshConnection, SshConnector, SshTarget,
 };
 use zess_terminal::{ConnectionFactory, ConnectionStream};
 
-use crate::server::{SessionInfo, SessionManager};
+use crate::server::{SessionInfo, SessionManager, SessionTarget};
 
 #[cfg(test)]
 mod tests;
@@ -23,73 +23,89 @@ mod tests;
 #[derive(Clone)]
 pub struct RemoteOptions {
     pub target: SshTarget,
-    pub server_binary: Option<PathBuf>,
-    pub server_artifacts: Option<PathBuf>,
-    pub file_system: Arc<dyn FileSystem>,
-    pub platform: Arc<dyn Platform>,
 }
 
-type ConnectorImpl =
-    SshConnector<SshBootstrap<SystemProcessRunner>, SystemProcessRunner, ProxyRequest>;
+type ConnectorImpl = SshConnector<SystemProcessRunner, ProxyRequest>;
 
-pub struct RemoteConnectionFactory(ConnectorImpl);
+pub struct RemoteConnectionFactory {
+    connector: ConnectorImpl,
+    session_id: Option<zess_protocol::SessionId>,
+}
 
-struct RemoteStream(SshConnection);
+struct RemoteStream {
+    connection: SshConnection,
+    session_id: Option<zess_protocol::SessionId>,
+}
 
 impl Read for RemoteStream {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.0.read(bytes)
+        self.connection.read(bytes)
     }
 }
 
 impl Write for RemoteStream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.write(bytes)
+        self.connection.write(bytes)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        self.connection.flush()
     }
 }
 
 impl ConnectionStream for RemoteStream {
+    fn session_id(&self) -> Option<&zess_protocol::SessionId> {
+        self.session_id.as_ref()
+    }
+
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.0.set_nonblocking(nonblocking)
+        self.connection.set_nonblocking(nonblocking)
+    }
+
+    fn wait_for_server_exit(&mut self, timeout: Duration) -> Result<bool> {
+        Ok(self.connection.wait_for_exit(timeout)?)
     }
 }
 
 impl ConnectionFactory for RemoteConnectionFactory {
     fn connect(&mut self) -> Result<Box<dyn ConnectionStream>> {
-        Ok(Box::new(RemoteStream(self.0.connect()?)))
+        let connection = self.connector.connect()?;
+        let session_id = Some(zess_protocol::SessionId(
+            connection
+                .session_id()
+                .context("remote proxy did not identify the session")?
+                .to_owned(),
+        ));
+        if let Some(pinned) = &self.session_id {
+            anyhow::ensure!(
+                session_id.as_ref() == Some(pinned),
+                "the original zess session is no longer available"
+            );
+        } else if let Some(id) = &session_id {
+            self.connector.request = ProxyRequest::new(ProxyOperation::AttachSession {
+                session_id: id.0.clone(),
+            });
+            self.session_id = session_id.clone();
+        }
+        Ok(Box::new(RemoteStream {
+            connection,
+            session_id,
+        }))
     }
 
     fn connect_with_cancellation(
         &mut self,
         cancellation: &CancellationToken,
     ) -> Result<Box<dyn ConnectionStream>> {
-        self.0.target.cancellation = Some(cancellation.clone());
+        self.connector.target.cancellation = Some(cancellation.clone());
         self.connect()
     }
 }
 
 impl RemoteOptions {
     fn connector(&self, operation: ProxyOperation) -> Result<ConnectorImpl> {
-        let file_system = self.file_system.clone();
-        let artifacts = if let Some(path) = &self.server_artifacts {
-            ArtifactCatalog::read_with_file_system(path, file_system.as_ref())?
-        } else {
-            ArtifactCatalog::default()
-        };
         Ok(SshConnector {
             target: self.target.clone(),
-            bootstrap: SshBootstrap {
-                runner: SystemProcessRunner,
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                artifacts,
-                server_binary: self.server_binary.clone(),
-                file_system,
-                platform: self.platform.clone(),
-            },
             runner: SystemProcessRunner,
             request: ProxyRequest::new(operation),
         })
@@ -101,19 +117,21 @@ impl RemoteOptions {
         files: Vec<String>,
         config: Option<String>,
     ) -> Result<RemoteConnectionFactory> {
-        Ok(RemoteConnectionFactory(self.connector(
-            ProxyOperation::Attach {
+        Ok(RemoteConnectionFactory {
+            connector: self.connector(ProxyOperation::Attach {
                 workspace,
                 files,
                 config,
-            },
-        )?))
+            })?,
+            session_id: None,
+        })
     }
 
     pub fn session_factory(&self, session_id: String) -> Result<RemoteConnectionFactory> {
-        Ok(RemoteConnectionFactory(
-            self.connector(ProxyOperation::AttachSession { session_id })?,
-        ))
+        Ok(RemoteConnectionFactory {
+            connector: self.connector(ProxyOperation::AttachSession { session_id })?,
+            session_id: None,
+        })
     }
 
     pub fn request(&self, operation: ProxyOperation) -> Result<ProxyResponse> {
@@ -132,16 +150,25 @@ impl RemoteOptions {
         }
     }
 
+    pub fn workspace_sessions(&self, workspace: String) -> Result<Vec<SessionInfo>> {
+        match self.request(ProxyOperation::WorkspaceSessions { workspace })? {
+            ProxyResponse::Sessions { sessions } => Ok(sessions),
+            _ => bail!("remote manager did not return workspace sessions"),
+        }
+    }
+
     pub fn create(
         &self,
         workspace: String,
         config: Option<String>,
         files: Vec<String>,
+        name: Option<String>,
     ) -> Result<SessionInfo> {
         match self.request(ProxyOperation::Start {
             workspace,
             config,
             files,
+            name,
         })? {
             ProxyResponse::Session { session } => Ok(session),
             _ => bail!("remote manager did not return the created session"),
@@ -224,6 +251,17 @@ pub fn serve_proxy(
     host: Arc<dyn Platform>,
 ) -> Result<()> {
     let mut input = BufReader::new(io::stdin());
+    let hello: zess_protocol::ClientMessage = zess_remote::read_request(&mut input)?;
+    let zess_protocol::ClientMessage::Hello { build_id } = hello else {
+        bail!("remote proxy expected hello");
+    };
+    zess_remote::write_request(
+        &mut io::stdout().lock(),
+        &zess_protocol::ServerMessage::Hello {
+            build_id: zess_build::BUILD_ID.into(),
+        },
+    )?;
+    zess_protocol::check_build_id(&build_id)?;
     let prepared = zess_remote::read_request(&mut input)
         .and_then(|request| prepare_proxy(request, &manager, filesystem.as_ref(), host.as_ref()));
     let output = match prepared {
@@ -237,17 +275,36 @@ pub fn serve_proxy(
             );
         }
     };
-    zess_remote::write_request(&mut io::stdout().lock(), &ProxyHandshake::ready())?;
     match output {
-        ProxyOutput::Stream(stream) => bridge(input, stream),
+        ProxyOutput::Stream {
+            stream,
+            session_id,
+            peer,
+        } => {
+            zess_remote::write_request(
+                &mut io::stdout().lock(),
+                &ProxyHandshake::Ready {
+                    session_id: Some(session_id),
+                },
+            )?;
+            bridge(input, stream, peer)
+        }
         ProxyOutput::Response(response) => {
+            zess_remote::write_request(
+                &mut io::stdout().lock(),
+                &ProxyHandshake::Ready { session_id: None },
+            )?;
             zess_remote::write_request(&mut io::stdout().lock(), &response)
         }
     }
 }
 
 enum ProxyOutput {
-    Stream(Stream),
+    Stream {
+        stream: Stream,
+        session_id: String,
+        peer: Box<dyn ProcessWait>,
+    },
     Response(ProxyResponse),
 }
 
@@ -257,13 +314,34 @@ fn prepare_proxy(
     filesystem: &dyn FileSystem,
     host: &dyn Platform,
 ) -> Result<ProxyOutput> {
-    request.validate()?;
-    if let ProxyOperation::AttachSession { session_id } = &request.operation {
-        let endpoint = manager.resolve(session_id)?;
-        let stream = manager
-            .connect(&endpoint)
-            .context("connect remote session")?;
-        return Ok(ProxyOutput::Stream(stream));
+    if let ProxyOperation::AttachSession {
+        session_id: selector,
+    } = &request.operation
+    {
+        let target = manager.resolve(selector)?;
+        let (stream, info, peer): (_, _, Box<dyn ProcessWait>) = match &target {
+            SessionTarget::Instance { .. } => {
+                let (stream, info, peer) = manager
+                    .connect_selected(&target)
+                    .with_context(|| format!("connect remote session {selector}"))?;
+                (stream, info, peer)
+            }
+            SessionTarget::Endpoint(endpoint) => {
+                let info = manager
+                    .inspect(endpoint)
+                    .with_context(|| format!("inspect remote session {selector}"))?;
+                let stream = manager
+                    .connect(endpoint)
+                    .with_context(|| format!("connect remote session {selector}"))?;
+                let peer = manager.watch(&stream)?;
+                (stream, info, peer)
+            }
+        };
+        return Ok(ProxyOutput::Stream {
+            stream,
+            session_id: info.session_id.0,
+            peer,
+        });
     }
     if let ProxyOperation::Attach {
         workspace,
@@ -280,16 +358,25 @@ fn prepare_proxy(
         let stream = manager
             .connect(&endpoint(&info))
             .context("connect remote session")?;
-        return Ok(ProxyOutput::Stream(stream));
+        let peer = manager.watch(&stream)?;
+        return Ok(ProxyOutput::Stream {
+            stream,
+            session_id: info.session_id.0,
+            peer,
+        });
     }
     let result = match request.operation {
         ProxyOperation::List | ProxyOperation::Status => manager
             .entries()
             .map(|sessions| ProxyResponse::Sessions { sessions }),
+        ProxyOperation::WorkspaceSessions { workspace } => manager
+            .workspace_sessions(&workspace_path(&workspace, filesystem, host)?)
+            .map(|sessions| ProxyResponse::Sessions { sessions }),
         ProxyOperation::Start {
             workspace,
             config,
             files,
+            name,
         } => {
             let workspace = workspace_path(&workspace, filesystem, host)?;
             let config = config
@@ -297,7 +384,7 @@ fn prepare_proxy(
                 .or_else(|| crate::default_config(filesystem, host));
             let files = files.into_iter().map(PathBuf::from).collect::<Vec<_>>();
             manager
-                .ensure_for_workspace(&workspace, config.as_deref(), &files)
+                .create(&workspace, config.as_deref(), &files, name.as_deref())
                 .map(|session| ProxyResponse::Session { session })
         }
         ProxyOperation::Stop {
@@ -305,17 +392,17 @@ fn prepare_proxy(
             workspace,
             force,
         } => {
-            let socket = if let Some(id) = session_id {
+            let target = if let Some(id) = session_id {
                 manager.resolve(&id)?
             } else {
-                manager.endpoint_for_workspace(&workspace_path(
+                SessionTarget::Endpoint(manager.endpoint_for_workspace(&workspace_path(
                     workspace.as_deref().unwrap_or("."),
                     filesystem,
                     host,
-                )?)?
+                )?)?)
             };
             manager
-                .stop(&socket, force)
+                .stop_target(&target, force)
                 .map(|()| ProxyResponse::Stopped)
         }
         ProxyOperation::Restart {
@@ -328,20 +415,28 @@ fn prepare_proxy(
                 .as_deref()
                 .map(|path| workspace_path(path, filesystem, host))
                 .transpose()?;
-            let socket = if let Some(id) = session_id {
-                manager.resolve(&id)?
+            let target = if let Some(id) = &session_id {
+                manager.resolve(id)?
             } else {
-                manager.endpoint_for_workspace(
-                    workspace
-                        .as_deref()
-                        .context("restart needs a workspace or session ID")?,
-                )?
+                SessionTarget::Endpoint(
+                    manager.endpoint_for_workspace(
+                        workspace
+                            .as_deref()
+                            .context("restart needs a workspace or session ID")?,
+                    )?,
+                )
             };
             let config = config
                 .map(PathBuf::from)
                 .or_else(|| crate::default_config(filesystem, host));
             manager
-                .restart(&socket, workspace.as_deref(), config.as_deref(), force)
+                .restart_target(
+                    &target,
+                    workspace.as_deref(),
+                    config.as_deref(),
+                    force,
+                    session_id.as_deref(),
+                )
                 .map(|session| ProxyResponse::Session { session })
         }
         ProxyOperation::Attach { .. } | ProxyOperation::AttachSession { .. } => unreachable!(),
@@ -349,7 +444,11 @@ fn prepare_proxy(
     result.map(ProxyOutput::Response)
 }
 
-fn bridge(mut input: BufReader<io::Stdin>, mut stream: Stream) -> Result<()> {
+fn bridge(
+    mut input: BufReader<io::Stdin>,
+    mut stream: Stream,
+    peer: Box<dyn zess_ipc::platform::ProcessWait>,
+) -> Result<()> {
     stream.set_nonblocking(false)?;
     let mut outgoing = stream.try_clone()?;
     std::thread::Builder::new()
@@ -358,9 +457,27 @@ fn bridge(mut input: BufReader<io::Stdin>, mut stream: Stream) -> Result<()> {
             let _ = io::copy(&mut input, &mut outgoing);
             let _ = outgoing.shutdown(Shutdown::Write);
         })?;
-    let result = io::copy(&mut stream, &mut io::stdout().lock());
+    let mut reader = BufReader::new(&mut stream);
+    let mut stdout = io::stdout().lock();
+    while let Some(frame) = zess_ipc::framing::read(&mut reader, zess_protocol::MAX_MESSAGE_BYTES)?
+    {
+        stdout.write_all(&frame)?;
+        stdout.flush()?;
+        let message: zess_protocol::ServerMessage = zess_ipc::framing::decode(&frame)?;
+        if matches!(
+            message,
+            zess_protocol::ServerMessage::Detached {
+                disposition: zess_protocol::ClientExitDisposition::Stopping
+            } | zess_protocol::ServerMessage::Exited
+        ) {
+            anyhow::ensure!(
+                peer.wait(Duration::from_secs(10))?,
+                "remote session did not exit within 10 seconds"
+            );
+            break;
+        }
+    }
     let _ = stream.shutdown(Shutdown::Both);
-    result.context("forward remote session output")?;
     Ok(())
 }
 

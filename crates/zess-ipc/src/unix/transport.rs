@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::SocketPath;
+use crate::{SocketPath, path::SocketIdentity};
 
 pub struct Stream(pub(crate) UnixStream);
 
@@ -60,6 +60,7 @@ impl Write for Stream {
 pub struct Listener {
     listener: UnixListener,
     socket: SocketPath,
+    identity: SocketIdentity,
 }
 
 impl Listener {
@@ -67,9 +68,11 @@ impl Listener {
         socket.remove_stale()?;
         let listener = UnixListener::bind(socket.as_path())
             .with_context(|| format!("bind {}", socket.display()))?;
+        let identity = socket.identity().context("identify newly bound socket")?;
         let listener = Self {
             listener,
             socket: socket.clone(),
+            identity,
         };
         fs::set_permissions(socket.as_path(), fs::Permissions::from_mode(0o600))?;
         Ok(listener)
@@ -86,6 +89,6 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        let _ = fs::remove_file(self.socket.as_path());
+        let _ = self.socket.remove_if_same(&self.identity);
     }
 }

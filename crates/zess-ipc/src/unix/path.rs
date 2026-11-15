@@ -16,6 +16,12 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::{ServerId, Stream};
 
+#[derive(PartialEq, Eq)]
+pub(crate) struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SocketPath(PathBuf);
 
@@ -34,6 +40,23 @@ impl SocketPath {
         match fs::symlink_metadata(&self.0) {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn identity(&self) -> io::Result<SocketIdentity> {
+        let metadata = fs::symlink_metadata(&self.0)?;
+        Ok(SocketIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    pub(crate) fn remove_if_same(&self, identity: &SocketIdentity) -> io::Result<()> {
+        match self.identity() {
+            Ok(current) if current == *identity => fs::remove_file(&self.0),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
     }

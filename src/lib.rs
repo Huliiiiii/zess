@@ -11,6 +11,8 @@ use zess_remote::SshTarget;
 use zess_session::Session;
 use zess_text::runtime::{GrammarToolchain, NativeGrammarToolchain};
 
+use crate::server::SessionTarget;
+
 mod remote;
 pub mod server;
 
@@ -29,11 +31,17 @@ struct RuntimeDependencies {
 struct SessionConnectionFactory {
     manager: server::SessionManager,
     endpoint: SocketPath,
+    session_id: zess_protocol::SessionId,
 }
 
 impl zess_terminal::ConnectionFactory for SessionConnectionFactory {
     fn connect(&mut self) -> Result<Box<dyn zess_terminal::ConnectionStream>> {
-        Ok(Box::new(self.manager.connect(&self.endpoint)?))
+        let stream = self.manager.connect(&self.endpoint)?;
+        let process = self.manager.watch(&stream)?;
+        Ok(Box::new(
+            zess_terminal::LocalConnection::new(stream, process)
+                .with_session_id(self.session_id.clone()),
+        ))
     }
 
     fn connect_with_cancellation(
@@ -91,15 +99,6 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 initial.get(1).context("clipboard operation missing")?,
             );
         }
-        Some("remote-info") => {
-            let info = zess_remote::RemoteInfo::current_with_file_system(
-                env!("CARGO_PKG_VERSION"),
-                filesystem.as_ref(),
-                &host.current_exe()?,
-            )?;
-            println!("{}", serde_json::to_string(&info)?);
-            return Ok(());
-        }
         Some("remote-proxy") => return remote::serve_proxy(manager, filesystem, host),
         _ => {}
     }
@@ -130,6 +129,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
     let mut force = false;
     let mut json = false;
     let mut session_id = None;
+    let mut session_name = None;
     let mut connect_by_id = false;
     let mut ssh_host = None;
     let mut ssh_port = None;
@@ -138,8 +138,6 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
     let mut ssh_config = None;
     let mut ssh_jump = None;
     let mut remote_workspace = None;
-    let mut server_binary = None;
-    let mut server_artifacts = None;
     let mut arguments = initial.into_iter().peekable();
     if arguments
         .peek()
@@ -150,14 +148,14 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
             Some("attach") => Mode::Attach,
             Some("session") => match arguments.next().as_deref() {
                 Some("list") => Mode::List,
-                Some("new" | "create") => Mode::New,
-                Some("connect" | "attach") => {
+                Some("new") => Mode::New,
+                Some("attach") => {
                     connect_by_id = true;
                     Mode::Attach
                 }
                 Some("stop") => Mode::Stop,
                 Some("restart") => Mode::Restart,
-                _ => bail!("usage: zess session list|new|connect|stop|restart [OPTIONS]"),
+                _ => bail!("usage: zess session list|new|attach|stop|restart [OPTIONS]"),
             },
             _ => unreachable!(),
         };
@@ -167,28 +165,22 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
             .peek()
             .is_some_and(|arg| matches!(arg.as_str(), "start" | "list" | "stop" | "restart"))
     {
-        let action = arguments.next().unwrap();
-        mode = match action.as_str() {
-            "start" => Mode::Server,
-            "list" => Mode::List,
-            "stop" => Mode::Stop,
-            "restart" => Mode::Restart,
-            _ => unreachable!(),
-        };
+        bail!("use zess session new|list|stop|restart");
     }
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "Zess — terminal editor with Wisp plugins\n\nUsage: zess [attach] [OPTIONS] [FILES...]\n       zess server [start] [OPTIONS] [FILES...]\n       zess server list [--socket PATH]\n       zess server stop [ID] [--workspace DIR | --socket PATH] [--force]\n       zess server restart [ID | --socket PATH] [--workspace DIR] [--config FILE] [--force]\n       zess --grammar fetch [GRAMMARS...]\n       zess --grammar build [GRAMMARS...]\n\nOptions: --workspace DIR, --socket PATH, --config FILE\n\nBy default, start a server if needed and attach the terminal.\nCtrl-z detaches; :q closes a buffer or exits when only a clean scratch remains.\nThe server keeps the session by default after the client exits.\n:files, :outline, :git open plugin buffers; :config-reload reloads Wisp.\n\nGrammar fetch downloads pinned sources; grammar build compiles cached sources without networking.\nSet ZESS_RUNTIME to select the grammar and query directory.\n\nServer IDs are workspace path hashes shown by `server list`.\n`server list` discovers sockets in the default runtime directory; use --socket for custom paths.\n`server stop` defaults to the current workspace and refuses unsaved buffers unless --force is given.\n`server restart` starts a fresh detached session using this executable.\nSaved files remain on disk; open buffers, layout and undo history are reset.\nRestart disconnects an attached terminal; --force discards unsaved changes.\nFor older servers without management support, --force is required; with ID/--socket, also specify --workspace.\nRestart uses --config or the current default configuration."
-                );
-                println!(
-                    "\nSession manager: zess session list|new|connect|stop|restart [OPTIONS]\n  --session ID selects a running session; --json prints manager responses.\nSSH: --ssh HOST [--remote-workspace PATH]\n  --ssh-config FILE, --ssh-identity FILE, --ssh-user USER, --ssh-port PORT, --ssh-jump HOST\n  --server-binary FILE selects a binary built for the remote platform.\n  --server-artifacts FILE selects a JSON artifact catalog for uploads or verified HTTPS downloads.\nRemote paths are interpreted on the remote machine.\nThe default on-client-exit=stop-if-unused stops an unused, unmodified session after normal client exit."
+                    "Zess — terminal editor with Wisp plugins\n\nUsage: zess [OPTIONS] [FILES...]\n       zess session new [NAME] [OPTIONS]\n       zess session list [OPTIONS]\n       zess session attach [NAME|ID] [OPTIONS]\n       zess session stop [NAME|ID] [OPTIONS]\n       zess session restart [NAME|ID] [OPTIONS]\n\nOptions: --workspace DIR, --config FILE, --ssh HOST, --json\nCtrl-z detaches; :q exits when only a clean scratch remains.\nRestart creates a fresh session and resets open buffers, layout and undo history.\nRemote Zess must already be installed on the SSH host."
                 );
                 return Ok(());
             }
             "--version" | "-V" => {
-                println!("zess {}", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "zess {} (build {})",
+                    env!("CARGO_PKG_VERSION"),
+                    zess_build::BUILD_ID
+                );
                 return Ok(());
             }
             "--json" => json = true,
@@ -228,17 +220,8 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                         .context("--remote-workspace needs a path")?,
                 )
             }
-            "--server-binary" => {
-                server_binary = Some(PathBuf::from(
-                    arguments.next().context("--server-binary needs a path")?,
-                ))
-            }
-            "--server-artifacts" => {
-                server_artifacts = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .context("--server-artifacts needs a JSON catalog")?,
-                ))
+            "--session-name" if mode == Mode::Server => {
+                session_name = Some(arguments.next().context("--session-name needs a name")?)
             }
             "--workspace" => {
                 workspace_given = true;
@@ -278,9 +261,6 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
     if connect_by_id && session_id.is_none() && !files.is_empty() {
         session_id = Some(remote::path_string(&files.remove(0))?);
     }
-    if connect_by_id && session_id.is_none() {
-        bail!("usage: zess session connect ID [OPTIONS] [FILES...]");
-    }
     if mode == Mode::Edit && session_id.is_some() {
         mode = Mode::Attach;
     }
@@ -294,13 +274,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         target.identity_file = ssh_identity;
         target.config_file = ssh_config;
         target.jump_host = ssh_jump;
-        let remote = remote::RemoteOptions {
-            target,
-            server_binary,
-            server_artifacts,
-            file_system: filesystem.clone(),
-            platform: host.clone(),
-        };
+        let remote = remote::RemoteOptions { target };
         let remote_workspace_given = remote_workspace.is_some() || workspace_given;
         let workspace = remote_workspace
             .or_else(|| workspace_given.then(|| workspace.to_string_lossy().into_owned()))
@@ -334,7 +308,11 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 Ok(())
             }
             Mode::New | Mode::Server => {
-                let session = remote.create(workspace, config, paths)?;
+                if paths.len() > 1 {
+                    bail!("usage: zess session new [NAME]");
+                }
+                let name = paths.into_iter().next();
+                let session = remote.create(workspace, config, Vec::new(), name)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&session)?);
                 } else {
@@ -362,11 +340,29 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                     let session = remote
                         .sessions()?
                         .into_iter()
-                        .find(|entry| entry.id == id || entry.session_id.0 == id)
+                        .find(|entry| {
+                            entry.id == id
+                                || entry.session_id.0 == id
+                                || entry.name.as_deref() == Some(id.as_str())
+                        })
                         .with_context(|| format!("remote session {id} was not found"))?;
                     let mut factory = remote.session_factory(session.session_id.0)?;
                     zess_terminal::run_connection_with_platform(&mut factory, &files, host.as_ref())
                 } else {
+                    let sessions = remote.workspace_sessions(workspace.clone())?;
+                    if mode == Mode::Attach || sessions.len() > 1 {
+                        let selected = match sessions.as_slice() {
+                            [] => bail!("no session exists for the remote workspace"),
+                            [session] => session,
+                            _ => select_session(&sessions)?,
+                        };
+                        let mut factory = remote.session_factory(selected.session_id.0.clone())?;
+                        return zess_terminal::run_connection_with_platform(
+                            &mut factory,
+                            &files,
+                            host.as_ref(),
+                        );
+                    }
                     let mut factory = remote.factory(workspace, Vec::new(), config)?;
                     zess_terminal::run_connection_with_platform(&mut factory, &files, host.as_ref())
                 }
@@ -380,10 +376,8 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         || ssh_config.is_some()
         || ssh_jump.is_some()
         || remote_workspace.is_some()
-        || server_binary.is_some()
-        || server_artifacts.is_some()
     {
-        bail!("SSH connection and server artifact options require --ssh HOST");
+        bail!("SSH connection options require --ssh HOST");
     }
     if matches!(mode, Mode::Stop | Mode::Restart)
         && let Some(id) = session_id.take()
@@ -415,18 +409,19 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
     }
     if mode == Mode::List {
         if !files.is_empty() || config.is_some() || workspace_given {
-            bail!("usage: zess server list [--socket PATH]");
+            bail!("usage: zess session list [--socket PATH]");
         }
+        let entries = if let Some(socket) = &socket {
+            vec![manager.inspect(socket)?]
+        } else {
+            manager.entries()?
+        };
         if json {
-            let entries = if let Some(socket) = &socket {
-                vec![manager.inspect(socket)?]
-            } else {
-                manager.entries()?
-            };
             println!("{}", serde_json::to_string_pretty(&entries)?);
-            return Ok(());
+        } else {
+            print_sessions(&entries);
         }
-        return server::list_with_manager(&manager, socket.as_ref());
+        return Ok(());
     }
     if mode == Mode::Stop {
         if files.len() > 1
@@ -434,36 +429,37 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
             || (!files.is_empty() && (socket.is_some() || workspace_given))
             || (socket.is_some() && workspace_given)
         {
-            bail!("usage: zess server stop [ID] [--workspace DIR | --socket PATH] [--force]");
+            bail!("usage: zess session stop [ID] [--workspace DIR | --socket PATH] [--force]");
         }
-        let socket = if let Some(id) = files.first() {
+        let target = if let Some(id) = files.first() {
             manager.resolve(id.to_str().context("server ID must be hexadecimal")?)?
         } else if let Some(socket) = socket {
-            socket
+            SessionTarget::Endpoint(socket)
         } else {
-            manager.endpoint_for_workspace(
-                &filesystem
-                    .canonicalize(&workspace)
-                    .context("open workspace directory")?,
-            )?
+            SessionTarget::Endpoint(
+                manager.endpoint_for_workspace(
+                    &filesystem
+                        .canonicalize(&workspace)
+                        .context("open workspace directory")?,
+                )?,
+            )
         };
 
+        manager.stop_target(&target, force)?;
         if json {
-            manager.stop(&socket, force)?;
             println!(
                 "{}",
                 serde_json::to_string(&remote::ProxyResponse::Stopped)?
             );
             return Ok(());
         }
-        manager.stop(&socket, force)?;
-        println!("Stopped server at {}", socket.display());
+        println!("Stopped server at {}", target.endpoint().display());
         return Ok(());
     }
     if mode == Mode::Restart {
         if files.len() > 1 || (!files.is_empty() && socket.is_some()) {
             bail!(
-                "usage: zess server restart [ID | --socket PATH] [--workspace DIR] [--config FILE] [--force]"
+                "usage: zess session restart [ID | --socket PATH] [--workspace DIR] [--config FILE] [--force]"
             );
         }
         let explicit_target = !files.is_empty() || socket.is_some();
@@ -476,24 +472,39 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         } else {
             None
         };
-        let socket = if let Some(id) = files.first() {
+        let target = if let Some(id) = files.first() {
             manager.resolve(id.to_str().context("server ID must be hexadecimal")?)?
         } else if let Some(socket) = socket {
-            socket
+            SessionTarget::Endpoint(socket)
         } else {
-            manager.endpoint_for_workspace(workspace.as_deref().unwrap())?
+            SessionTarget::Endpoint(manager.endpoint_for_workspace(workspace.as_deref().unwrap())?)
         };
-        return server::restart_with_manager(
-            &manager,
-            &socket,
+        eprintln!(
+            "Restart creates a fresh session; open buffers, layout and undo history are reset{}.",
+            if force {
+                "; unsaved changes will be discarded"
+            } else {
+                ""
+            }
+        );
+        let session = manager.restart_target(
+            &target,
             workspace.as_deref(),
             config
                 .or_else(|| default_config(filesystem.as_ref(), host.as_ref()))
                 .as_deref(),
             force,
-        );
+            files.first().and_then(|id| id.to_str()),
+        )?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&session)?);
+        } else {
+            print_sessions(&[session]);
+        }
+        return Ok(());
     }
-    if !workspace_given
+    if mode == Mode::Edit
+        && !workspace_given
         && files.first().is_some_and(|path| {
             filesystem
                 .metadata(path)
@@ -513,11 +524,15 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
     let mut workspace = filesystem
         .canonicalize(&workspace)
         .context("open workspace directory")?;
+    let socket_given = socket.is_some();
+    let mut selected_session = None;
     let socket = match (session_id, socket) {
         (Some(id), None) => {
-            let endpoint = manager.resolve(&id)?;
-            workspace = PathBuf::from(manager.inspect(&endpoint)?.workspace);
-            endpoint
+            let target = manager.resolve(&id)?;
+            let info = manager.inspect_target(&target)?;
+            workspace = PathBuf::from(&info.workspace);
+            selected_session = Some(info.session_id);
+            target.endpoint().clone()
         }
         (Some(_), Some(_)) => bail!("--session cannot be combined with --socket"),
         (None, Some(path)) => path,
@@ -537,23 +552,29 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
             host.clone(),
             filesystem.clone(),
         ));
-        return zess_session::serve_with_platform(
-            ipc.as_ref(),
-            &socket,
-            Session::with_capabilities(
-                workspace,
-                &files,
-                config,
-                services,
-                syntax_provider,
-                script_compiler,
-            )?,
-            host.as_ref(),
-        );
+        let mut session = Session::with_capabilities(
+            workspace,
+            &files,
+            config,
+            services,
+            syntax_provider,
+            script_compiler,
+        )?;
+        if let Some(name) = session_name {
+            session.set_name(name);
+        }
+        return zess_session::serve_with_platform(ipc.as_ref(), &socket, session, host.as_ref());
     }
-    let socket = if matches!(mode, Mode::Edit | Mode::New) {
-        let session = manager.ensure(&workspace, &socket, config.as_deref(), &files)?;
+    let (socket, session_id) = if matches!(mode, Mode::Edit | Mode::New) {
         if mode == Mode::New {
+            if files.len() > 1 {
+                bail!("usage: zess session new [NAME]");
+            }
+            let name = files
+                .first()
+                .map(|path| path.to_str().context("session name must be UTF-8"))
+                .transpose()?;
+            let session = manager.create(&workspace, config.as_deref(), &[], name)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&session)?);
             } else {
@@ -561,9 +582,35 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
             }
             return Ok(());
         }
-        SocketPath::from(PathBuf::from(session.endpoint))
+        let sessions = manager.workspace_sessions(&workspace)?;
+        let session = if sessions.len() > 1 {
+            select_session(&sessions)?.clone()
+        } else {
+            manager.ensure(&workspace, &socket, config.as_deref(), &files)?
+        };
+        (
+            SocketPath::from(PathBuf::from(session.endpoint)),
+            session.session_id,
+        )
     } else {
-        socket
+        if selected_session.is_none() && !socket_given {
+            let sessions = manager.workspace_sessions(&workspace)?;
+            let session = match sessions.as_slice() {
+                [] => bail!("no session exists for {}", workspace.display()),
+                [session] => session,
+                _ => select_session(&sessions)?,
+            };
+            (
+                SocketPath::from(PathBuf::from(&session.endpoint)),
+                session.session_id.clone(),
+            )
+        } else {
+            let session_id = match selected_session {
+                Some(id) => id,
+                None => manager.inspect(&socket)?.session_id,
+            };
+            (socket, session_id)
+        }
     };
     let files = files
         .iter()
@@ -579,10 +626,32 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         &mut SessionConnectionFactory {
             manager,
             endpoint: socket,
+            session_id,
         },
         &files,
         host.as_ref(),
     )
+}
+
+fn select_session(sessions: &[server::SessionInfo]) -> Result<&server::SessionInfo> {
+    use std::io::Write;
+    eprintln!("Multiple sessions are available:");
+    for (index, session) in sessions.iter().enumerate() {
+        eprintln!(
+            "  {}: {} ({})",
+            index + 1,
+            session.name.as_deref().unwrap_or("unnamed"),
+            session.id
+        );
+    }
+    eprint!("Select a session: ");
+    std::io::stderr().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let index: usize = input.trim().parse().context("enter a session number")?;
+    sessions
+        .get(index.wrapping_sub(1))
+        .context("invalid session number")
 }
 
 fn default_config(filesystem: &dyn FileSystem, host: &dyn Platform) -> Option<PathBuf> {
@@ -598,10 +667,11 @@ fn default_config(filesystem: &dyn FileSystem, host: &dyn Platform) -> Option<Pa
 }
 
 fn print_sessions(sessions: &[server::SessionInfo]) {
-    println!("ID\tSESSION\tPID\tCLIENT\tMODIFIED\tWORKSPACE");
+    println!("NAME\tID\tSESSION\tPID\tCLIENT\tMODIFIED\tWORKSPACE");
     for session in sessions {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            session.name.as_deref().unwrap_or("-"),
             session.id,
             session.session_id.0,
             session.pid,

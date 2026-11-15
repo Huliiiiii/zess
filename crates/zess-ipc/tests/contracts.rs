@@ -106,6 +106,20 @@ fn failed_binding_preserves_the_existing_listener() {
 
 #[cfg(unix)]
 #[test]
+fn dropping_a_listener_preserves_a_replacement_at_the_same_path() {
+    let fixture = SocketFixture::new();
+    let original = Listener::bind(&fixture.socket).unwrap();
+    fs::remove_file(fixture.socket.as_path()).unwrap();
+    let replacement = Listener::bind(&fixture.socket).unwrap();
+
+    drop(original);
+
+    let _client = Stream::connect(&fixture.socket).unwrap();
+    assert!(replacement.accept().is_ok());
+}
+
+#[cfg(unix)]
+#[test]
 fn binding_does_not_replace_a_regular_file() {
     let fixture = SocketFixture::new();
     fs::write(fixture.socket.as_path(), b"keep me").unwrap();

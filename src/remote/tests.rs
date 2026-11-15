@@ -13,6 +13,10 @@ struct RoutedIpc {
 }
 
 impl LocalIpc for RoutedIpc {
+    fn discover(&self) -> Result<Vec<SocketPath>> {
+        Ok(Vec::new())
+    }
+
     fn by_id(&self, _: ServerId) -> SocketPath {
         self.logical.clone()
     }
@@ -43,6 +47,38 @@ fn attaching_a_remote_session_uses_the_managers_ipc_route() -> Result<()> {
         Arc::new(NativeDaemonControl),
         Arc::new(NativePlatform),
     );
+    let worker = std::thread::spawn(move || -> Result<()> {
+        let mut peer = listener.accept()?;
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        let mut input = BufReader::new(peer.try_clone()?);
+        let _: zess_protocol::ClientMessage = zess_remote::read_request(&mut input)?;
+        zess_remote::write_request(
+            &mut peer,
+            &zess_protocol::ServerMessage::Hello {
+                build_id: zess_build::BUILD_ID.into(),
+            },
+        )?;
+        let _: zess_protocol::ClientMessage = zess_remote::read_request(&mut input)?;
+        zess_remote::write_request(
+            &mut peer,
+            &zess_protocol::ServerMessage::Status {
+                session_id: zess_protocol::SessionId("actual-session".into()),
+                name: None,
+                server_instance: zess_protocol::ServerInstanceId("instance".into()),
+                state_revision: 0,
+                pid: 1,
+                workspace: "/".into(),
+                attached: false,
+                modified: false,
+            },
+        )?;
+        let mut peer = listener.accept()?;
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        let mut bytes = [0; 19];
+        peer.read_exact(&mut bytes)?;
+        assert_eq!(&bytes, b"remote protocol\0\xff\r\n");
+        Ok(())
+    });
     let output = prepare_proxy(
         ProxyRequest::new(ProxyOperation::AttachSession {
             session_id: "0123456789abcdef".into(),
@@ -51,14 +87,16 @@ fn attaching_a_remote_session_uses_the_managers_ipc_route() -> Result<()> {
         &NativeFileSystem,
         &NativePlatform,
     )?;
-    let ProxyOutput::Stream(mut stream) = output else {
+    let ProxyOutput::Stream {
+        mut stream,
+        session_id,
+        ..
+    } = output
+    else {
         panic!("attach must return a protocol stream");
     };
-    let mut peer = listener.accept()?;
-    peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    assert_eq!(session_id, "actual-session");
     stream.write_all(b"remote protocol\0\xff\r\n")?;
-    let mut bytes = [0; 19];
-    peer.read_exact(&mut bytes)?;
-    assert_eq!(&bytes, b"remote protocol\0\xff\r\n");
+    worker.join().unwrap()?;
     Ok(())
 }
