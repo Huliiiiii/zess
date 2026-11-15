@@ -9,6 +9,7 @@ use std::{
     path::PathBuf,
     process::Command,
     ptr::null_mut,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -36,7 +37,40 @@ use windows_sys::Win32::{
     UI::Shell::CommandLineToArgvW,
 };
 
-use crate::{SocketPath, Stream, windows::security};
+use crate::{SocketPath, Stream, platform::ProcessWait, windows::security};
+
+struct PeerProcess(OwnedHandle);
+
+impl ProcessWait for PeerProcess {
+    fn wait(&self, timeout: Duration) -> io::Result<bool> {
+        let millis = timeout.as_millis() + u128::from(timeout.subsec_nanos() % 1_000_000 != 0);
+        let timeout = millis.min((u32::MAX - 1) as u128) as u32;
+        // SAFETY: the owned process handle has SYNCHRONIZE access and remains live.
+        match unsafe { WaitForSingleObject(self.0.as_raw_handle(), timeout) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+pub fn watch(stream: &Stream) -> Result<Box<dyn ProcessWait>> {
+    let pipe = stream.handle()?;
+    let mut pid = 0;
+    // SAFETY: the connected pipe handle is live and pid is writable.
+    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
+        return Err(io::Error::last_os_error()).context("identify pipe server process");
+    }
+    // SAFETY: pid came from the connected pipe; the returned handle is checked.
+    let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error()).context("open pipe server process");
+    }
+    // SAFETY: successful OpenProcess transferred unique handle ownership.
+    Ok(Box::new(PeerProcess(unsafe {
+        OwnedHandle::from_raw_handle(raw)
+    })))
+}
 
 pub fn detach(command: &mut Command) -> Result<()> {
     let mut flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;

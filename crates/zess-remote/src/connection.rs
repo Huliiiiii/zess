@@ -14,6 +14,7 @@ use zess_platform::{CancellationToken, OwnedProcess};
 
 pub struct SshConnection {
     process: OwnedProcess,
+    pub(crate) session_id: Option<String>,
     outgoing: Option<SyncSender<Outgoing>>,
     writer: Option<JoinHandle<()>>,
     flushing: Option<Receiver<io::Result<()>>>,
@@ -111,6 +112,7 @@ impl SshConnection {
         };
         Ok(Self {
             process,
+            session_id: None,
             outgoing: Some(outgoing),
             writer: Some(writer),
             flushing: None,
@@ -122,6 +124,32 @@ impl SshConnection {
             eof: false,
             cancellation,
         })
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> io::Result<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            self.check_cancellation()?;
+            if let Some(status) = self.process.try_wait()? {
+                if status.success() {
+                    return Ok(true);
+                }
+                return Err(io::Error::other(format!(
+                    "SSH process exited with {status}"
+                )));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(
+                Duration::from_millis(10)
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
+        }
     }
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {

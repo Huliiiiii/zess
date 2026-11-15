@@ -35,7 +35,7 @@ Unix 使用 Unix domain socket，Windows 使用 named pipe。Unix socket 放在�
 
 快照标识 Session、server instance 和 revision；增量指定原 revision 和新 revision。身份不一致或 revision 不连续时，客户端暂停应用增量并请求新快照。Session 标识会话，server instance 区分不同 daemon；context epoch 用于识别输入的交互上下文是否发生变化。
 
-恢复选择先于待决退出；失败或未知的操作结果保持可见。寄存器 `+p` 的待处理读取仍可被后续输入取消。连接中断后，客户端重新附着并等待服务端确认位置和快照。相同实例且服务端允许重放时，客户端重发尚未确认的输入。实例变化或上下文不允许重放时，用户选择重放或丢弃；丢弃已发送但未确认的输入时，等待服务端确认；尚未发送的队列直接丢弃。已确认输入不会因重连再发。带副作用的命令另以 request ID 和 server instance 跟踪，重连时查询结果；实例变化后无法假设旧实例的结果仍可查询。相关状态机见 [客户端](../crates/zess-terminal/src/lib.rs) 和 [服务端](../crates/zess-session/src/server.rs)。
+恢复选择先于待决退出；失败或未知的操作结果保持可见。寄存器 `+p` 的待处理读取仍可被后续输入取消。连接中断后，客户端只重新附着原会话并等待服务端确认位置和快照；原会话已结束时不会创建替代会话。相同实例且服务端允许重放时，客户端重发尚未确认的输入。上下文不允许重放时，用户选择重放或丢弃；丢弃已发送但未确认的输入时，等待服务端确认；尚未发送的队列直接丢弃。已确认输入不会因重连再发。带副作用的命令另以 request ID 和 server instance 跟踪，重连时查询结果；会话停止后无法查询原实例的结果。相关状态机见 [客户端](../crates/zess-terminal/src/lib.rs) 和 [服务端](../crates/zess-session/src/server.rs)。
 
 Windows 远端启动 daemon 时检查当前 Job 的限制；需要且允许时显式请求 breakaway，遇到禁止 breakaway 的关闭即终止 Job 则报告错误。Microsoft 的 [OpenSSH Windows 命令进程实现](https://github.com/PowerShell/openssh-portable/blob/274893f8d1fe86c4d128b514c3af4bc10cdc0c99/contrib/win32/win32compat/w32-doexec.c#L440-L457) 使用关闭 Job 时结束进程并允许 breakaway 的设置。当前检查针对当前 Job；自定义嵌套外层 Job 的限制不在该检查保证范围内。
 
@@ -45,7 +45,7 @@ Windows 远端启动 daemon 时检查当前 Job 的限制；需要且允许时�
 
 本地管理器按规范化 workspace 路径选择端点，`ensure` 连接已有 daemon 或启动一个新 daemon。daemon 负责 Session、文件及插件操作；终端客户端持有终端设备、剪贴板和连接。客户端退出后，服务端在连接释放后依据活动连接、未保存状态与会话策略决定是否停止，见 [配置](configuration.md)。会话运行在哪台机器，其 workspace、配置、Git、监听及外部程序就属于哪台机器；远程会话的界面和剪贴板仍属于本地客户端。
 
-SSH 连接依次探测远端系统和架构，选择预安装程序或 artifact，验证版本、协议、平台及适用的摘要；需要安装时通过 SSH 上传或由远端 HTTPS 下载，校验 SHA-256 后放入缓存。随后启动 `remote-proxy`，发送管理或附着请求；代理连接远端 workspace daemon，准备完成后握手并转发会话流。一个连接的标准输入和输出承载协议，标准错误承载诊断；远端 shell 向标准输出写入 banner 会破坏引导或协议。系统 SSH 按其有效配置负责认证、主机密钥检查和加密，Zess 不复制私钥，也不覆盖用户的主机密钥检查策略。Windows 命名管道忙时的连接尝试最多等待既有的两秒后才检查取消。
+SSH 连接启动远端 PATH 中已安装的 Zess `remote-proxy`，双方通过 Hello 确认 Build ID 一致；代理处理管理请求或连接对应的会话服务端并转发会话流。一个连接的标准输入和输出承载协议，标准错误承载诊断；远端 shell 向标准输出写入 banner 会破坏协议。系统 SSH 按其有效配置负责认证、主机密钥检查和加密。Windows 命名管道忙时的连接尝试最多等待既有的两秒后才检查取消。
 
 标准流代理复用 SSH 进程及现有本地 IPC，不需要在远端公开 TCP 监听或分配转发端口。代价是 SSH 进程和其标准流构成连接生命周期，须处理认证、握手、断线和流中诊断隔离；端口转发则需要另行管理转发端点及生命周期。这里没有对两种传输作性能比较。
 

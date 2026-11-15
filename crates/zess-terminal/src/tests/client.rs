@@ -42,6 +42,9 @@ struct ScriptedStream {
     close_at: Option<usize>,
     fence_probes: std::collections::HashSet<RequestId>,
     fence_reply_after: usize,
+    waited: Rc<Cell<usize>>,
+    exit_result: bool,
+    session_id: Option<SessionId>,
 }
 
 impl ScriptedStream {
@@ -50,16 +53,21 @@ impl ScriptedStream {
         messages: Vec<(usize, Vec<ServerMessage>)>,
         close_at: Option<usize>,
     ) -> Self {
-        let batches = messages
-            .into_iter()
-            .map(|(phase, messages)| {
-                let bytes = messages
-                    .into_iter()
-                    .flat_map(|message| framing::encode(&message).unwrap())
-                    .collect();
-                (phase, bytes)
-            })
-            .collect();
+        let batches = std::iter::once((
+            0,
+            vec![ServerMessage::Hello {
+                build_id: zess_build::BUILD_ID.into(),
+            }],
+        ))
+        .chain(messages)
+        .map(|(phase, messages)| {
+            let bytes = messages
+                .into_iter()
+                .flat_map(|message| framing::encode(&message).unwrap())
+                .collect();
+            (phase, bytes)
+        })
+        .collect();
         Self {
             phase,
             batches,
@@ -67,6 +75,9 @@ impl ScriptedStream {
             close_at,
             fence_probes: std::collections::HashSet::new(),
             fence_reply_after: 0,
+            waited: Rc::default(),
+            exit_result: true,
+            session_id: None,
         }
     }
 }
@@ -142,6 +153,13 @@ impl Write for ScriptedStream {
 }
 
 impl ConnectionStream for ScriptedStream {
+    fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
+    }
+    fn wait_for_server_exit(&mut self, _: Duration) -> Result<bool> {
+        self.waited.set(self.waited.get() + 1);
+        Ok(self.exit_result)
+    }
     fn set_nonblocking(&self, _: bool) -> io::Result<()> {
         Ok(())
     }
@@ -1633,4 +1651,168 @@ fn reconnect_recovery_preserves_pending_command_results() {
             assert!(messages.iter().any(|message| matches!(message, ClientMessage::Input { sequence, key, context_epoch: 6 } if *sequence == next && key == "y")), "{report:?}: normal input resumes after both decisions");
         }
     }
+}
+
+#[test]
+fn a_different_build_is_rejected_before_attachment() {
+    let phase = Rc::new(Cell::new(0));
+    let mut stream = ScriptedStream::new(phase.clone(), vec![], None);
+    stream.batches[0].1 = framing::encode(&ServerMessage::Hello {
+        build_id: "different-build".into(),
+    })
+    .unwrap()
+    .into();
+    let output = stream.output.clone();
+    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let mut terminal = ScriptedTerminal {
+        phase,
+        events: VecDeque::new(),
+        wait_at: None,
+        output: Vec::new(),
+        mouse: false,
+    };
+    let error = run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard)
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<zess_protocol::BuildMismatch>()
+            .is_some()
+    );
+    let sent = messages(&output);
+    assert_eq!(sent.len(), 1);
+    assert!(
+        matches!(&sent[0], ClientMessage::Hello { build_id } if build_id == zess_build::BUILD_ID)
+    );
+}
+
+#[test]
+fn attachment_uses_the_session_selected_by_the_transport() {
+    let phase = Rc::new(Cell::new(0));
+    let mut stream = ScriptedStream::new(
+        phase.clone(),
+        vec![
+            (0, vec![attached(), snapshot(1, SessionSnapshot::default())]),
+            (
+                2,
+                vec![ServerMessage::Detached {
+                    disposition: zess_protocol::ClientExitDisposition::Retained,
+                }],
+            ),
+        ],
+        None,
+    );
+    stream.session_id = Some(SessionId("session".into()));
+    let output = stream.output.clone();
+    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let mut terminal = ScriptedTerminal {
+        phase,
+        events: VecDeque::from([None, None]),
+        wait_at: None,
+        output: Vec::new(),
+        mouse: false,
+    };
+    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    let sent = messages(&output);
+    assert!(matches!(&sent[0], ClientMessage::Hello { .. }));
+    assert!(
+        matches!(&sent[1], ClientMessage::Attach { expected_session: Some(id), .. } if id.0 == "session")
+    );
+}
+
+#[test]
+fn stopping_waits_for_the_server_and_reports_a_process_that_did_not_exit() {
+    let phase = Rc::new(Cell::new(0));
+    let mut stream = ScriptedStream::new(
+        phase.clone(),
+        vec![
+            (0, vec![attached(), snapshot(1, SessionSnapshot::default())]),
+            (
+                2,
+                vec![ServerMessage::Detached {
+                    disposition: zess_protocol::ClientExitDisposition::Stopping,
+                }],
+            ),
+        ],
+        None,
+    );
+    stream.exit_result = false;
+    let waited = stream.waited.clone();
+    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let mut terminal = ScriptedTerminal {
+        phase,
+        events: VecDeque::from([None, None]),
+        wait_at: None,
+        output: Vec::new(),
+        mouse: false,
+    };
+    let error = run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard)
+        .unwrap_err();
+    assert!(error.to_string().contains("did not exit"));
+    assert_eq!(waited.get(), 1);
+}
+
+#[test]
+fn retaining_the_session_does_not_wait_for_its_process() {
+    let phase = Rc::new(Cell::new(0));
+    let mut stream = ScriptedStream::new(
+        phase.clone(),
+        vec![
+            (0, vec![attached(), snapshot(1, SessionSnapshot::default())]),
+            (
+                2,
+                vec![ServerMessage::Detached {
+                    disposition: zess_protocol::ClientExitDisposition::Retained,
+                }],
+            ),
+        ],
+        None,
+    );
+    stream.exit_result = false;
+    let waited = stream.waited.clone();
+    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let mut terminal = ScriptedTerminal {
+        phase,
+        events: VecDeque::from([None, None]),
+        wait_at: None,
+        output: Vec::new(),
+        mouse: false,
+    };
+    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    assert_eq!(waited.get(), 0);
+}
+
+#[test]
+fn reconnecting_to_a_replacement_session_does_not_replay_input() {
+    let phase = Rc::new(Cell::new(0));
+    let first = ScriptedStream::new(
+        phase.clone(),
+        vec![(0, vec![attached(), snapshot(1, SessionSnapshot::default())])],
+        Some(1),
+    );
+    let mut replacement = attached();
+    if let ServerMessage::Attached {
+        server_instance, ..
+    } = &mut replacement
+    {
+        server_instance.0 = "replacement".into();
+    }
+    let second = ScriptedStream::new(phase.clone(), vec![(2, vec![replacement])], None);
+    let output = second.output.clone();
+    let mut factory = ScriptedFactory(VecDeque::from([first, second]));
+    let mut terminal = ScriptedTerminal {
+        phase,
+        events: VecDeque::from([key(KeyCode::Char('x')), None, None]),
+        wait_at: Some(1),
+        output: Vec::new(),
+        mouse: false,
+    };
+    let error = run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard)
+        .unwrap_err();
+    assert!(error.to_string().contains("original zess server"));
+    assert!(!messages(&output).iter().any(|message| matches!(
+        message,
+        ClientMessage::Input { .. }
+            | ClientMessage::TrackedInput { .. }
+            | ClientMessage::Command { .. }
+    )));
 }

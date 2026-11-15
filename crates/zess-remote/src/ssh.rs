@@ -7,10 +7,11 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use zess_platform::{Cancellation, CancellationToken, ConsoleMode, ProcessRunner, ProcessSpec};
+use zess_protocol::{ClientMessage, ServerMessage, check_build_id};
 
-use crate::{Bootstrap, PROXY_PROTOCOL_VERSION, ProxyHandshake, SshConnection};
+use crate::{ProxyHandshake, SshConnection};
 
 #[derive(Clone, Debug)]
 pub struct SshTarget {
@@ -79,27 +80,39 @@ pub trait Connector {
     fn connect(&mut self) -> anyhow::Result<Self::Connection>;
 }
 
-pub struct SshConnector<B, R, Q> {
+pub struct SshConnector<R, Q> {
     pub target: SshTarget,
-    pub bootstrap: B,
     pub runner: R,
     pub request: Q,
 }
 
-impl<B: Bootstrap, R: ProcessRunner, Q: Serialize> Connector for SshConnector<B, R, Q> {
+impl<R: ProcessRunner, Q: Serialize> Connector for SshConnector<R, Q> {
     type Connection = SshConnection;
 
     fn connect(&mut self) -> anyhow::Result<Self::Connection> {
         self.target.check_cancellation()?;
-        let server = self.bootstrap.prepare(&self.target)?;
-        self.target.check_cancellation()?;
-        let spec = self.target.command(server.command())?;
+        let spec = self.target.command("zess remote-proxy")?;
         let mut connection = SshConnection::with_cancellation(
             self.runner.spawn(&spec)?,
             self.target.cancellation.clone(),
         )?;
+        write_initial_request(
+            &mut connection,
+            &ClientMessage::Hello {
+                build_id: zess_build::BUILD_ID.into(),
+            },
+            &self.target,
+        )?;
+        match read_initial::<ServerMessage>(&mut connection, &self.target)? {
+            ServerMessage::Hello { build_id } => check_build_id(&build_id)?,
+            _ => bail!("remote proxy did not send hello"),
+        }
         write_initial_request(&mut connection, &self.request, &self.target)?;
-        wait_ready(&mut connection, &self.target)?;
+        connection.session_id = match read_initial(&mut connection, &self.target)? {
+            ProxyHandshake::Ready { session_id } => session_id,
+            ProxyHandshake::Failed { message } => bail!("remote proxy: {message}"),
+        };
+        connection.set_nonblocking(false)?;
         self.target.check_cancellation()?;
         connection.release_console()?;
         Ok(connection)
@@ -144,7 +157,10 @@ fn write_initial_request(
     }
 }
 
-fn wait_ready(connection: &mut SshConnection, target: &SshTarget) -> anyhow::Result<()> {
+fn read_initial<T: DeserializeOwned>(
+    connection: &mut SshConnection,
+    target: &SshTarget,
+) -> anyhow::Result<T> {
     connection.set_nonblocking(true)?;
     let deadline = Deadline::new(target);
     let mut bytes = Vec::new();
@@ -152,9 +168,7 @@ fn wait_ready(connection: &mut SshConnection, target: &SshTarget) -> anyhow::Res
         deadline.check()?;
         let mut byte = [0];
         match connection.read(&mut byte) {
-            Ok(0) => bail!(
-                "remote proxy closed before its ready handshake; upgrade the server to proxy protocol {PROXY_PROTOCOL_VERSION}"
-            ),
+            Ok(0) => bail!("remote proxy closed during handshake"),
             Ok(_) => {
                 bytes.push(byte[0]);
                 anyhow::ensure!(
@@ -174,15 +188,7 @@ fn wait_ready(connection: &mut SshConnection, target: &SshTarget) -> anyhow::Res
             }
         }
     }
-    match serde_json::from_slice(&bytes).context("decode remote proxy ready handshake")? {
-        ProxyHandshake::Ready { protocol_version } => anyhow::ensure!(
-            protocol_version == PROXY_PROTOCOL_VERSION,
-            "incompatible remote proxy handshake version"
-        ),
-        ProxyHandshake::Failed { message } => bail!("remote proxy: {message}"),
-    }
-    connection.set_nonblocking(false)?;
-    Ok(())
+    serde_json::from_slice(&bytes).context("decode remote proxy handshake")
 }
 
 struct Deadline<'a> {
@@ -208,46 +214,3 @@ impl Cancellation for Deadline<'_> {
         Ok(())
     }
 }
-
-pub(crate) fn execute(
-    runner: &impl ProcessRunner,
-    target: &SshTarget,
-    command: &str,
-    input: Option<&[u8]>,
-) -> anyhow::Result<Vec<u8>> {
-    let mut spec = target.command(command)?;
-    spec.output_limit = Some(1024 * 1024);
-    let output = runner
-        .output(&spec, input, &Deadline::new(target))
-        .with_context(|| format!("SSH to {}", target.host))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let error = anyhow::Error::new(SshCommandFailure {
-            host: target.host.clone(),
-            status: output.status,
-            stderr,
-        });
-        Err(error)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct SshCommandFailure {
-    host: String,
-    pub status: std::process::ExitStatus,
-    stderr: String,
-}
-
-impl std::fmt::Display for SshCommandFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "SSH to {} exited with {}: {}",
-            self.host, self.status, self.stderr
-        )
-    }
-}
-
-impl std::error::Error for SshCommandFailure {}

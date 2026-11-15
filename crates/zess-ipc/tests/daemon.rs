@@ -11,6 +11,67 @@ mod windows;
 
 use zess_ipc::platform::{DaemonControl, DaemonSpec, NativeDaemonControl};
 
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn closing_the_endpoint_does_not_mean_the_server_process_exited() {
+    use std::io::Write;
+    use zess_ipc::{SocketPath, Stream};
+
+    let root = std::env::temp_dir().join(format!("zess-watch-test-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let mut daemon = NativeDaemonControl
+        .spawn(&DaemonSpec {
+            program: std::env::current_exe().unwrap(),
+            args: ["--exact", "watch_child", "--ignored", "--nocapture"]
+                .map(Into::into)
+                .into(),
+            cwd: Some(root.clone()),
+            log_path: root.join("daemon.log"),
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !root.join("ready").exists() {
+        assert!(daemon.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut stream = Stream::connect(&SocketPath::from(root.join("server.pipe"))).unwrap();
+    let process = NativeDaemonControl.watch(&stream).unwrap();
+    stream.write_all(b"x").unwrap();
+    while !root.join("closed").exists() {
+        assert!(daemon.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!process.wait(Duration::from_millis(20)).unwrap());
+    fs::write(root.join("exit"), b"").unwrap();
+    assert!(process.wait(Duration::from_secs(5)).unwrap());
+    daemon.try_wait().unwrap().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+#[ignore = "child process entry point used by the process wait test"]
+fn watch_child() {
+    use std::io::Read;
+    use zess_ipc::{Listener, SocketPath};
+
+    let root = std::env::current_dir().unwrap();
+    let listener = Listener::bind(&SocketPath::from(root.join("server.pipe"))).unwrap();
+    fs::write(root.join("ready"), b"").unwrap();
+    let mut stream = listener.accept().unwrap();
+    stream.read_exact(&mut [0]).unwrap();
+    drop(stream);
+    drop(listener);
+    fs::write(root.join("closed"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !root.join("exit").exists() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn dropping_the_process_handle_keeps_the_daemon_running() {
     static NEXT: AtomicU64 = AtomicU64::new(0);

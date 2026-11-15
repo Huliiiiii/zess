@@ -90,12 +90,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "base64"
-version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
-
-[[package]]
 name = "bigdecimal"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -391,7 +385,7 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bitflags 2.13.2",
  "crossterm_winapi",
  "derive_more",
@@ -3643,6 +3637,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "zess-build",
  "zess-git",
  "zess-ipc",
  "zess-platform",
@@ -3745,6 +3740,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "zess-build",
  "zess-ui",
 ]
 
@@ -3753,13 +3749,13 @@ name = "zess-remote"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.23.1",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
+ "zess-build",
  "zess-ipc",
  "zess-platform",
+ "zess-protocol",
 ]
 
 [[package]]
@@ -3803,6 +3799,7 @@ dependencies = [
  "smallvec",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+ "zess-build",
  "zess-filter",
  "zess-git",
  "zess-ipc",
@@ -3826,6 +3823,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "windows-sys",
+ "zess-build",
  "zess-ipc",
  "zess-platform",
  "zess-protocol",

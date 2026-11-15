@@ -26,6 +26,9 @@ struct PendingMessage {
 }
 
 enum ConnectionRole {
+    AwaitHello {
+        accepted: Instant,
+    },
     Unidentified {
         accepted: Instant,
     },
@@ -43,7 +46,7 @@ impl ConnectionRole {
         match self {
             Self::Attached { client } => Some(client),
             Self::Closing { client, .. } => client.as_ref(),
-            Self::Unidentified { .. } => None,
+            Self::Unidentified { .. } | Self::AwaitHello { .. } => None,
         }
     }
 }
@@ -77,7 +80,7 @@ struct Connection {
     written: usize,
     role: ConnectionRole,
     eof: bool,
-    normal_exit: bool,
+    exit_disposition: Option<zess_protocol::ClientExitDisposition>,
 }
 
 impl Connection {
@@ -88,11 +91,11 @@ impl Connection {
             input: framing::Decoder::default(),
             output: VecDeque::new(),
             written: 0,
-            role: ConnectionRole::Unidentified {
+            role: ConnectionRole::AwaitHello {
                 accepted: Instant::now(),
             },
             eof: false,
-            normal_exit: false,
+            exit_disposition: None,
         })
     }
 
@@ -442,12 +445,38 @@ pub fn serve_with_platform(
             let mut disconnected = messages.is_err();
             if let Ok(messages) = messages {
                 for message in messages {
+                    if matches!(connection.role, ConnectionRole::AwaitHello { .. })
+                        && !matches!(message, ClientMessage::Hello { .. })
+                    {
+                        connection.send(&ServerMessage::Rejected {
+                            reason:
+                                "Hello with a matching build is required before session requests"
+                                    .into(),
+                        })?;
+                        connection.close_after_flush();
+                        break;
+                    }
                     match message {
+                        ClientMessage::Hello { build_id }
+                            if matches!(connection.role, ConnectionRole::AwaitHello { .. }) =>
+                        {
+                            connection.send(&ServerMessage::Hello {
+                                build_id: zess_build::BUILD_ID.to_owned(),
+                            })?;
+                            if zess_protocol::check_build_id(&build_id).is_err() {
+                                connection.close_after_flush();
+                                break;
+                            }
+                            connection.role = ConnectionRole::Unidentified {
+                                accepted: Instant::now(),
+                            };
+                        }
                         ClientMessage::Status
                             if matches!(connection.role, ConnectionRole::Unidentified { .. }) =>
                         {
                             connection.send(&ServerMessage::Status {
                                 session_id: published.session_id.clone(),
+                                name: session.name().map(str::to_owned),
                                 server_instance: server_instance.clone(),
                                 state_revision: published.revision,
                                 pid: process_id,
@@ -474,13 +503,20 @@ pub fn serve_with_platform(
                             break;
                         }
                         ClientMessage::Attach {
+                            expected_session,
                             client_id,
                             width,
                             height,
                             files,
                             context_epoch: previous_epoch,
                         } if matches!(connection.role, ConnectionRole::Unidentified { .. }) => {
-                            if active.is_some() {
+                            if expected_session
+                                .as_ref()
+                                .is_some_and(|expected| expected != &published.session_id)
+                            {
+                                connection.send(&ServerMessage::Rejected { reason: "session identity changed; the original session is no longer available".into() })?;
+                                connection.close_after_flush();
+                            } else if active.is_some() {
                                 connection.send(&ServerMessage::Rejected {
                                     reason:
                                         "another terminal is attached; detach it with Ctrl-z first"
@@ -742,9 +778,18 @@ pub fn serve_with_platform(
                                 result,
                             })?;
                             if exited {
-                                connection.send(&ServerMessage::Detached)?;
+                                let disposition = if active.as_ref() == connection.role.client()
+                                    && !session.modified()
+                                    && session.on_client_exit()
+                                        == zess_plugin::OnClientExit::StopIfUnused
+                                {
+                                    zess_protocol::ClientExitDisposition::Stopping
+                                } else {
+                                    zess_protocol::ClientExitDisposition::Retained
+                                };
+                                connection.send(&ServerMessage::Detached { disposition })?;
                                 connection.close_after_flush();
-                                connection.normal_exit = true;
+                                connection.exit_disposition = Some(disposition);
                             }
                         }
                         ClientMessage::QueryOperation {
@@ -810,6 +855,7 @@ pub fn serve_with_platform(
             }
             match connection.role {
                 ConnectionRole::Unidentified { accepted }
+                | ConnectionRole::AwaitHello { accepted }
                     if accepted.elapsed() > Duration::from_secs(5) =>
                 {
                     disconnected = true
@@ -820,16 +866,12 @@ pub fn serve_with_platform(
                 _ => {}
             }
             if disconnected {
-                let normal_exit =
-                    connection.normal_exit && !flush_failed && connection.output.is_empty();
+                let stopping = connection.exit_disposition
+                    == Some(zess_protocol::ClientExitDisposition::Stopping);
                 connections
                     .remove(index)
                     .disconnect(&mut session, &mut active);
-                if normal_exit
-                    && active.is_none()
-                    && !session.modified()
-                    && session.on_client_exit() == zess_plugin::OnClientExit::StopIfUnused
-                {
+                if stopping {
                     state = ServerState::Draining {
                         deadline: Instant::now() + DRAIN_TIMEOUT,
                     };
@@ -843,7 +885,12 @@ pub fn serve_with_platform(
         }
         if session.exiting() || matches!(state, ServerState::Draining { .. }) {
             for connection in &mut connections {
-                let _ = connection.send(&ServerMessage::Exited);
+                if matches!(
+                    connection.role,
+                    ConnectionRole::Attached { .. } | ConnectionRole::Unidentified { .. }
+                ) {
+                    let _ = connection.send(&ServerMessage::Exited);
+                }
                 connection.close_after_flush();
             }
             state = ServerState::Draining {

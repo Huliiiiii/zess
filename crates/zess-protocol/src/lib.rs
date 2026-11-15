@@ -7,6 +7,42 @@ mod tests;
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug)]
+pub struct BuildMismatch {
+    pub expected: &'static str,
+    pub actual: String,
+}
+
+impl std::fmt::Display for BuildMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "zess build mismatch: expected {}, received {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for BuildMismatch {}
+
+pub fn check_build_id(build_id: &str) -> Result<(), BuildMismatch> {
+    if build_id == zess_build::BUILD_ID {
+        Ok(())
+    } else {
+        Err(BuildMismatch {
+            expected: zess_build::BUILD_ID,
+            actual: build_id.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientExitDisposition {
+    Retained,
+    Stopping,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ServerInstanceId(pub String);
@@ -321,11 +357,15 @@ pub enum CommandOutcome {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    Hello {
+        build_id: String,
+    },
     Status,
     Stop {
         force: bool,
     },
     Attach {
+        expected_session: Option<SessionId>,
         client_id: String,
         width: u16,
         height: u16,
@@ -388,8 +428,12 @@ pub enum ClientMessage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    Hello {
+        build_id: String,
+    },
     Status {
         session_id: SessionId,
+        name: Option<String>,
         server_instance: ServerInstanceId,
         state_revision: u64,
         pid: u32,
@@ -432,7 +476,9 @@ pub enum ServerMessage {
         server_instance: ServerInstanceId,
         result: OperationResult,
     },
-    Detached,
+    Detached {
+        disposition: ClientExitDisposition,
+    },
     ClipboardWrite {
         text: String,
     },

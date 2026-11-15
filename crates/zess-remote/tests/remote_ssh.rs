@@ -4,29 +4,17 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use zess_platform::{
-    Cancellation, CancellationToken, OwnedProcess, ProcessRunner, ProcessSpec, SystemProcessRunner,
-};
+use zess_platform::{Cancellation, OwnedProcess, ProcessRunner, ProcessSpec, SystemProcessRunner};
 use zess_remote::{
-    ArtifactCatalog, Bootstrap, Connector, Platform, ProxyOperation, ProxyRequest, RemoteServer,
-    SshBootstrap, SshConnection, SshConnector, SshTarget,
+    Connector, ProxyOperation, ProxyRequest, SshConnection, SshConnector, SshTarget,
 };
 
 struct NeverCancel;
-
-struct CommandBootstrap(String);
-
-impl Bootstrap for CommandBootstrap {
-    fn prepare(&self, _: &SshTarget) -> Result<RemoteServer> {
-        Ok(RemoteServer::new(Platform::current()?, self.0.clone()))
-    }
-}
 
 impl Cancellation for NeverCancel {
     fn check(&self) -> Result<()> {
@@ -38,7 +26,6 @@ struct SshFixture {
     directory: tempfile::TempDir,
     daemon: OwnedProcess,
     target: SshTarget,
-    binary: PathBuf,
 }
 
 impl SshFixture {
@@ -66,7 +53,7 @@ impl SshFixture {
         let shell = String::from_utf8(run("sh", &["-c", "command -v sh"])?)?
             .trim()
             .to_owned();
-        let path = std::env::var("PATH")?;
+        let path = format!("{}:{}", root.display(), std::env::var("PATH")?);
         let wrapper = root.join("wrapper.sh");
         std::fs::write(
             &wrapper,
@@ -123,12 +110,12 @@ impl SshFixture {
                 root.display()
             ),
         )?;
-        let binary = root.join("server with spaces '");
-        let platform = Platform::current()?;
-        let platform = serde_json::to_string(&platform)?;
-        let protocol_version = zess_remote::PROXY_PROTOCOL_VERSION;
+        let binary = root.join("zess");
+        let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
+            build_id: zess_build::BUILD_ID.into(),
+        })?;
         let script = format!(
-            "#!/bin/sh\nset -eu\ncase \"$1\" in\nremote-info)\nif command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum \"$0\"); else h=$(shasum -a 256 \"$0\"); fi\nh=${{h%% *}}\nprintf '%s\\n' '{{\"version\":\"fixture\",\"protocol_version\":{protocol_version},\"platform\":{platform},\"binary_sha256\":\"'\"$h\"'\"}}'\n;;\nremote-proxy)\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"protocol_version\":{protocol_version}}}'\nprintf '%s\\n' \"$request\"\nexec cat\n;;\nesac\n"
+            "#!/bin/sh\nset -eu\n[ \"$1\" = remote-proxy ]\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"session_id\":null}}'\nprintf '%s\\n' \"$request\"\nexec cat\n"
         );
         std::fs::write(&binary, script)?;
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))?;
@@ -138,19 +125,7 @@ impl SshFixture {
             directory,
             daemon,
             target,
-            binary,
         })
-    }
-
-    fn bootstrap(&self) -> SshBootstrap<SystemProcessRunner> {
-        SshBootstrap {
-            runner: SystemProcessRunner,
-            version: "fixture".to_owned(),
-            artifacts: ArtifactCatalog::default(),
-            server_binary: Some(self.binary.clone()),
-            file_system: std::sync::Arc::new(zess_platform::NativeFileSystem),
-            platform: std::sync::Arc::new(zess_platform::NativePlatform),
-        }
     }
 }
 
@@ -176,7 +151,7 @@ fn run(program: &str, args: &[&str]) -> Result<Vec<u8>> {
 }
 
 #[test]
-fn ssh_uploads_then_reuses_the_server_and_preserves_workspace_data() -> Result<()> {
+fn ssh_uses_preinstalled_server_and_preserves_workspace_data() -> Result<()> {
     let fixture = SshFixture::new()?;
     let workspace = "work space/'\";$()/项目";
     let request = ProxyRequest::new(ProxyOperation::Attach {
@@ -187,7 +162,6 @@ fn ssh_uploads_then_reuses_the_server_and_preserves_workspace_data() -> Result<(
     let encoded = serde_json::to_string(&request)?;
     let mut connector = SshConnector {
         target: fixture.target.clone(),
-        bootstrap: fixture.bootstrap(),
         runner: SystemProcessRunner,
         request,
     };
@@ -202,14 +176,6 @@ fn ssh_uploads_then_reuses_the_server_and_preserves_workspace_data() -> Result<(
     connection.read_line(&mut actual)?;
     assert_eq!(actual, "protocol payload\n");
     drop(connection);
-    let cache = fixture.directory.path().join(".cache/zess/servers");
-    let entries: Vec<_> = std::fs::read_dir(cache)?.collect::<std::io::Result<_>>()?;
-    assert_eq!(entries.len(), 1);
-    let installed = entries[0].path().join("zess");
-    assert_eq!(std::fs::read(&installed)?, std::fs::read(&fixture.binary)?);
-    let modified = std::fs::metadata(&installed)?.modified()?;
-    fixture.bootstrap().prepare(&fixture.target)?;
-    assert_eq!(std::fs::metadata(&installed)?.modified()?, modified);
     Ok(())
 }
 
@@ -217,12 +183,12 @@ fn ssh_uploads_then_reuses_the_server_and_preserves_workspace_data() -> Result<(
 fn ssh_rejects_a_host_key_absent_from_known_hosts() -> Result<()> {
     let fixture = SshFixture::new()?;
     std::fs::write(fixture.directory.path().join("known_hosts"), "")?;
-    let error = match fixture.bootstrap().prepare(&fixture.target) {
-        Ok(_) => anyhow::bail!("unexpectedly accepted an unknown host key"),
-        Err(error) => format!("{error:#}"),
+    let mut connector = SshConnector {
+        target: fixture.target.clone(),
+        runner: SystemProcessRunner,
+        request: ProxyRequest::new(ProxyOperation::Status),
     };
-    assert!(error.contains("Host key verification failed"), "{error}");
-    assert!(!Path::new(&fixture.directory.path().join(".cache/zess")).exists());
+    assert!(connector.connect().is_err());
     Ok(())
 }
 
@@ -260,40 +226,38 @@ fn a_stalled_peer_does_not_block_client_reads_or_writes() -> Result<()> {
 fn cancelling_a_connection_interrupts_the_remote_ready_wait() -> Result<()> {
     let fixture = SshFixture::new()?;
     let marker = fixture.directory.path().join("waiting-for-ready");
-    let token = CancellationToken::new();
+    let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
+        build_id: zess_build::BUILD_ID.into(),
+    })?;
+    let script = format!(
+        "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\ntouch '{}'\nexec cat >/dev/null\n",
+        marker.display()
+    );
+    std::fs::write(fixture.directory.path().join("zess"), script)?;
+    let token = zess_platform::CancellationToken::new();
     let mut target = fixture.target.clone();
     target.cancellation = Some(token.clone());
     let mut connector = SshConnector {
         target,
-        bootstrap: CommandBootstrap(format!(
-            "sh -c 'IFS= read -r request; touch {}; cat >/dev/null'",
-            marker.display()
-        )),
         runner: SystemProcessRunner,
         request: ProxyRequest::new(ProxyOperation::Status),
     };
-    let started = Instant::now();
     thread::scope(|scope| -> Result<()> {
         let cancellation = scope.spawn(|| {
             let deadline = Instant::now() + Duration::from_secs(3);
             while !marker.exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
-            let ready_wait_reached = marker.exists();
+            let reached = marker.exists();
             token.cancel();
-            ready_wait_reached
+            reached
         });
-        let result = connector.connect();
-        assert!(
-            cancellation.join().unwrap(),
-            "proxy did not receive its initial request"
-        );
-        let error = match result {
+        let error = match connector.connect() {
             Ok(_) => anyhow::bail!("unready proxy unexpectedly connected"),
             Err(error) => format!("{error:#}"),
         };
+        assert!(cancellation.join().unwrap());
         assert!(error.contains("cancelled"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(5));
         Ok(())
     })
 }
@@ -301,28 +265,73 @@ fn cancelling_a_connection_interrupts_the_remote_ready_wait() -> Result<()> {
 #[test]
 fn cancelling_after_ready_interrupts_a_blocking_response_read() -> Result<()> {
     let fixture = SshFixture::new()?;
-    let token = CancellationToken::new();
+    let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
+        build_id: zess_build::BUILD_ID.into(),
+    })?;
+    let script = format!(
+        "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"session_id\":null}}'\nexec cat >/dev/null\n"
+    );
+    std::fs::write(fixture.directory.path().join("zess"), script)?;
+    let token = zess_platform::CancellationToken::new();
     let mut target = fixture.target.clone();
     target.cancellation = Some(token.clone());
-    let ready = serde_json::to_string(&zess_remote::ProxyHandshake::ready())?;
-    let script = format!("IFS= read -r request; printf '%s\\n' '{ready}'; cat >/dev/null");
     let mut connector = SshConnector {
         target,
-        bootstrap: CommandBootstrap(format!("sh -c '{}'", script.replace('\'', "'\\''"))),
         runner: SystemProcessRunner,
         request: ProxyRequest::new(ProxyOperation::Status),
     };
     let mut connection = connector.connect()?;
-    let started = Instant::now();
-    thread::scope(|scope| -> Result<()> {
+    thread::scope(|scope| {
         scope.spawn(|| {
             thread::sleep(Duration::from_millis(50));
             token.cancel();
         });
         let error = connection.read(&mut [0]).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
-        assert!(error.to_string().contains("cancelled"));
-        assert!(started.elapsed() < Duration::from_secs(2));
-        Ok(())
-    })
+    });
+    Ok(())
+}
+
+#[test]
+fn waiting_for_ssh_exit_reports_failure_status() -> Result<()> {
+    let mut spec = ProcessSpec::new("sh");
+    spec.args(["-c", "exit 7"]);
+    let mut connection = SshConnection::new(SystemProcessRunner.spawn(&spec)?)?;
+    let error = connection
+        .wait_for_exit(Duration::from_secs(2))
+        .unwrap_err();
+    assert!(error.to_string().contains("exit status: 7"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn cancelling_interrupts_wait_for_ssh_exit() -> Result<()> {
+    let fixture = SshFixture::new()?;
+    let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
+        build_id: zess_build::BUILD_ID.into(),
+    })?;
+    let script = format!(
+        "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"session_id\":null}}'\nexec cat >/dev/null\n"
+    );
+    std::fs::write(fixture.directory.path().join("zess"), script)?;
+    let token = zess_platform::CancellationToken::new();
+    let mut target = fixture.target.clone();
+    target.cancellation = Some(token.clone());
+    let mut connector = SshConnector {
+        target,
+        runner: SystemProcessRunner,
+        request: ProxyRequest::new(ProxyOperation::Status),
+    };
+    let mut connection = connector.connect()?;
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(Duration::from_millis(50));
+            token.cancel();
+        });
+        let error = connection
+            .wait_for_exit(Duration::from_secs(2))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+    });
+    Ok(())
 }

@@ -14,22 +14,11 @@
 
 ## 会话管理
 
-根程序内部的 [`SessionManager`](../src/server.rs) 通过 `native()` 构造原生实现，也可用 `new()` 注入平台依赖。`with_cancellation()` 为管理操作提供共享取消令牌。`entries()` 列出会话，`resolve()` 根据 ID 查找端点，`inspect()` 获取单个会话信息；`ensure()` 为 workspace 取得或启动会话，`stop()` 和 `restart()` 接受 force。调用者应处理未保存内容导致的停止失败。终端调用方可使用 `zess_terminal::run_connection_with_platform(factory, files, platform)` 注入主机能力。
+根程序内部的 [`SessionManager`](../src/server.rs) 通过 `native()` 构造原生实现，也可用 `new()` 注入平台依赖。`with_cancellation()` 为管理操作提供共享取消令牌。`entries()` 列出会话，`resolve()` 根据名称或 ID 查找端点，`inspect()` 获取单个会话信息；`create()` 创建会话，`ensure()` 为 workspace 取得或启动会话，`stop()` 和 `restart()` 接受 force。调用者应处理未保存内容导致的停止失败。终端调用方可使用 `zess_terminal::run_connection_with_platform(factory, files, platform)` 注入主机能力。
 
-## SSH 引导
+## SSH 与会话消息
 
-[`zess-remote`](../crates/zess-remote/src/lib.rs) 导出以下接口：
-
-- `SshTarget` 保存 host、可选端口、用户、identity 文件、SSH 配置文件、jump host及 `Option<CancellationToken>`。`command()` 生成 `ssh` 的 `ProcessSpec`，使用 `-T` 和 `ClearAllForwardings=yes`。
-- `Bootstrap::prepare()` 准备远端程序并返回 `RemoteServer`。`SshBootstrap` 检测远端平台、检查预安装或缓存的程序，必要时安装选定 artifact；其 `file_system` 和 `platform` 分别注入 `Arc<dyn FileSystem>` 和 `Arc<dyn zess_platform::Platform>`。远程 crate 的 `Platform` 是操作系统与架构数据，不是主机能力 trait。
-- `ArtifactCatalog` 按平台索引 `ServerArtifact`。artifact 包含平台、版本、SHA-256 和本地文件或 HTTPS 下载来源。catalog 文件中相对的本地路径相对于 catalog 文件解析。
-- `SshConnector` 将引导、进程启动和初始请求组合为 `SshConnection`。`Connector::connect()` 返回连接。
-
-引导匹配远端程序的版本、代理协议版本和平台；选定 artifact 时还匹配二进制摘要。无兼容远端程序且无法取得匹配 artifact 时，引导返回错误。远端启动脚本必须保持标准输出无 banner，以免破坏引导输出和协议流。
-
-## 代理与会话消息
-
-代理初始请求是换行分隔的 JSON。`ProxyRequest::new()` 设置当前 `PROXY_PROTOCOL_VERSION`；`validate()` 拒绝不同版本。`ProxyOperation` 包含 `AttachSession`、`Attach`、`List`、`Start`、`Restart`、`Stop` 和 `Status`，字段和序列化形式见 [定义](../crates/zess-remote/src/lib.rs)。代理完成请求准备后返回 `ProxyHandshake::Ready { protocol_version }`；准备失败时返回 `Failed { message }`。当前代理协议版本为 3，客户端检查握手版本。随后管理请求返回管理响应，附着请求进入会话协议流。标准输出不得混入诊断文字。
+[`zess-remote`](../crates/zess-remote/src/lib.rs) 使用 `SshTarget` 配置 SSH 连接。`SshConnector` 启动远端已安装的 Zess 并经标准流交换消息；远端 shell 的标准输出不得混入 banner。客户端与代理、客户端与会话服务端分别交换 `Hello` 并要求 Build ID 一致，然后发送业务请求。代理处理管理请求，或转发与会话服务端的连接。
 
 [`zess-protocol`](../crates/zess-protocol/src/lib.rs) 定义 `ClientMessage`、`ServerMessage`、快照、增量及操作结果。快照和增量携带 session、server instance 和 revision；客户端在应用增量前检查身份与基础 revision。命令通过 `RequestId` 和 server instance 标识，结果为 `Pending`、`Completed { outcome, state_revision }` 或 `Unknown`。完成的 outcome 可表示已应用、已保存、Buffer 已关闭及实际后继，或失败；取消可体现为失败信息，剪贴板写入结果另有 `Cancelled`。`Unknown` 表示结果无法确认；普通命令显示提示，仍在服务端待处理的客户端动作则解除提交标记，允许重新提交并由动作 ID 防止重复消费。输入序列和确认用于跟踪客户端输入进度；重连是否允许重放由服务端返回的 `replay_allowed` 决定。
 

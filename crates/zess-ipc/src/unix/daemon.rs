@@ -27,14 +27,52 @@ mod linux {
             fd::{AsRawFd, FromRawFd, OwnedFd},
             unix::fs::MetadataExt,
         },
+        time::Duration,
     };
 
     use anyhow::{Context, Result, bail};
 
-    pub fn stop(socket: &SocketPath) -> Result<()> {
-        let metadata = fs::symlink_metadata(socket.as_path())?;
-        let stream =
-            Stream::connect(socket).context("connect to server for process identification")?;
+    use crate::platform::ProcessWait;
+
+    struct PeerProcess(OwnedFd);
+
+    impl ProcessWait for PeerProcess {
+        fn wait(&self, timeout: Duration) -> io::Result<bool> {
+            let mut poll = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = timeout.as_millis() + u128::from(timeout.subsec_nanos() % 1_000_000 != 0);
+            let timeout = millis.min(i32::MAX as u128) as i32;
+            // SAFETY: poll points to one initialized pollfd with a live descriptor.
+            let result = unsafe { libc::poll(&mut poll, 1, timeout) };
+            if result == -1 {
+                Err(io::Error::last_os_error())
+            } else if poll.revents & libc::POLLNVAL != 0 {
+                Err(io::Error::from_raw_os_error(libc::EBADF))
+            } else {
+                Ok(result > 0)
+            }
+        }
+    }
+
+    pub fn watch(stream: &Stream) -> Result<Box<dyn ProcessWait>> {
+        let credentials = peer_credentials(stream)?;
+        Ok(Box::new(PeerProcess(peer_pidfd(credentials.pid)?)))
+    }
+
+    fn peer_pidfd(pid: libc::pid_t) -> Result<OwnedFd> {
+        // SAFETY: pid comes from SO_PEERCRED and zero is a valid flags value.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error()).context("open socket peer pidfd");
+        }
+        // SAFETY: successful pidfd_open transferred ownership of a fresh descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) })
+    }
+
+    fn peer_credentials(stream: &Stream) -> Result<libc::ucred> {
         let mut credentials = MaybeUninit::<libc::ucred>::uninit();
         let mut length = size_of::<libc::ucred>() as libc::socklen_t;
 
@@ -62,31 +100,20 @@ mod linux {
         if credentials.pid <= 1 {
             bail!("server PID is not visible; run this command in the server's PID namespace");
         }
+        Ok(credentials)
+    }
+
+    pub fn stop(socket: &SocketPath) -> Result<()> {
+        let metadata = fs::symlink_metadata(socket.as_path())?;
+        let stream =
+            Stream::connect(socket).context("connect to server for process identification")?;
+        let credentials = peer_credentials(&stream)?;
         // SAFETY: geteuid takes no arguments and has no memory safety preconditions.
         if credentials.uid != unsafe { libc::geteuid() } {
             bail!("refusing to stop a server owned by another user");
         }
 
-        let mut descriptor = -1;
-        let mut length = size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: stream is live, and descriptor and length are initialized, writable
-        // integers of the sizes required by SO_PEERPIDFD.
-        let result = unsafe {
-            libc::getsockopt(
-                stream.0.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERPIDFD,
-                (&mut descriptor as *mut libc::c_int).cast(),
-                &mut length,
-            )
-        };
-        if result == -1 {
-            return Err(io::Error::last_os_error())
-                .context("get socket peer pidfd (requires Linux 6.5 or newer)");
-        }
-        // SAFETY: SO_PEERPIDFD succeeded and transferred a fresh, owned descriptor;
-        // no other Rust value owns it.
-        let process = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let process = peer_pidfd(credentials.pid)?;
         let executable = fs::read_link(format!("/proc/{}/exe", credentials.pid))?;
         let name = executable.file_name().unwrap_or_default().to_string_lossy();
         let arguments = fs::read(format!("/proc/{}/cmdline", credentials.pid))?;
@@ -143,7 +170,12 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::stop;
+pub use linux::{stop, watch};
+
+#[cfg(not(target_os = "linux"))]
+pub fn watch(_stream: &crate::Stream) -> anyhow::Result<Box<dyn crate::platform::ProcessWait>> {
+    anyhow::bail!("waiting for the server process is unavailable on this platform")
+}
 
 #[cfg(not(target_os = "linux"))]
 pub fn stop(_socket: &crate::SocketPath) -> anyhow::Result<()> {
