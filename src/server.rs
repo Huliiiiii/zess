@@ -8,8 +8,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use zess_ipc::platform::{DaemonControl, DaemonSpec, NativeDaemonControl};
-use zess_ipc::{LocalIpc, NativeLocalIpc, SocketPath, Stream, framing};
+use zess_ipc::platform::{DaemonControl, DaemonSpec, NativeDaemonControl, ProcessWait};
+use zess_ipc::{LocalIpc, NativeLocalIpc, ServerId, SocketPath, Stream, framing};
 use zess_platform::{CancellationToken, FileSystem, NativeFileSystem, NativePlatform, Platform};
 use zess_protocol::{ClientMessage, ServerInstanceId, ServerMessage, SessionId};
 
@@ -18,6 +18,7 @@ pub struct SessionInfo {
     pub id: String,
     pub endpoint: String,
     pub session_id: SessionId,
+    pub name: Option<String>,
     pub server_instance: ServerInstanceId,
     pub workspace: String,
     pub pid: u32,
@@ -90,6 +91,26 @@ impl SessionManager {
             .ipc
             .connect(endpoint)
             .with_context(|| format!("connect to server at {}", endpoint.display()))?;
+        self.handshake(&mut stream)?;
+        self.request_on(&mut stream, message)
+    }
+
+    fn handshake(&self, stream: &mut Stream) -> Result<()> {
+        self.request_on(
+            stream,
+            ClientMessage::Hello {
+                build_id: zess_build::BUILD_ID.to_owned(),
+            },
+        )
+        .and_then(|reply| match reply {
+            ServerMessage::Hello { build_id } => {
+                zess_protocol::check_build_id(&build_id).map_err(Into::into)
+            }
+            _ => Err(anyhow::anyhow!("unexpected server handshake")),
+        })
+    }
+
+    fn request_on(&self, stream: &mut Stream, message: ClientMessage) -> Result<ServerMessage> {
         self.check_cancellation()?;
         let message = framing::encode(&message)?;
         let mut pending = message.as_slice();
@@ -121,10 +142,7 @@ impl SessionManager {
         loop {
             stream.set_read_timeout(Some(self.request_interval(deadline)?))?;
             match stream.read(&mut buffer) {
-                Ok(0) => bail!(
-                    "server at {} did not return a management response; close it with :exit, or use server stop with --force to discard the session",
-                    endpoint.display()
-                ),
+                Ok(0) => bail!("server did not return a management response"),
                 Ok(read) => {
                     response.push(&buffer[..read], 1024 * 1024)?;
                     if let Some(response) = response
@@ -151,6 +169,7 @@ impl SessionManager {
         match self.request(endpoint, ClientMessage::Status)? {
             ServerMessage::Status {
                 session_id,
+                name,
                 server_instance,
                 workspace,
                 pid,
@@ -164,6 +183,7 @@ impl SessionManager {
                     .unwrap_or_else(|| endpoint.as_path().to_string_lossy().into_owned()),
                 endpoint: endpoint.as_path().to_string_lossy().into_owned(),
                 session_id,
+                name,
                 server_instance,
                 workspace,
                 pid,
@@ -180,8 +200,13 @@ impl SessionManager {
         let mut entries = Vec::new();
         for endpoint in self.ipc.discover()? {
             self.check_cancellation()?;
-            if let Ok(info) = self.inspect(&endpoint) {
-                entries.push(info);
+            match self.inspect(&endpoint) {
+                Ok(info) => entries.push(info),
+                Err(error)
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) => {}
+                Err(error) => return Err(error),
             }
             self.check_cancellation()?;
         }
@@ -201,6 +226,10 @@ impl SessionManager {
         Ok(stream)
     }
 
+    pub fn watch(&self, stream: &Stream) -> Result<Box<dyn ProcessWait>> {
+        self.daemons.watch(stream)
+    }
+
     pub fn ensure_for_workspace(
         &self,
         workspace: &Path,
@@ -216,19 +245,34 @@ impl SessionManager {
         self.ensure(&workspace, &endpoint, config, files)
     }
 
+    pub fn workspace_sessions(&self, workspace: &Path) -> Result<Vec<SessionInfo>> {
+        let workspace = self
+            .filesystem
+            .canonicalize(workspace)
+            .context("open workspace directory")?;
+        Ok(self
+            .entries()?
+            .into_iter()
+            .filter(|info| Path::new(&info.workspace) == workspace)
+            .collect())
+    }
+
     pub fn resolve(&self, id: &str) -> Result<SocketPath> {
         self.check_cancellation()?;
+        let named = self.ipc.by_id(ServerId::for_name(id));
+        if self.ipc.is_present(&named)? {
+            return Ok(named);
+        }
+        for info in self.entries()? {
+            if info.session_id.0 == id
+                || info.id.eq_ignore_ascii_case(id)
+                || info.name.as_deref() == Some(id)
+            {
+                return Ok(SocketPath::from(PathBuf::from(info.endpoint)));
+            }
+        }
         if let Ok(id) = id.parse() {
             return Ok(self.ipc.by_id(id));
-        }
-        for endpoint in self.ipc.discover()? {
-            self.check_cancellation()?;
-            if let Ok(info) = self.inspect(&endpoint)
-                && (info.session_id.0 == id || info.id == id)
-            {
-                return Ok(endpoint);
-            }
-            self.check_cancellation()?;
         }
         self.check_cancellation()?;
         bail!("unknown session: {id}")
@@ -246,16 +290,53 @@ impl SessionManager {
             .filesystem
             .canonicalize(workspace)
             .context("open workspace directory")?;
-        if let Ok(info) = self.inspect(endpoint) {
+        let matches: Vec<_> = self
+            .entries()?
+            .into_iter()
+            .filter(|info| Path::new(&info.workspace) == workspace)
+            .collect();
+        match matches.as_slice() {
+            [info] => return Ok(info.clone()),
+            [] => {}
+            _ => bail!(
+                "multiple sessions exist for {}; select one explicitly",
+                workspace.display()
+            ),
+        }
+        if self.ipc.is_present(endpoint)? {
+            let info = self.inspect(endpoint)?;
             self.check_workspace(&info, &workspace)?;
             return Ok(info);
         }
-        for info in self.entries()? {
-            if Path::new(&info.workspace) == workspace {
-                return Ok(info);
-            }
-        }
         self.start(&workspace, endpoint, config, files)
+    }
+
+    pub fn create(
+        &self,
+        workspace: &Path,
+        config: Option<&Path>,
+        files: &[PathBuf],
+        name: Option<&str>,
+    ) -> Result<SessionInfo> {
+        let workspace = self
+            .filesystem
+            .canonicalize(workspace)
+            .context("open workspace directory")?;
+        let endpoint = if let Some(name) = name {
+            if name.is_empty() {
+                bail!("session name cannot be empty");
+            }
+            self.ipc.by_id(ServerId::for_name(name))
+        } else {
+            if !self.workspace_sessions(&workspace)?.is_empty() {
+                bail!("a session already exists for {}", workspace.display());
+            }
+            self.endpoint_for_workspace(&workspace)?
+        };
+        if self.ipc.is_present(&endpoint)? {
+            bail!("session already exists at {}", endpoint.display());
+        }
+        self.start_named(&workspace, &endpoint, config, files, name)
     }
 
     pub fn start(
@@ -265,14 +346,24 @@ impl SessionManager {
         config: Option<&Path>,
         files: &[PathBuf],
     ) -> Result<SessionInfo> {
+        self.start_named(workspace, endpoint, config, files, None)
+    }
+
+    fn start_named(
+        &self,
+        workspace: &Path,
+        endpoint: &SocketPath,
+        config: Option<&Path>,
+        files: &[PathBuf],
+        name: Option<&str>,
+    ) -> Result<SessionInfo> {
         self.check_cancellation()?;
         let workspace = self
             .filesystem
             .canonicalize(workspace)
             .context("open workspace directory")?;
-        if let Ok(info) = self.inspect(endpoint) {
-            self.check_workspace(&info, &workspace)?;
-            return Ok(info);
+        if self.ipc.is_present(endpoint)? {
+            bail!("session already exists at {}", endpoint.display());
         }
         self.check_cancellation()?;
         self.ipc.prepare(endpoint)?;
@@ -285,6 +376,9 @@ impl SessionManager {
         ];
         if let Some(config) = config {
             args.extend(["--config".into(), config.as_os_str().to_owned()]);
+        }
+        if let Some(name) = name {
+            args.extend(["--session-name".into(), name.into()]);
         }
         args.push("--".into());
         args.extend(files.iter().map(|path| path.as_os_str().to_owned()));
@@ -302,7 +396,8 @@ impl SessionManager {
         let start = Instant::now();
         loop {
             self.check_cancellation()?;
-            if let Ok(info) = self.inspect(endpoint) {
+            if self.ipc.is_present(endpoint)? {
+                let info = self.inspect(endpoint)?;
                 self.check_workspace(&info, &workspace)?;
                 return Ok(info);
             }
@@ -336,61 +431,32 @@ impl SessionManager {
     }
 
     pub fn stop(&self, endpoint: &SocketPath, force: bool) -> Result<()> {
-        let response = self.request(endpoint, ClientMessage::Stop { force });
+        let mut stream = self.connect(endpoint)?;
+        let process = self.watch(&stream)?;
+        let response = self
+            .handshake(&mut stream)
+            .and_then(|()| self.request_on(&mut stream, ClientMessage::Stop { force }));
         self.check_cancellation()?;
         match response {
-            Ok(ServerMessage::Exited) => Ok(()),
+            Ok(ServerMessage::Exited) => {}
             Ok(ServerMessage::Rejected { reason }) => bail!("{reason}"),
             Ok(_) => bail!("unexpected management response from {}", endpoint.display()),
             Err(error) if force => self.daemons.stop(endpoint).with_context(|| {
                 format!("management request failed ({error:#}); stop socket peer")
-            }),
-            Err(error) => Err(error),
+            })?,
+            Err(error) => return Err(error),
         }
-    }
-
-    fn restart_workspace(
-        &self,
-        endpoint: &SocketPath,
-        workspace: Option<&Path>,
-        force: bool,
-    ) -> Result<PathBuf> {
-        let response = self.inspect(endpoint);
-        self.check_cancellation()?;
-        match response {
-            Ok(info) => {
-                let current = self.filesystem.canonicalize(Path::new(&info.workspace)).context("open server workspace")?;
-                if let Some(workspace) = workspace
-                    && self.filesystem.canonicalize(workspace).context("open workspace directory")? != current
-                {
-                    bail!("server workspace is {}; refusing to restart it in {}", current.display(), workspace.display());
-                }
-                Ok(current)
-            }
-            Err(_) if force => self.filesystem.canonicalize(workspace.context("cannot determine the older server's workspace; supply --workspace DIR with --force")?).context("open server workspace"),
-            Err(error) => Err(error).context("cannot inspect server; older servers require --force to discard their session"),
-        }
-    }
-
-    fn wait_stopped(&self, endpoint: &SocketPath) -> Result<()> {
-        self.check_cancellation()?;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while self
-            .ipc
-            .is_present(endpoint)
-            .context("wait for stopped server socket removal")?
-        {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
             self.check_cancellation()?;
-            if Instant::now() >= deadline {
-                bail!(
-                    "stopped server did not remove {}; replacement was not started",
-                    endpoint.display()
-                );
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("timed out waiting for server process to exit");
             }
-            thread::sleep(Duration::from_millis(10));
+            if process.wait(remaining.min(Duration::from_millis(50)))? {
+                return Ok(());
+            }
         }
-        self.check_cancellation()?;
-        Ok(())
     }
 
     pub fn restart(
@@ -400,125 +466,56 @@ impl SessionManager {
         config: Option<&Path>,
         force: bool,
     ) -> Result<SessionInfo> {
+        self.restart_with_selector(endpoint, workspace, config, force, None)
+    }
+
+    pub fn restart_with_selector(
+        &self,
+        endpoint: &SocketPath,
+        workspace: Option<&Path>,
+        config: Option<&Path>,
+        force: bool,
+        selector: Option<&str>,
+    ) -> Result<SessionInfo> {
         self.check_cancellation()?;
-        let workspace = self.restart_workspace(endpoint, workspace, force)?;
+        let info = match self.inspect(endpoint) {
+            Ok(info) => Some(info),
+            Err(_) if force && workspace.is_some() => None,
+            Err(error) => return Err(error),
+        };
+        let current =
+            self.filesystem
+                .canonicalize(match &info {
+                    Some(info) => Path::new(&info.workspace),
+                    None => workspace
+                        .context("workspace is required to restart an unresponsive session")?,
+                })
+                .context("open server workspace")?;
+        if let Some(workspace) = workspace
+            && self
+                .filesystem
+                .canonicalize(workspace)
+                .context("open workspace directory")?
+                != current
+        {
+            bail!(
+                "server workspace is {}; refusing to restart it in {}",
+                current.display(),
+                workspace.display()
+            );
+        }
         self.stop(endpoint, force)?;
-        self.wait_stopped(endpoint)?;
-        self.start(&workspace, endpoint, config, &[])
+        let name = info
+            .as_ref()
+            .and_then(|info| info.name.as_deref())
+            .or_else(|| {
+                selector.filter(|name| {
+                    endpoint
+                        .server_id()
+                        .is_some_and(|id| id.to_string() == ServerId::for_name(name).to_string())
+                })
+            });
+        self.start_named(&current, endpoint, config, &[], name)
             .context("old session stopped; start replacement server")
     }
-}
-
-pub fn socket_by_id(id: &str) -> Result<SocketPath> {
-    SessionManager::native().resolve(id)
-}
-
-pub fn list(socket: Option<&SocketPath>) -> Result<()> {
-    let manager = SessionManager::native();
-    list_with_manager(&manager, socket)
-}
-
-pub(crate) fn list_with_manager(
-    manager: &SessionManager,
-    socket: Option<&SocketPath>,
-) -> Result<()> {
-    let explicit = socket.is_some();
-    let sockets = if let Some(socket) = socket {
-        vec![socket.clone()]
-    } else {
-        manager.ipc.discover()?
-    };
-    if sockets.is_empty() {
-        println!("No servers found.");
-        return Ok(());
-    }
-    println!("ID\tPID\tCLIENT\tMODIFIED\tWORKSPACE\tSOCKET");
-    for socket in sockets {
-        let id = if explicit {
-            "-".into()
-        } else {
-            socket
-                .server_id()
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| socket.as_path().to_string_lossy().into_owned())
-        };
-        match manager.request(&socket, ClientMessage::Status) {
-            Ok(ServerMessage::Status {
-                pid,
-                workspace,
-                attached,
-                modified,
-                ..
-            }) => println!(
-                "{id}\t{pid}\t{}\t{}\t{workspace}\t{}",
-                if attached { "attached" } else { "detached" },
-                if modified { "yes" } else { "no" },
-                socket.display()
-            ),
-            Ok(ServerMessage::Rejected { reason }) => bail!("{reason}"),
-            Ok(_) => bail!("unexpected management response from {}", socket.display()),
-            Err(error) if explicit => return Err(error),
-            Err(error) => {
-                println!("{id}\t-\tunavailable\t-\t-\t{}", socket.display());
-                eprintln!("{}: {error:#}", socket.display());
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn stop(socket: &SocketPath, force: bool) -> Result<()> {
-    SessionManager::native().stop(socket, force)?;
-    println!("Stopped server at {}", socket.display());
-    Ok(())
-}
-
-pub fn start(
-    workspace: &Path,
-    socket: &SocketPath,
-    config: Option<&Path>,
-    files: &[PathBuf],
-) -> Result<()> {
-    SessionManager::native().start(workspace, socket, config, files)?;
-    Ok(())
-}
-
-pub fn restart(
-    socket: &SocketPath,
-    workspace: Option<&Path>,
-    config: Option<&Path>,
-    force: bool,
-) -> Result<()> {
-    let manager = SessionManager::native();
-    restart_with_manager(&manager, socket, workspace, config, force)
-}
-
-pub(crate) fn restart_with_manager(
-    manager: &SessionManager,
-    socket: &SocketPath,
-    workspace: Option<&Path>,
-    config: Option<&Path>,
-    force: bool,
-) -> Result<()> {
-    let workspace = manager.restart_workspace(socket, workspace, force)?;
-    eprintln!(
-        "Restart creates a fresh session; open buffers, layout and undo history are reset{}.",
-        if force {
-            "; unsaved changes will be discarded"
-        } else {
-            ""
-        }
-    );
-    manager.stop(socket, force)?;
-    println!("Stopped server at {}", socket.display());
-    manager.wait_stopped(socket)?;
-    manager
-        .start(&workspace, socket, config, &[])
-        .context("old session stopped; start replacement server")?;
-    println!(
-        "Restarted server at {} using {}",
-        socket.display(),
-        manager.host.current_exe()?.display()
-    );
-    Ok(())
 }

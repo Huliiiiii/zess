@@ -4,11 +4,12 @@ use std::{
     io,
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
 
-use crate::SocketPath;
+use crate::{SocketPath, Stream};
 
 #[cfg(unix)]
 #[path = "unix/daemon.rs"]
@@ -41,6 +42,11 @@ impl DaemonHandle {
 pub trait DaemonControl: Send + Sync {
     fn stop(&self, endpoint: &SocketPath) -> Result<()>;
     fn spawn(&self, specification: &DaemonSpec) -> Result<DaemonHandle>;
+    fn watch(&self, stream: &Stream) -> Result<Box<dyn ProcessWait>>;
+}
+
+pub trait ProcessWait: Send {
+    fn wait(&self, timeout: Duration) -> io::Result<bool>;
 }
 
 #[cfg(unix)]
@@ -54,6 +60,10 @@ pub use UnixDaemonControl as NativeDaemonControl;
 pub use WindowsDaemonControl as NativeDaemonControl;
 
 impl DaemonControl for NativeDaemonControl {
+    fn watch(&self, stream: &Stream) -> Result<Box<dyn ProcessWait>> {
+        backend::watch(stream)
+    }
+
     fn stop(&self, endpoint: &SocketPath) -> Result<()> {
         stop(endpoint)
     }

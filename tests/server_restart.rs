@@ -107,7 +107,7 @@ impl Server {
     }
 
     fn status(&self) -> Value {
-        let mut stream = UnixStream::connect(&self.socket).unwrap();
+        let mut stream = connect(&self.socket);
         send(&mut stream, json!({"type": "status"}));
         receive(&mut BufReader::new(stream))
     }
@@ -116,7 +116,7 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.command(&[
-            "server",
+            "session",
             "stop",
             "--socket",
             self.socket.to_str().unwrap(),
@@ -129,8 +129,69 @@ impl Drop for Server {
     }
 }
 
+fn connect(socket: &Path) -> UnixStream {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    send(
+        &mut stream,
+        json!({"type": "hello", "build_id": zess_build::BUILD_ID}),
+    );
+    let hello = receive(&mut BufReader::new(stream.try_clone().unwrap()));
+    assert_eq!(hello["type"], "hello");
+    assert_eq!(hello["build_id"], zess_build::BUILD_ID);
+    stream
+}
+
 fn send(stream: &mut UnixStream, message: Value) {
     writeln!(stream, "{message}").unwrap();
+}
+
+#[test]
+fn named_sessions_share_a_workspace_and_duplicate_names_are_rejected() {
+    let server = Server::new();
+    let workspace = server.workspace.to_str().unwrap();
+    let created = server.command(&[
+        "session",
+        "new",
+        "review",
+        "--workspace",
+        workspace,
+        "--json",
+    ]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created: Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(created["name"], "review");
+    assert_eq!(created["workspace"], workspace);
+    assert_ne!(created["pid"], server.child.id());
+    let duplicate = server.command(&["session", "new", "review", "--workspace", workspace]);
+    assert!(!duplicate.status.success());
+    let stopped = server.command(&["session", "stop", "review"]);
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+}
+
+#[test]
+fn attaching_to_an_empty_workspace_does_not_create_a_session() {
+    let server = Server::new();
+    let workspace = server.root.join("empty");
+    fs::create_dir(&workspace).unwrap();
+    let output = server.command(&[
+        "session",
+        "attach",
+        "--workspace",
+        workspace.to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no session exists"));
+    let list = server.command(&["session", "list", "--json"]);
+    let sessions: Vec<Value> = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(sessions.len(), 1);
 }
 
 fn receive(reader: &mut BufReader<UnixStream>) -> Value {
@@ -156,7 +217,7 @@ fn receive_type(reader: &mut BufReader<UnixStream>, kind: &str) -> Value {
 #[test]
 fn unsaved_changes_require_force_before_replacing_the_session() {
     let server = Server::new();
-    let mut client = UnixStream::connect(&server.socket).unwrap();
+    let mut client = connect(&server.socket);
     send(
         &mut client,
         json!({"type": "attach", "client_id": "restart-test", "width": 80, "height": 24}),
@@ -181,7 +242,7 @@ fn unsaved_changes_require_force_before_replacing_the_session() {
     assert_eq!(before["modified"], true);
     assert_eq!(before["attached"], true);
     let arguments = [
-        "server",
+        "session",
         "restart",
         "--socket",
         server.socket.to_str().unwrap(),
@@ -196,7 +257,7 @@ fn unsaved_changes_require_force_before_replacing_the_session() {
     assert_eq!(server.status()["modified"], true);
 
     let restarted = server.command(&[
-        "server",
+        "session",
         "restart",
         "--socket",
         server.socket.to_str().unwrap(),
@@ -223,7 +284,7 @@ fn restarting_by_id_uses_the_original_workspace() {
     let server = Server::new();
     let mut pid = server.status()["pid"].clone();
     for _ in 0..2 {
-        let output = server.command(&["server", "restart", "0123456789abcdef"]);
+        let output = server.command(&["session", "restart", "0123456789abcdef"]);
         assert!(
             output.status.success(),
             "{}",
@@ -258,17 +319,16 @@ fn default_servers_are_discovered_and_can_be_stopped_by_uppercase_id() {
         fs::metadata(&server.socket).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    let listed = server.command(&["server", "list"]);
+    let listed = server.command(&["session", "list"]);
     assert!(listed.status.success());
     let listing = String::from_utf8(listed.stdout).unwrap();
     let entries = listing.lines().skip(1).collect::<Vec<_>>();
     assert_eq!(entries.len(), 1, "{listing}");
     let fields = entries[0].split('\t').collect::<Vec<_>>();
-    assert_eq!(fields[0], id);
-    assert_eq!(fields[1], server.child.id().to_string());
-    assert_eq!(fields[4], server.workspace.to_str().unwrap());
-    assert_eq!(fields[5], server.socket.to_str().unwrap());
-    let stopped = server.command(&["server", "stop", &id.to_ascii_uppercase()]);
+    assert_eq!(fields[1], id);
+    assert_eq!(fields[3], server.child.id().to_string());
+    assert_eq!(fields[6], server.workspace.to_str().unwrap());
+    let stopped = server.command(&["session", "stop", &id.to_ascii_uppercase()]);
     assert!(
         stopped.status.success(),
         "{}",
@@ -353,7 +413,7 @@ fn existing_workspace_servers_are_reused_after_the_id_algorithm_changes() {
 fn restarting_a_relative_socket_preserves_its_location() {
     let server = Server::with_socket(|_| Some(PathBuf::from("relative.sock")));
     let before = server.status();
-    let restarted = server.command(&["server", "restart", "--socket", "relative.sock"]);
+    let restarted = server.command(&["session", "restart", "--socket", "relative.sock"]);
     assert!(
         restarted.status.success(),
         "{}",
@@ -369,7 +429,7 @@ fn restarting_a_relative_socket_preserves_its_location() {
 #[test]
 fn fragmented_management_requests_wait_for_the_delimiter() {
     let server = Server::new();
-    let mut stream = UnixStream::connect(&server.socket).unwrap();
+    let mut stream = connect(&server.socket);
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -403,7 +463,7 @@ fn oversized_requests_only_close_the_offending_connection() {
         let mut message = prefix.to_vec();
         message.resize(size - suffix.len(), b'x');
         message.extend_from_slice(suffix);
-        let mut stream = UnixStream::connect(&server.socket).unwrap();
+        let mut stream = connect(&server.socket);
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
@@ -439,7 +499,7 @@ fn attach(
     client_id: &str,
     epoch: Option<&Value>,
 ) -> (BufReader<UnixStream>, Value) {
-    let mut stream = UnixStream::connect(&server.socket).unwrap();
+    let mut stream = connect(&server.socket);
     send(
         &mut stream,
         json!({"type": "attach", "client_id": client_id, "width": 80, "height": 24, "context_epoch": epoch}),

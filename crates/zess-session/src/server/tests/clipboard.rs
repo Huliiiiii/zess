@@ -47,6 +47,12 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         if let Ok(mut stream) = UnixStream::connect(&self.socket) {
+            let _ = framing::write(
+                &mut stream,
+                &ClientMessage::Hello {
+                    build_id: zess_build::BUILD_ID.into(),
+                },
+            );
             let _ = framing::write(&mut stream, &ClientMessage::Stop { force: true });
         }
         if let Some(thread) = self.thread.take() {
@@ -80,7 +86,21 @@ impl Client {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         framing::write(
             &mut stream,
+            &ClientMessage::Hello {
+                build_id: zess_build::BUILD_ID.into(),
+            },
+        )
+        .unwrap();
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&hello).unwrap(),
+            ServerMessage::Hello { .. }
+        ));
+        framing::write(
+            &mut stream,
             &ClientMessage::Attach {
+                expected_session: None,
                 client_id: client_id.into(),
                 width: 80,
                 height: 24,

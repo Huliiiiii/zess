@@ -41,6 +41,7 @@ helix-loader = { path = "vendor/helix-loader" }
 helix-core = { git = "https://github.com/helix-editor/helix", rev = "ba40e547426b0f9896c8bdc699a4ab11f2b37dbc" }
 helix-stdx = { git = "https://github.com/helix-editor/helix", rev = "ba40e547426b0f9896c8bdc699a4ab11f2b37dbc" }
 steel-core = { path = "vendor/steel-core", default-features = false, features = ["std", "modules", "sandbox"] }
+zess-build = { path = "crates/zess-build" }
 zess-filter = { path = "crates/zess-filter" }
 zess-platform = { path = "crates/zess-platform" }
 zess-remote = { path = "crates/zess-remote" }
@@ -67,6 +68,7 @@ edition.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zess-build.workspace = true
 zess-platform.workspace = true
 zess-remote.workspace = true
 zess-protocol.workspace = true

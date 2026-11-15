@@ -10,7 +10,9 @@ use std::{
 };
 
 use anyhow::Result;
-use zess_ipc::platform::{DaemonControl, DaemonHandle, DaemonSpec, NativeDaemonControl};
+use zess_ipc::platform::{
+    DaemonControl, DaemonHandle, DaemonSpec, NativeDaemonControl, ProcessWait,
+};
 use zess_ipc::{Listener, LocalIpc, NativeLocalIpc, ServerId, SocketPath, Stream};
 use zess_platform::{
     CancellationToken, HostInfo, NativeFileSystem, NativePlatform, Platform, UserDirs,
@@ -23,7 +25,6 @@ struct ScopedIpc {
     endpoint: SocketPath,
     stale: SocketPath,
     log: PathBuf,
-    reject_presence: AtomicBool,
 }
 
 impl LocalIpc for ScopedIpc {
@@ -53,17 +54,6 @@ impl LocalIpc for ScopedIpc {
 
     fn log_path(&self, _: &SocketPath) -> PathBuf {
         self.log.clone()
-    }
-
-    fn is_present(&self, endpoint: &SocketPath) -> io::Result<bool> {
-        if self.reject_presence.load(Ordering::Relaxed) {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "endpoint presence unavailable",
-            ))
-        } else {
-            NativeLocalIpc.is_present(endpoint)
-        }
     }
 }
 
@@ -103,9 +93,20 @@ struct TestDaemons {
     log: PathBuf,
     spawns: AtomicUsize,
     stops: AtomicUsize,
+    reject_watch: AtomicBool,
 }
 
 impl DaemonControl for TestDaemons {
+    fn watch(&self, stream: &Stream) -> Result<Box<dyn ProcessWait>> {
+        if self.reject_watch.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "process watch unavailable",
+            )
+            .into());
+        }
+        NativeDaemonControl.watch(stream)
+    }
     fn stop(&self, endpoint: &SocketPath) -> Result<()> {
         self.stops.fetch_add(1, Ordering::Relaxed);
         NativeDaemonControl.stop(endpoint)
@@ -121,7 +122,6 @@ struct Server {
     root: tempfile::TempDir,
     manager: server::SessionManager,
     daemons: Arc<TestDaemons>,
-    ipc: Arc<ScopedIpc>,
     endpoint: SocketPath,
     workspace: PathBuf,
     config: PathBuf,
@@ -140,12 +140,12 @@ impl Server {
             log: root.path().join("server.log"),
             spawns: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
+            reject_watch: AtomicBool::new(false),
         });
         let ipc = Arc::new(ScopedIpc {
             endpoint: endpoint.clone(),
             stale: SocketPath::from(root.path().join("unreachable.sock")),
             log: daemons.log.clone(),
-            reject_presence: AtomicBool::new(false),
         });
         let manager = server::SessionManager::new(
             Arc::new(NativeFileSystem),
@@ -157,7 +157,6 @@ impl Server {
             root,
             manager,
             daemons,
-            ipc,
             endpoint,
             workspace,
             config,
@@ -189,10 +188,10 @@ fn workspace_session_creation_uses_the_configured_endpoint_and_log_path() {
 }
 
 #[test]
-fn restarting_does_not_spawn_a_replacement_when_endpoint_removal_cannot_be_checked() {
+fn restarting_does_not_spawn_a_replacement_when_process_cannot_be_watched() {
     let server = Server::new();
     server.start();
-    server.ipc.reject_presence.store(true, Ordering::Relaxed);
+    server.daemons.reject_watch.store(true, Ordering::Relaxed);
     let error = server
         .manager
         .restart(&server.endpoint, None, Some(&server.config), false)
@@ -202,6 +201,7 @@ fn restarting_does_not_spawn_a_replacement_when_endpoint_removal_cannot_be_check
         io::ErrorKind::PermissionDenied
     );
     assert_eq!(server.daemons.spawns.load(Ordering::Relaxed), 1);
+    server.daemons.reject_watch.store(false, Ordering::Relaxed);
 }
 
 impl Drop for Server {
@@ -282,6 +282,38 @@ fn cancelling_session_creation_before_it_starts_does_not_spawn_a_daemon() {
 }
 
 #[test]
+fn a_build_mismatch_does_not_start_another_session() {
+    let server = Server::new();
+    let listener = NativeLocalIpc.bind(&server.endpoint).unwrap();
+    let manager = server.manager.clone();
+    let workspace = server.workspace.clone();
+    let endpoint = server.endpoint.clone();
+    let worker = thread::spawn(move || manager.ensure(&workspace, &endpoint, None, &[]));
+    let mut stream = listener.accept().unwrap();
+    zess_ipc::framing::read(
+        &mut BufReader::new(stream.try_clone().unwrap()),
+        1024 * 1024,
+    )
+    .unwrap()
+    .unwrap();
+    stream
+        .write_all(
+            &zess_ipc::framing::encode(&zess_protocol::ServerMessage::Hello {
+                build_id: "different-build".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    let error = worker.join().unwrap().unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<zess_protocol::BuildMismatch>()
+            .is_some()
+    );
+    assert_eq!(server.daemons.spawns.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn cancelling_a_force_stop_wait_does_not_signal_the_daemon() {
     let server = Server::new();
     let listener = NativeLocalIpc.bind(&server.endpoint).unwrap();
@@ -303,7 +335,7 @@ fn cancelling_a_force_stop_wait_does_not_signal_the_daemon() {
         .unwrap();
     assert!(matches!(
         zess_ipc::framing::decode::<zess_protocol::ClientMessage>(&request).unwrap(),
-        zess_protocol::ClientMessage::Stop { force: true }
+        zess_protocol::ClientMessage::Hello { .. }
     ));
     cancellation.cancel();
     let error = result
@@ -332,8 +364,23 @@ fn management_responses_can_arrive_across_poll_intervals() {
     )
     .unwrap()
     .unwrap();
+    stream
+        .write_all(
+            &zess_ipc::framing::encode(&zess_protocol::ServerMessage::Hello {
+                build_id: zess_build::BUILD_ID.to_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    zess_ipc::framing::read(
+        &mut BufReader::new(stream.try_clone().unwrap()),
+        1024 * 1024,
+    )
+    .unwrap()
+    .unwrap();
     let response = zess_ipc::framing::encode(&zess_protocol::ServerMessage::Status {
         session_id: zess_protocol::SessionId("fragmented-session".into()),
+        name: None,
         server_instance: zess_protocol::ServerInstanceId("fragmented-instance".into()),
         state_revision: 5,
         pid: 42,

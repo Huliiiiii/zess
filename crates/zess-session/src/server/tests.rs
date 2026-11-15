@@ -1,4 +1,5 @@
 mod clipboard;
+mod lifecycle;
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -245,6 +246,13 @@ fn mouse_input_is_applied_once_only_in_the_attached_context() {
     impl Drop for RunningServer {
         fn drop(&mut self) {
             if let Ok(mut stream) = UnixStream::connect(&self.socket) {
+                framing::write(
+                    &mut stream,
+                    &ClientMessage::Hello {
+                        build_id: zess_build::BUILD_ID.into(),
+                    },
+                )
+                .unwrap();
                 serde_json::to_writer(&mut stream, &ClientMessage::Stop { force: true }).unwrap();
                 stream.write_all(b"\n").unwrap();
             }
@@ -255,13 +263,31 @@ fn mouse_input_is_applied_once_only_in_the_attached_context() {
         }
     }
     fn send(stream: &mut UnixStream, message: &ClientMessage) {
+        if matches!(
+            message,
+            ClientMessage::Attach { .. } | ClientMessage::Status | ClientMessage::Stop { .. }
+        ) {
+            framing::write(
+                stream,
+                &ClientMessage::Hello {
+                    build_id: zess_build::BUILD_ID.into(),
+                },
+            )
+            .unwrap();
+        }
         serde_json::to_writer(&mut *stream, message).unwrap();
         stream.write_all(b"\n").unwrap();
     }
     fn receive(reader: &mut BufReader<UnixStream>) -> ServerMessage {
         let mut line = String::new();
         assert!(reader.read_line(&mut line).unwrap() > 0);
-        serde_json::from_str(&line).unwrap()
+        let message = serde_json::from_str(&line).unwrap();
+        if let ServerMessage::Hello { build_id } = message {
+            zess_protocol::check_build_id(&build_id).unwrap();
+            receive(reader)
+        } else {
+            message
+        }
     }
     fn acknowledged(reader: &mut BufReader<UnixStream>, sequence: u64) {
         loop {
@@ -316,6 +342,7 @@ fn mouse_input_is_applied_once_only_in_the_attached_context() {
     send(
         &mut stream,
         &ClientMessage::Attach {
+            expected_session: None,
             client_id: "mouse-test".into(),
             width: 80,
             height: 24,
@@ -514,6 +541,12 @@ fn reconnecting_retains_command_results_without_repeating_the_command() {
     impl Drop for RunningServer {
         fn drop(&mut self) {
             if let Ok(mut stream) = UnixStream::connect(&self.socket) {
+                let _ = framing::write(
+                    &mut stream,
+                    &ClientMessage::Hello {
+                        build_id: zess_build::BUILD_ID.into(),
+                    },
+                );
                 let _ = framing::write(&mut stream, &ClientMessage::Stop { force: true });
             }
             if let Some(thread) = self.thread.take() {
@@ -523,13 +556,31 @@ fn reconnecting_retains_command_results_without_repeating_the_command() {
         }
     }
     fn send(stream: &mut UnixStream, message: &ClientMessage) {
+        if matches!(
+            message,
+            ClientMessage::Attach { .. } | ClientMessage::Status | ClientMessage::Stop { .. }
+        ) {
+            framing::write(
+                stream,
+                &ClientMessage::Hello {
+                    build_id: zess_build::BUILD_ID.into(),
+                },
+            )
+            .unwrap();
+        }
         serde_json::to_writer(&mut *stream, message).unwrap();
         stream.write_all(b"\n").unwrap();
     }
     fn receive(reader: &mut BufReader<UnixStream>) -> ServerMessage {
         let mut line = String::new();
         assert!(reader.read_line(&mut line).unwrap() > 0);
-        serde_json::from_str(&line).unwrap()
+        let message = serde_json::from_str(&line).unwrap();
+        if let ServerMessage::Hello { build_id } = message {
+            zess_protocol::check_build_id(&build_id).unwrap();
+            receive(reader)
+        } else {
+            message
+        }
     }
     fn attach(
         socket: &std::path::Path,
@@ -548,6 +599,7 @@ fn reconnecting_retains_command_results_without_repeating_the_command() {
         send(
             &mut stream,
             &ClientMessage::Attach {
+                expected_session: None,
                 client_id: "command-reconnect".into(),
                 width: 80,
                 height: 24,
