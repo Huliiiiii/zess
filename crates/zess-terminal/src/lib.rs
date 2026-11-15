@@ -17,6 +17,7 @@ use crossterm::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use zess_ipc::platform::{DaemonControl, NativeDaemonControl, ProcessWait};
 use zess_ipc::{SocketPath, Stream, framing};
 use zess_platform::{NativePlatform, Platform};
 use zess_protocol::{
@@ -51,6 +52,7 @@ const MAX_CONNECT_ATTEMPTS: u8 = 5;
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+const SERVER_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run the terminal client connected to a local zess server socket.
 pub fn run(socket: &SocketPath) -> Result<()> {
@@ -78,11 +80,62 @@ pub trait ConnectionFactory {
 /// Nonblocking byte transport consumed by the terminal event loop.
 pub trait ConnectionStream: Read + Write {
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
+    fn wait_for_server_exit(&mut self, timeout: Duration) -> Result<bool>;
+    fn session_id(&self) -> Option<&zess_protocol::SessionId> {
+        None
+    }
 }
 
-impl ConnectionStream for Stream {
+pub struct LocalConnection {
+    stream: Stream,
+    process: Box<dyn ProcessWait>,
+    session_id: Option<zess_protocol::SessionId>,
+}
+
+impl LocalConnection {
+    pub fn new(stream: Stream, process: Box<dyn ProcessWait>) -> Self {
+        Self {
+            stream,
+            process,
+            session_id: None,
+        }
+    }
+
+    pub fn with_session_id(mut self, session_id: zess_protocol::SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+}
+
+impl Read for LocalConnection {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(bytes)
+    }
+}
+
+impl Write for LocalConnection {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl ConnectionStream for LocalConnection {
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        Stream::set_nonblocking(self, nonblocking)
+        self.stream.set_nonblocking(nonblocking)
+    }
+
+    fn wait_for_server_exit(&mut self, timeout: Duration) -> Result<bool> {
+        self.process
+            .wait(timeout)
+            .context("wait for zess server to exit")
+    }
+
+    fn session_id(&self) -> Option<&zess_protocol::SessionId> {
+        self.session_id.as_ref()
     }
 }
 
@@ -90,9 +143,10 @@ pub struct LocalConnectionFactory(pub SocketPath);
 
 impl ConnectionFactory for LocalConnectionFactory {
     fn connect(&mut self) -> Result<Box<dyn ConnectionStream>> {
-        Stream::connect(&self.0)
-            .map(|stream| Box::new(stream) as Box<dyn ConnectionStream>)
-            .with_context(|| format!("connect to zess socket {}", self.0.display()))
+        let stream = Stream::connect(&self.0)
+            .with_context(|| format!("connect to zess socket {}", self.0.display()))?;
+        let process = NativeDaemonControl.watch(&stream)?;
+        Ok(Box::new(LocalConnection::new(stream, process)))
     }
 }
 
@@ -166,6 +220,7 @@ struct Connection {
     input: framing::Decoder,
     output: VecDeque<Vec<u8>>,
     written: usize,
+    pending_attach: Option<ClientMessage>,
 }
 
 impl Connection {
@@ -174,23 +229,31 @@ impl Connection {
         client_id: &str,
         files: &[String],
         context_epoch: Option<u64>,
+        expected_session: Option<&zess_protocol::SessionId>,
         width: u16,
         height: u16,
     ) -> Result<Self> {
         let stream = factory.connect()?;
+        let expected_session = expected_session
+            .cloned()
+            .or_else(|| stream.session_id().cloned());
         stream.set_nonblocking(true)?;
         let mut connection = Self {
             stream,
             input: framing::Decoder::default(),
             output: VecDeque::new(),
             written: 0,
+            pending_attach: Some(ClientMessage::Attach {
+                expected_session,
+                client_id: client_id.to_owned(),
+                files: files.to_vec(),
+                context_epoch,
+                width,
+                height,
+            }),
         };
-        connection.send(&ClientMessage::Attach {
-            client_id: client_id.to_owned(),
-            files: files.to_vec(),
-            context_epoch,
-            width,
-            height,
+        connection.send(&ClientMessage::Hello {
+            build_id: zess_build::BUILD_ID.to_owned(),
         })?;
         Ok(connection)
     }
@@ -233,11 +296,27 @@ impl Connection {
                     for fragment in bytes[..count].split_inclusive(|byte| *byte == b'\n') {
                         self.input.push(fragment, MAX_MESSAGE_BYTES)?;
                         if fragment.last() == Some(&b'\n') {
-                            messages.push(
-                                self.input
-                                    .decode_next()?
-                                    .expect("fragment completes a message"),
-                            );
+                            let message = self
+                                .input
+                                .decode_next()?
+                                .expect("fragment completes a message");
+                            if self.pending_attach.is_some() {
+                                match message {
+                                    ServerMessage::Hello { build_id } => {
+                                        zess_protocol::check_build_id(&build_id)?;
+                                        let attach = self.pending_attach.take().unwrap();
+                                        self.send(&attach)?;
+                                    }
+                                    ServerMessage::Rejected { reason } => {
+                                        anyhow::bail!("zess handshake rejected: {reason}")
+                                    }
+                                    _ => {
+                                        anyhow::bail!("expected zess Hello before server messages")
+                                    }
+                                }
+                            } else {
+                                messages.push(message);
+                            }
                         }
                     }
                 }
@@ -247,6 +326,15 @@ impl Connection {
             }
         }
         Ok(messages)
+    }
+
+    fn wait_for_server_exit(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.stream.wait_for_server_exit(SERVER_EXIT_TIMEOUT)?,
+            "zess server did not exit within {} seconds",
+            SERVER_EXIT_TIMEOUT.as_secs()
+        );
+        Ok(())
     }
 }
 
@@ -318,7 +406,6 @@ enum PendingInput {
 
 struct PendingOperation {
     server_instance: ServerInstanceId,
-    exits_client: bool,
     action_id: Option<u64>,
     workspace_change: Option<zess_protocol::ClientActionKind>,
 }
@@ -344,32 +431,24 @@ impl InputLedger {
         }
     }
 
-    fn request_id(&mut self, client_id: &str) -> Result<RequestId> {
+    fn request_id(&mut self) -> Result<RequestId> {
         let sequence = self.next_request_id;
         self.next_request_id = sequence
             .checked_add(1)
             .context("client request ID sequence exhausted")?;
-        Ok(RequestId(format!("{client_id}-{sequence}")))
+        Ok(RequestId(sequence))
     }
 
-    fn attach(&mut self, server_instance: ServerInstanceId, acknowledged: u64) -> bool {
-        let replaced = self
-            .server_instance
-            .as_ref()
-            .is_some_and(|previous| previous != &server_instance);
-        if replaced {
-            // A new server has a new deduplication ledger. Only unresolved input
-            // crosses this boundary; already acknowledged input must stay consumed.
-            self.acknowledged = 0;
-            self.next_sequence = 1;
-            for (sequence, _) in &mut self.pending {
-                *sequence = self.next_sequence;
-                self.next_sequence += 1;
-            }
-        }
+    fn attach(&mut self, server_instance: ServerInstanceId, acknowledged: u64) -> Result<()> {
+        anyhow::ensure!(
+            self.server_instance
+                .as_ref()
+                .is_none_or(|previous| previous == &server_instance),
+            "the original zess server is no longer available"
+        );
         self.server_instance = Some(server_instance);
         self.acknowledge(acknowledged);
-        replaced
+        Ok(())
     }
 
     fn acknowledge(&mut self, acknowledged: u64) {
@@ -534,6 +613,7 @@ fn run_client<C: Clipboard>(
     let mut submitted_actions = HashSet::new();
     let mut client_workspace = zess_protocol::ClientWorkspace::default();
     let mut context_epoch = None;
+    let mut expected_session = None;
     let mut remote_state: Option<RemoteStateCache> = None;
     let mut attach_metadata = None;
     let mut resync_deadline = None;
@@ -557,11 +637,21 @@ fn run_client<C: Clipboard>(
             if Instant::now() >= *retry_at {
                 let attempts = attempts + 1;
                 terminal.suspend()?;
-                let attempt =
-                    Connection::connect(factory, &client_id, &files, context_epoch, width, height);
+                let attempt = Connection::connect(
+                    factory,
+                    &client_id,
+                    &files,
+                    context_epoch,
+                    expected_session.as_ref(),
+                    width,
+                    height,
+                );
                 terminal.resume()?;
                 connection = match attempt {
                     Ok(connection) => {
+                        if expected_session.is_none() {
+                            expected_session = connection.stream.session_id().cloned();
+                        }
                         ui.notice = Some("Connected; attaching...".into());
                         ClientConnection::Attaching {
                             connection,
@@ -646,8 +736,6 @@ fn run_client<C: Clipboard>(
                     continue;
                 }
                 let action = command.action;
-                let exits_client =
-                    matches!(&action, zess_protocol::CommandAction::ClientExit { .. });
                 let action_id = match &action {
                     zess_protocol::CommandAction::AcknowledgeClientAction { action_id }
                     | zess_protocol::CommandAction::CloseBuffer { action_id, .. }
@@ -664,10 +752,10 @@ fn run_client<C: Clipboard>(
                         .map(|pending| pending.kind.clone()),
                     _ => None,
                 };
-                let request_id = ledger.request_id(&client_id)?;
+                let request_id = ledger.request_id()?;
                 let server_instance = ledger.server_instance.clone().unwrap();
                 let message = ClientMessage::Command {
-                    request_id: request_id.clone(),
+                    request_id,
                     server_instance: server_instance.clone(),
                     action,
                 };
@@ -680,7 +768,6 @@ fn run_client<C: Clipboard>(
                     request_id,
                     PendingOperation {
                         server_instance,
-                        exits_client,
                         action_id,
                         workspace_change,
                     },
@@ -692,6 +779,12 @@ fn run_client<C: Clipboard>(
         let messages = match connection.active_mut().map(Connection::poll).transpose() {
             Ok(messages) => messages.unwrap_or_default(),
             Err(error) => {
+                if error
+                    .downcast_ref::<zess_protocol::BuildMismatch>()
+                    .is_some()
+                {
+                    return Err(error);
+                }
                 ui.notice = Some(format!("Disconnected; reconnecting: {error}"));
                 connection.disconnect();
                 ui.dirty = true;
@@ -701,6 +794,7 @@ fn run_client<C: Clipboard>(
         for message in messages {
             let primary_write = matches!(&message, ServerMessage::ClipboardWritePrimary { .. });
             match message {
+                ServerMessage::Hello { .. } => anyhow::bail!("unexpected duplicate zess Hello"),
                 ServerMessage::Attached {
                     server_instance,
                     acknowledged,
@@ -708,6 +802,13 @@ fn run_client<C: Clipboard>(
                     replay_allowed,
                     frame: _,
                 } => {
+                    anyhow::ensure!(
+                        ledger
+                            .server_instance
+                            .as_ref()
+                            .is_none_or(|expected| expected == &server_instance),
+                        "the original zess server is no longer available"
+                    );
                     attach_metadata = Some((server_instance, acknowledged, epoch, replay_allowed));
                     remote_state = None;
                     ui.dirty = true;
@@ -719,15 +820,18 @@ fn run_client<C: Clipboard>(
                     state,
                     frame: _,
                 } => {
+                    anyhow::ensure!(
+                        expected_session
+                            .as_ref()
+                            .is_none_or(|expected| expected == &session_id),
+                        "the original zess session is no longer available"
+                    );
                     let expected_server = attach_metadata
                         .as_ref()
                         .map(|(instance, _, _, _)| instance)
                         .or(ledger.server_instance.as_ref());
                     if expected_server.is_some_and(|expected| expected != &server_instance) {
-                        connection.disconnect();
-                        ui.notice = Some("Server identity changed; reconnecting".into());
-                        ui.dirty = true;
-                        break;
+                        anyhow::bail!("the original zess server is no longer available");
                     }
                     let next_state = RemoteStateCache {
                         session_id,
@@ -756,6 +860,7 @@ fn run_client<C: Clipboard>(
                         }
                     }
                     resync_deadline = None;
+                    expected_session = Some(remote_state.as_ref().unwrap().session_id.clone());
                     client_workspace = remote_state.as_ref().unwrap().state.workspace.clone();
                     let Some((attached_instance, acknowledged, epoch, replay_allowed)) =
                         attach_metadata.take()
@@ -771,28 +876,18 @@ fn run_client<C: Clipboard>(
                         "snapshot does not match attachment server"
                     );
                     clipboard.attach(&server_instance);
-                    let replaced = ledger.attach(server_instance, acknowledged);
-                    if replaced {
-                        submitted_actions.clear();
-                    }
+                    ledger.attach(server_instance, acknowledged)?;
                     connection.finish_attach();
                     context_epoch = Some(epoch);
                     recovery = match recovery {
                         InputRecovery::AwaitSkip { through, .. } if !ledger.pending.is_empty() => {
-                            InputRecovery::AwaitSkip {
-                                epoch,
-                                through: if replaced {
-                                    ledger.pending.back().unwrap().0
-                                } else {
-                                    through
-                                },
-                            }
+                            InputRecovery::AwaitSkip { epoch, through }
                         }
                         _ if ledger.pending.is_empty() => InputRecovery::Ready,
                         InputRecovery::ConfirmReplay { .. } => {
                             InputRecovery::ConfirmReplay { epoch }
                         }
-                        _ if replay_allowed && !replaced => InputRecovery::Ready,
+                        _ if replay_allowed => InputRecovery::Ready,
                         _ => InputRecovery::ConfirmReplay { epoch },
                     };
                     let active = connection.active_mut().unwrap();
@@ -816,7 +911,7 @@ fn run_client<C: Clipboard>(
                     }
                     for (request_id, operation) in &ledger.operations {
                         active.send(&ClientMessage::QueryOperation {
-                            request_id: request_id.clone(),
+                            request_id: *request_id,
                             server_instance: operation.server_instance.clone(),
                         })?;
                     }
@@ -886,48 +981,42 @@ fn run_client<C: Clipboard>(
                     server_instance,
                     result,
                 } => {
-                    if ledger.operations.contains_key(&request_id)
-                        && ledger.server_instance.as_ref() == Some(&server_instance)
-                    {
+                    if ledger.server_instance.as_ref() == Some(&server_instance) {
                         match result {
                             zess_protocol::OperationResult::Completed { outcome, .. } => {
-                                let operation = ledger.operations.remove(&request_id).unwrap();
-                                let exited = operation.exits_client
-                                    && matches!(&outcome, zess_protocol::CommandOutcome::Applied);
-                                match (&outcome, operation.workspace_change) {
-                                    (zess_protocol::CommandOutcome::Applied, Some(change)) => {
-                                        client_workspace.apply(&change)
-                                    }
-                                    (
-                                        zess_protocol::CommandOutcome::BufferClosed {
-                                            buffer_id,
-                                            replacement,
-                                        },
-                                        _,
-                                    ) => {
-                                        client_workspace.buffers.retain(|id| id != buffer_id);
-                                        if !client_workspace.buffers.contains(replacement) {
-                                            client_workspace.buffers.push(*replacement);
+                                if let Some(operation) = ledger.operations.remove(&request_id) {
+                                    match (&outcome, operation.workspace_change) {
+                                        (zess_protocol::CommandOutcome::Applied, Some(change)) => {
+                                            client_workspace.apply(&change)
                                         }
-                                        client_workspace.current = Some(*replacement);
+                                        (
+                                            zess_protocol::CommandOutcome::BufferClosed {
+                                                buffer_id,
+                                                replacement,
+                                            },
+                                            _,
+                                        ) => {
+                                            client_workspace.buffers.retain(|id| id != buffer_id);
+                                            if !client_workspace.buffers.contains(replacement) {
+                                                client_workspace.buffers.push(*replacement);
+                                            }
+                                            client_workspace.current = Some(*replacement);
+                                        }
+                                        _ => {}
                                     }
-                                    _ => {}
-                                }
-                                match outcome {
-                                    zess_protocol::CommandOutcome::Failed { message } => {
+                                    if let zess_protocol::CommandOutcome::Failed { message } =
+                                        outcome
+                                    {
                                         ui.notice = Some(message);
                                         ui.dirty = true;
                                     }
-                                    _ => {}
                                 }
+                                // A reconnect can resend a result if its earlier ACK was lost.
                                 if let Some(active) = connection.active_mut() {
                                     active.send(&ClientMessage::ResultAck {
                                         request_id,
                                         server_instance,
                                     })?;
-                                }
-                                if exited {
-                                    return Ok(());
                                 }
                             }
                             zess_protocol::OperationResult::Unknown => {
@@ -935,15 +1024,23 @@ fn run_client<C: Clipboard>(
                                     if let Some(action_id) = operation.action_id {
                                         submitted_actions.remove(&action_id);
                                     }
+                                    ui.notice = Some("The previous operation's outcome is unknown; check the remote state before retrying".into());
+                                    ui.dirty = true;
                                 }
-                                ui.notice = Some("The previous operation's outcome is unknown; check the remote state before retrying".into());
-                                ui.dirty = true;
                             }
                             zess_protocol::OperationResult::Pending => {}
                         }
                     }
                 }
-                ServerMessage::Detached => return Ok(()),
+                ServerMessage::Detached { disposition } => {
+                    if disposition == zess_protocol::ClientExitDisposition::Stopping {
+                        connection
+                            .active_mut()
+                            .context("server exit has no connection")?
+                            .wait_for_server_exit()?;
+                    }
+                    return Ok(());
+                }
                 ServerMessage::Update { .. } => {}
                 ServerMessage::ClipboardWrite { text }
                 | ServerMessage::ClipboardWritePrimary { text } => {
@@ -957,18 +1054,15 @@ fn run_client<C: Clipboard>(
                     }
                 }
                 ServerMessage::Rejected { reason } => {
-                    if ledger.pending.is_empty() {
-                        anyhow::bail!("zess server rejected the client: {}", sanitize(&reason));
-                    }
-                    ui.notice = Some(format!(
-                        "Server rejected reconnect; retaining queued input: {}",
-                        sanitize(&reason)
-                    ));
-                    connection.disconnect();
-                    ui.dirty = true;
-                    break;
+                    anyhow::bail!("zess server rejected the client: {}", sanitize(&reason));
                 }
-                ServerMessage::Exited => return Ok(()),
+                ServerMessage::Exited => {
+                    connection
+                        .active_mut()
+                        .context("server exit has no connection")?
+                        .wait_for_server_exit()?;
+                    return Ok(());
+                }
                 ServerMessage::Status { .. } => anyhow::bail!("unexpected server status response"),
             }
         }
@@ -1118,13 +1212,12 @@ fn run_client<C: Clipboard>(
                             for (_, input) in &ledger.pending {
                                 if let PendingInput::TrackedKey { request_id, .. } = input {
                                     ledger.operations.insert(
-                                        request_id.clone(),
+                                        *request_id,
                                         PendingOperation {
                                             server_instance: ledger
                                                 .server_instance
                                                 .clone()
                                                 .unwrap(),
-                                            exits_client: false,
                                             action_id: None,
                                             workspace_change: None,
                                         },
@@ -1167,17 +1260,16 @@ fn run_client<C: Clipboard>(
                 let epoch = context_epoch.expect("attached clients have a context epoch");
                 let tracked = key == "Enter";
                 if tracked {
-                    let request_id = ledger.request_id(&client_id)?;
+                    let request_id = ledger.request_id()?;
                     let server_instance = ledger.server_instance.clone().unwrap();
                     let sequence = ledger.push(PendingInput::TrackedKey {
                         key: key.clone(),
-                        request_id: request_id.clone(),
+                        request_id,
                     });
                     ledger.operations.insert(
-                        request_id.clone(),
+                        request_id,
                         PendingOperation {
                             server_instance: server_instance.clone(),
-                            exits_client: false,
                             action_id: None,
                             workspace_change: None,
                         },
@@ -1219,7 +1311,7 @@ fn send_pending(
             PendingInput::TrackedKey { key, request_id } => ClientMessage::TrackedInput {
                 sequence: *sequence,
                 key: key.clone(),
-                request_id: request_id.clone(),
+                request_id: *request_id,
                 server_instance: server_instance.clone(),
                 context_epoch,
             },

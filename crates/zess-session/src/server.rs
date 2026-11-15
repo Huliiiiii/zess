@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     io::{ErrorKind, Read, Write},
     thread,
     time::{Duration, Instant},
@@ -26,6 +26,9 @@ struct PendingMessage {
 }
 
 enum ConnectionRole {
+    AwaitHello {
+        accepted: Instant,
+    },
     Unidentified {
         accepted: Instant,
     },
@@ -43,7 +46,7 @@ impl ConnectionRole {
         match self {
             Self::Attached { client } => Some(client),
             Self::Closing { client, .. } => client.as_ref(),
-            Self::Unidentified { .. } => None,
+            Self::Unidentified { .. } | Self::AwaitHello { .. } => None,
         }
     }
 }
@@ -77,7 +80,7 @@ struct Connection {
     written: usize,
     role: ConnectionRole,
     eof: bool,
-    normal_exit: bool,
+    exit_disposition: Option<zess_protocol::ClientExitDisposition>,
 }
 
 impl Connection {
@@ -88,11 +91,11 @@ impl Connection {
             input: framing::Decoder::default(),
             output: VecDeque::new(),
             written: 0,
-            role: ConnectionRole::Unidentified {
+            role: ConnectionRole::AwaitHello {
                 accepted: Instant::now(),
             },
             eof: false,
-            normal_exit: false,
+            exit_disposition: None,
         })
     }
 
@@ -253,7 +256,7 @@ impl PublishedState {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(PartialEq)]
 enum OperationAction {
     Command(CommandAction),
     Input {
@@ -264,15 +267,36 @@ enum OperationAction {
 }
 
 struct Operation {
-    token: String,
     action: OperationAction,
-    result: OperationResult,
-    acknowledged: bool,
+    completed: Option<OperationCompletion>,
+}
+
+impl Operation {
+    fn result(&self) -> OperationResult {
+        match &self.completed {
+            Some(completion) => OperationResult::Completed {
+                outcome: completion.outcome.clone(),
+                state_revision: completion.state_revision,
+            },
+            None => OperationResult::Pending,
+        }
+    }
+}
+
+struct OperationCompletion {
+    outcome: CommandOutcome,
+    state_revision: u64,
+}
+
+#[derive(Default)]
+struct ClientOperations {
+    last_started: u64,
+    unacknowledged: BTreeMap<RequestId, Operation>,
 }
 
 #[derive(Default)]
 struct OperationTable {
-    operations: HashMap<(String, RequestId), Operation>,
+    clients: HashMap<String, ClientOperations>,
 }
 
 impl OperationTable {
@@ -284,11 +308,11 @@ impl OperationTable {
         session: &mut Session,
         published: &mut PublishedState,
     ) -> (OperationResult, Option<ServerMessage>) {
-        let key = (client.to_owned(), request_id);
-        if let Some(operation) = self.operations.get(&key) {
+        let operations = self.clients.entry(client.to_owned()).or_default();
+        if let Some(operation) = operations.unacknowledged.get(&request_id) {
             return (
                 if operation.action == action {
-                    operation.result.clone()
+                    operation.result()
                 } else {
                     OperationResult::Completed {
                         outcome: CommandOutcome::Failed {
@@ -300,63 +324,69 @@ impl OperationTable {
                 None,
             );
         }
-        let token = format!("{}:{}:{}", client.len(), client, key.1.0);
-        self.operations.insert(
-            key.clone(),
-            Operation {
-                token: token.clone(),
-                action: action.clone(),
-                result: OperationResult::Pending,
-                acknowledged: false,
-            },
-        );
+        // Acknowledged operations can be dropped because new requests arrive in
+        // order. Gaps are allowed when the client discards an unsent request.
+        if request_id.0 <= operations.last_started {
+            return (OperationResult::Unknown, None);
+        }
+        operations.last_started = request_id.0;
+        let token = format!("{client}:{}", request_id.0);
         let outcome = match &action {
             OperationAction::Command(action) => session.begin_operation(&token, action),
             OperationAction::Input { key, .. } => session.tracked_input(&token, key),
         };
         let delta = published.refresh(session);
-        let result = match outcome {
-            Some(outcome) => OperationResult::Completed {
+        let operation = Operation {
+            action,
+            completed: outcome.map(|outcome| OperationCompletion {
                 outcome,
                 state_revision: published.revision,
-            },
-            None => OperationResult::Pending,
+            }),
         };
-        self.operations.get_mut(&key).unwrap().result = result.clone();
+        let result = operation.result();
+        operations.unacknowledged.insert(request_id, operation);
         (result, delta)
     }
 
-    fn complete(
+    fn complete<'token>(
         &mut self,
-        token: &str,
+        token: &'token str,
         outcome: CommandOutcome,
         revision: u64,
-    ) -> Option<(String, RequestId, OperationResult)> {
-        let ((client, request_id), operation) = self
-            .operations
-            .iter_mut()
-            .find(|(_, operation)| operation.token == token)?;
-        if !matches!(operation.result, OperationResult::Pending) {
+    ) -> Option<(&'token str, RequestId, OperationResult)> {
+        let (client, request_id) = token.rsplit_once(':')?;
+        let request_id = RequestId(request_id.parse().ok()?);
+        let operation = self
+            .clients
+            .get_mut(client)?
+            .unacknowledged
+            .get_mut(&request_id)?;
+        if operation.completed.is_some() {
             return None;
         }
-        operation.result = OperationResult::Completed {
+        operation.completed = Some(OperationCompletion {
             outcome,
             state_revision: revision,
-        };
-        operation.acknowledged = false;
-        Some((client.clone(), request_id.clone(), operation.result.clone()))
+        });
+        Some((client, request_id, operation.result()))
     }
 
-    fn result(&self, client: &str, request_id: &RequestId) -> OperationResult {
-        self.operations
-            .get(&(client.to_owned(), request_id.clone()))
-            .map(|operation| operation.result.clone())
+    fn result(&self, client: &str, request_id: RequestId) -> OperationResult {
+        self.clients
+            .get(client)
+            .and_then(|operations| operations.unacknowledged.get(&request_id))
+            .map(Operation::result)
             .unwrap_or(OperationResult::Unknown)
     }
 
     fn acknowledge(&mut self, client: &str, request_id: RequestId) {
-        if let Some(operation) = self.operations.get_mut(&(client.to_owned(), request_id)) {
-            operation.acknowledged = true;
+        if let Some(operations) = self.clients.get_mut(client)
+            && operations
+                .unacknowledged
+                .get(&request_id)
+                .is_some_and(|operation| operation.completed.is_some())
+        {
+            operations.unacknowledged.remove(&request_id);
         }
     }
 
@@ -366,12 +396,12 @@ impl OperationTable {
         instance: &ServerInstanceId,
         connection: &mut Connection,
     ) -> Result<()> {
-        for ((owner, request_id), operation) in &self.operations {
-            if owner == client && !operation.acknowledged {
+        if let Some(operations) = self.clients.get(client) {
+            for (&request_id, operation) in &operations.unacknowledged {
                 connection.send(&ServerMessage::CommandResult {
-                    request_id: request_id.clone(),
+                    request_id,
                     server_instance: instance.clone(),
-                    result: operation.result.clone(),
+                    result: operation.result(),
                 })?;
             }
         }
@@ -442,12 +472,38 @@ pub fn serve_with_platform(
             let mut disconnected = messages.is_err();
             if let Ok(messages) = messages {
                 for message in messages {
+                    if matches!(connection.role, ConnectionRole::AwaitHello { .. })
+                        && !matches!(message, ClientMessage::Hello { .. })
+                    {
+                        connection.send(&ServerMessage::Rejected {
+                            reason:
+                                "Hello with a matching build is required before session requests"
+                                    .into(),
+                        })?;
+                        connection.close_after_flush();
+                        break;
+                    }
                     match message {
+                        ClientMessage::Hello { build_id }
+                            if matches!(connection.role, ConnectionRole::AwaitHello { .. }) =>
+                        {
+                            connection.send(&ServerMessage::Hello {
+                                build_id: zess_build::BUILD_ID.to_owned(),
+                            })?;
+                            if zess_protocol::check_build_id(&build_id).is_err() {
+                                connection.close_after_flush();
+                                break;
+                            }
+                            connection.role = ConnectionRole::Unidentified {
+                                accepted: Instant::now(),
+                            };
+                        }
                         ClientMessage::Status
                             if matches!(connection.role, ConnectionRole::Unidentified { .. }) =>
                         {
                             connection.send(&ServerMessage::Status {
                                 session_id: published.session_id.clone(),
+                                name: session.name().map(str::to_owned),
                                 server_instance: server_instance.clone(),
                                 state_revision: published.revision,
                                 pid: process_id,
@@ -474,13 +530,20 @@ pub fn serve_with_platform(
                             break;
                         }
                         ClientMessage::Attach {
+                            expected_session,
                             client_id,
                             width,
                             height,
                             files,
                             context_epoch: previous_epoch,
                         } if matches!(connection.role, ConnectionRole::Unidentified { .. }) => {
-                            if active.is_some() {
+                            if expected_session
+                                .as_ref()
+                                .is_some_and(|expected| expected != &published.session_id)
+                            {
+                                connection.send(&ServerMessage::Rejected { reason: "session identity changed; the original session is no longer available".into() })?;
+                                connection.close_after_flush();
+                            } else if active.is_some() {
                                 connection.send(&ServerMessage::Rejected {
                                     reason:
                                         "another terminal is attached; detach it with Ctrl-z first"
@@ -590,7 +653,7 @@ pub fn serve_with_platform(
                             let result = if sequence == *watermark + 1 {
                                 let (result, delta) = operations.execute(
                                     &client,
-                                    request_id.clone(),
+                                    request_id,
                                     OperationAction::Input {
                                         sequence,
                                         key,
@@ -605,7 +668,7 @@ pub fn serve_with_platform(
                                 }
                                 result
                             } else if sequence <= *watermark {
-                                operations.result(&client, &request_id)
+                                operations.result(&client, request_id)
                             } else {
                                 connection.send(&ServerMessage::Rejected { reason: "input sequence gap; reconnect to retry unacknowledged input".into() })?;
                                 connection.close_after_flush();
@@ -716,7 +779,7 @@ pub fn serve_with_platform(
                                 let client = connection.role.client().unwrap().clone();
                                 let (result, delta) = operations.execute(
                                     &client,
-                                    request_id.clone(),
+                                    request_id,
                                     OperationAction::Command(action),
                                     &mut session,
                                     &mut published,
@@ -742,9 +805,18 @@ pub fn serve_with_platform(
                                 result,
                             })?;
                             if exited {
-                                connection.send(&ServerMessage::Detached)?;
+                                let disposition = if active.as_ref() == connection.role.client()
+                                    && !session.modified()
+                                    && session.on_client_exit()
+                                        == zess_plugin::OnClientExit::StopIfUnused
+                                {
+                                    zess_protocol::ClientExitDisposition::Stopping
+                                } else {
+                                    zess_protocol::ClientExitDisposition::Retained
+                                };
+                                connection.send(&ServerMessage::Detached { disposition })?;
                                 connection.close_after_flush();
-                                connection.normal_exit = true;
+                                connection.exit_disposition = Some(disposition);
                             }
                         }
                         ClientMessage::QueryOperation {
@@ -752,7 +824,7 @@ pub fn serve_with_platform(
                             server_instance: expected,
                         } if matches!(connection.role, ConnectionRole::Attached { .. }) => {
                             let result = if expected == server_instance {
-                                operations.result(connection.role.client().unwrap(), &request_id)
+                                operations.result(connection.role.client().unwrap(), request_id)
                             } else {
                                 OperationResult::Unknown
                             };
@@ -810,6 +882,7 @@ pub fn serve_with_platform(
             }
             match connection.role {
                 ConnectionRole::Unidentified { accepted }
+                | ConnectionRole::AwaitHello { accepted }
                     if accepted.elapsed() > Duration::from_secs(5) =>
                 {
                     disconnected = true
@@ -820,16 +893,12 @@ pub fn serve_with_platform(
                 _ => {}
             }
             if disconnected {
-                let normal_exit =
-                    connection.normal_exit && !flush_failed && connection.output.is_empty();
+                let stopping = connection.exit_disposition
+                    == Some(zess_protocol::ClientExitDisposition::Stopping);
                 connections
                     .remove(index)
                     .disconnect(&mut session, &mut active);
-                if normal_exit
-                    && active.is_none()
-                    && !session.modified()
-                    && session.on_client_exit() == zess_plugin::OnClientExit::StopIfUnused
-                {
+                if stopping {
                     state = ServerState::Draining {
                         deadline: Instant::now() + DRAIN_TIMEOUT,
                     };
@@ -843,7 +912,12 @@ pub fn serve_with_platform(
         }
         if session.exiting() || matches!(state, ServerState::Draining { .. }) {
             for connection in &mut connections {
-                let _ = connection.send(&ServerMessage::Exited);
+                if matches!(
+                    connection.role,
+                    ConnectionRole::Attached { .. } | ConnectionRole::Unidentified { .. }
+                ) {
+                    let _ = connection.send(&ServerMessage::Exited);
+                }
                 connection.close_after_flush();
             }
             state = ServerState::Draining {
@@ -904,10 +978,12 @@ pub fn serve_with_platform(
             if let Some((client, request_id, result)) =
                 operations.complete(&token, outcome, published.revision)
             {
-                if let Some(connection) = connections
-                    .iter_mut()
-                    .find(|connection| connection.role.client() == Some(&client))
-                {
+                if let Some(connection) = connections.iter_mut().find(|connection| {
+                    connection
+                        .role
+                        .client()
+                        .is_some_and(|owner| owner == client)
+                }) {
                     connection.send(&ServerMessage::CommandResult {
                         request_id,
                         server_instance: server_instance.clone(),

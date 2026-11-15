@@ -11,12 +11,12 @@ Zess 支持 Linux 和 Windows。
 ```sh
 zess session list
 zess session new --workspace /path/to/project
-zess session connect --session SESSION_ID
+zess session attach --session SESSION_ID
 zess session stop --session SESSION_ID
 zess session restart --session SESSION_ID
 ```
 
-`restart` 和 `stop` 分别作用于仍在运行的会话；不要先 stop 再用同一 ID restart。restart 后会产生新的 Session ID，请重新 list 再选择会话。`session list` 显示会话 ID、进程、连接与修改状态及 workspace；`list`、`new` 和 `stop` 支持 `--json`。`new` 确保 workspace 的会话存在；文件参数用于新建的会话。复用已有会话时，要打开文件请通过编辑器或 connect 附着。stop 在有未保存内容时拒绝停止；`--force` 丢弃这些修改。restart 创建新的空会话，已保存文件保留，原会话的未保存内容、布局和撤销历史不会保留。远程会话也支持 `session restart --ssh HOST --session SESSION_ID`。Linux 上仅在 daemon 不响应管理协议、需要操作系统级强制停止兜底时，要求 Linux 6.5 或更新版本的 `SO_PEERPIDFD` 支持；正常的 stop 或 force 管理协议不依赖该兜底。
+`restart` 和 `stop` 分别作用于仍在运行的会话；不要先 stop 再用同一 ID restart。restart 后会产生新的 Session ID，请重新 list 再选择会话。`session list` 显示会话 ID、进程、连接与修改状态及 workspace；`list`、`new` 和 `stop` 支持 `--json`。`new [NAME]` 创建独立会话；名称已存在或未命名的 workspace 会话已存在时会报错。同一 workspace 有多个会话时，启动编辑器会提示选择。stop 在有未保存内容时拒绝停止；`--force` 丢弃这些修改。restart 创建新的空会话，已保存文件保留，原会话的未保存内容、布局和撤销历史不会保留。远程会话也支持 `session restart --ssh HOST --session SESSION_ID`。Linux 上等待服务端进程退出依赖 Linux 5.3 或更新版本的 `pidfd_open` 支持。
 
 ## 退出与会话保留
 
@@ -54,35 +54,18 @@ set-view-options! 'git : obj 'diff-pager : obj 'program "delta" 'args : list "--
 
 ## SSH
 
-以下编辑器启动与 connect 命令是互斥的附着方式；切换前先用 Ctrl-z 。
+以下编辑器启动与 attach 命令是互斥的连接方式；切换前先用 Ctrl-z 。
 
 ```sh
 zess --ssh my-host --remote-workspace /path/to/project
 zess session list --ssh my-host
-zess session connect --ssh my-host --session SESSION_ID
+zess session attach --ssh my-host --session SESSION_ID
 ```
 
 `--ssh` 接受主机名或 SSH 配置别名，使用本机 `ssh` 及其有效配置、known_hosts 和认证方式；主机密钥的确认与拒绝取决于该配置中的 [`StrictHostKeyChecking`](https://man.openbsd.org/ssh_config#StrictHostKeyChecking) 等选项。可用 `--ssh-config`、`--ssh-identity`、`--ssh-user`、`--ssh-port` 和 `--ssh-jump` 覆盖对应连接参数。远端登录和 shell 启动脚本不得向标准输出打印 banner。远端 workspace 默认是 `.`，文件参数和 `--config` 指向远端路径。
 
-引导首先检查远端已安装的兼容版本，然后检查缓存。必要时，`--server-binary FILE` 指定本地的目标平台可执行文件，或 `--server-artifacts FILE` 指定 artifact catalog；同平台没有显式 artifact 时可上传当前程序。不同平台需要兼容的预安装程序或指定对应 artifact。程序必须与远端操作系统、架构和运行时兼容。Zess 不提供默认下载地址。
-
-catalog 是 JSON 数组，例如：
-
-```json
-[
-  {
-    "platform": { "os": "linux", "arch": "x86_64" },
-    "version": "0.1.0",
-    "sha256": "替换为可执行文件的 64 位十六进制 SHA-256",
-    "source": { "kind": "local", "path": "zess-linux-x86_64" }
-  }
-]
-```
-
-将版本和摘要替换为实际值；版本需与本地 `zess --version` 一致。可用 `sha256sum zess-linux-x86_64` 计算 Linux 文件摘要，PowerShell 可用 `Get-FileHash .\zess.exe -Algorithm SHA256`。catalog 每个平台只能有一项；支持 `linux`、`windows` 和 `x86_64`、`aarch64`。本地相对路径相对于 catalog 所在目录；下载来源使用 `{"kind":"download","url":"https://example.com/zess-linux-x86_64"}`，需要远端 `curl`。URL 指向原始可执行文件，摘要也针对该文件；引导不解压归档。Windows 远端引导需要 PowerShell 和 `Get-FileHash`。下载及重定向只允许 HTTPS，安装前校验 SHA-256。
-
-远端缓存位于 Unix 的 `~/.cache/zess/servers/<sha256>` 或 Windows 的 `%LOCALAPPDATA%\Zess\servers\<sha256>`。已安装程序在有选定 artifact 时也要匹配其摘要；无 artifact 时按版本、协议和平台匹配。摘要验证文件是否与 catalog 一致，catalog 和摘要本身应来自可信渠道。
+远端必须预先安装与客户端 Build ID 相同的 Zess，并在远端 PATH 中可执行。Zess 不自动部署或更新远端程序。
 
 本地和远端各自的用户目录、文件路径及外部程序属于各自主机。远端会话的编辑和文件操作发生在远端；剪贴板操作由本地客户端处理。SSH 的连接选项参见 [OpenSSH ssh 手册](https://man.openbsd.org/ssh) 和 [ssh_config 手册](https://man.openbsd.org/ssh_config)。
 
-Windows PowerShell 中路径含空格时请引用，例如 `zess --workspace "C:\Users\Alice\My Project"`。终端界面需要可交互终端。默认 `Ctrl-z` 从终端断开，`:q` 关闭当前 View。
+Windows PowerShell 中路径含空格时请引用，例如 `zess --workspace "C:\Users\Alice\My Project"`。终端界面需要可交互终端。默认 `Ctrl-z` 从终端断开，`:q` 关闭当前 Buffer，最后只剩未修改的无名草稿时退出客户端。

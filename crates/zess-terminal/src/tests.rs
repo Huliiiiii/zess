@@ -73,10 +73,14 @@ fn reconnect_replays_keys_and_discards_mouse_coordinates_in_sequence() {
         .unwrap();
     writer.set_nonblocking(true).unwrap();
     let mut connection = Connection {
-        stream: Box::new(writer),
+        stream: Box::new(LocalConnection::new(
+            writer.try_clone().unwrap(),
+            NativeDaemonControl.watch(&writer).unwrap(),
+        )),
         input: framing::Decoder::default(),
         output: VecDeque::new(),
         written: 0,
+        pending_attach: None,
     };
     let pending = VecDeque::from([
         (1, PendingInput::Key("i".into())),
@@ -119,6 +123,7 @@ fn dropping_a_connection_closes_the_socket_without_waiting_for_the_peer() {
         "close",
         &[],
         None,
+        None,
         80,
         24,
     )
@@ -130,56 +135,27 @@ fn dropping_a_connection_closes_the_socket_without_waiting_for_the_peer() {
 }
 
 #[test]
-fn restarting_the_server_renumbers_only_unacknowledged_input() {
+fn reconnecting_to_a_replacement_server_preserves_pending_input_and_rejects_attachment() {
     let mut ledger = InputLedger::new();
-    ledger.attach(ServerInstanceId("old".into()), 0);
-    ledger.push(PendingInput::Key("i".into()));
-    ledger.push(PendingInput::Key("a".into()));
-    ledger.acknowledge(2);
-    let request_id = ledger.request_id("client").unwrap();
-    ledger.push(PendingInput::TrackedKey {
-        key: "b".into(),
-        request_id,
-    });
-    ledger.push(PendingInput::Mouse);
-    ledger.push(PendingInput::Key("c".into()));
-    assert!(ledger.attach(ServerInstanceId("new".into()), 0));
-    assert_eq!(
-        ledger
-            .pending
-            .iter()
-            .map(|(sequence, _)| *sequence)
-            .collect::<Vec<_>>(),
-        [1, 2, 3]
-    );
-    assert!(
-        matches!(&ledger.pending[0].1, PendingInput::TrackedKey { key, request_id } if key == "b" && request_id.0 == "client-1")
-    );
-    assert_eq!(ledger.request_id("client").unwrap().0, "client-2");
-    assert!(matches!(&ledger.pending[2].1, PendingInput::Key(key) if key == "c"));
-    assert_eq!(ledger.push(PendingInput::Key("d".into())), 4);
-}
-
-#[test]
-fn restarting_the_server_with_no_pending_input_starts_a_fresh_sequence() {
-    let mut ledger = InputLedger::new();
-    ledger.attach(ServerInstanceId("old".into()), 0);
+    ledger.attach(ServerInstanceId("old".into()), 0).unwrap();
     ledger.push(PendingInput::Key("i".into()));
     ledger.push(PendingInput::Key("x".into()));
-    ledger.acknowledge(2);
-    assert!(ledger.attach(ServerInstanceId("new".into()), 0));
-    assert!(ledger.pending.is_empty());
-    assert_eq!(ledger.push(PendingInput::Key("j".into())), 1);
+    ledger.acknowledge(1);
+    assert!(ledger.attach(ServerInstanceId("new".into()), 0).is_err());
+    assert_eq!(ledger.server_instance, Some(ServerInstanceId("old".into())));
+    assert_eq!(ledger.pending.len(), 1);
+    assert_eq!(ledger.pending[0].0, 2);
+    assert!(matches!(&ledger.pending[0].1, PendingInput::Key(key) if key == "x"));
 }
 
 #[test]
 fn reconnecting_to_the_same_server_preserves_the_deduplication_sequence() {
     let mut ledger = InputLedger::new();
-    ledger.attach(ServerInstanceId("same".into()), 0);
+    ledger.attach(ServerInstanceId("same".into()), 0).unwrap();
     ledger.push(PendingInput::Key("i".into()));
     ledger.push(PendingInput::Key("x".into()));
     ledger.acknowledge(1);
-    assert!(!ledger.attach(ServerInstanceId("same".into()), 2));
+    ledger.attach(ServerInstanceId("same".into()), 2).unwrap();
     assert!(ledger.pending.is_empty());
     assert_eq!(ledger.push(PendingInput::Key("y".into())), 3);
 }
@@ -191,6 +167,7 @@ fn a_peer_that_stops_reading_does_not_block_terminal_progress() {
         &mut LocalConnectionFactory(socket.clone()),
         "stalled",
         &[],
+        None,
         None,
         80,
         24,
@@ -375,6 +352,7 @@ fn a_clipboard_response_completed_while_disconnected_is_reused_after_reconnect()
         "clipboard-response",
         &[],
         None,
+        None,
         80,
         24,
     )
@@ -426,11 +404,20 @@ fn a_limit_sized_message_and_the_next_message_can_share_a_socket_read() {
         "frame-limit",
         &[],
         None,
+        None,
         80,
         24,
     )
     .unwrap();
     let mut peer = listener.accept().unwrap();
+    peer.write_all(
+        &framing::encode(&ServerMessage::Hello {
+            build_id: zess_build::BUILD_ID.into(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    connection.poll().unwrap();
     let envelope = framing::encode(&ServerMessage::ClipboardWrite {
         text: String::new(),
     })

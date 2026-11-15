@@ -4,17 +4,15 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, Output},
-    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use zess_platform::{NativeFileSystem, NativePlatform, SystemProcessRunner};
+use zess_platform::SystemProcessRunner;
 use zess_remote::{
-    ArtifactCatalog, Connector, ProxyOperation, ProxyRequest, SshBootstrap, SshConnection,
-    SshConnector, SshTarget,
+    Connector, ProxyOperation, ProxyRequest, SshConnection, SshConnector, SshTarget,
 };
 
 struct RemoteSession {
@@ -59,9 +57,7 @@ impl RemoteSession {
     fn with_ssh(&self, mut command: Command) -> Command {
         command
             .args(["--ssh", &self.host, "--ssh-config"])
-            .arg(&self.ssh_config)
-            .arg("--server-binary")
-            .arg(&self.binary);
+            .arg(&self.ssh_config);
         command
     }
 
@@ -97,14 +93,6 @@ impl RemoteSession {
         target.config_file = Some(self.ssh_config.clone());
         let mut connector = SshConnector {
             target,
-            bootstrap: SshBootstrap {
-                runner: SystemProcessRunner,
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                artifacts: ArtifactCatalog::default(),
-                server_binary: Some(self.binary.clone()),
-                file_system: Arc::new(NativeFileSystem),
-                platform: Arc::new(NativePlatform),
-            },
             runner: SystemProcessRunner,
             request: ProxyRequest::new(operation),
         };
@@ -112,9 +100,21 @@ impl RemoteSession {
     }
 
     fn protocol(&self, session: &str) -> Result<RemoteWire> {
-        let connection = self.connect_operation(ProxyOperation::AttachSession {
+        let mut connection = self.connect_operation(ProxyOperation::AttachSession {
             session_id: session.to_owned(),
         })?;
+        zess_remote::write_request(
+            &mut connection,
+            &zess_protocol::ClientMessage::Hello {
+                build_id: zess_build::BUILD_ID.into(),
+            },
+        )?;
+        let hello: zess_protocol::ServerMessage =
+            zess_remote::read_request(&mut io::BufReader::new(&mut connection))?;
+        let zess_protocol::ServerMessage::Hello { build_id } = hello else {
+            anyhow::bail!("missing server hello")
+        };
+        zess_protocol::check_build_id(&build_id)?;
         connection.set_nonblocking(true)?;
         Ok(RemoteWire {
             connection,
@@ -137,7 +137,7 @@ impl RemoteSession {
     }
 
     fn connect(&mut self, session: &str, file: Option<&Path>) -> Result<()> {
-        let mut command = self.command(&["connect", session]);
+        let mut command = self.command(&["attach", session]);
         if let Some(file) = file {
             command.arg(file);
         }
@@ -323,7 +323,8 @@ impl Drop for RemoteSession {
     }
 }
 
-/// The SSH server must share this machine's temporary filesystem and isolate its runtime.
+/// The SSH server must share this machine's temporary filesystem, isolate its runtime,
+/// and have the same build of zess preinstalled on PATH.
 #[test]
 #[ignore = "requires an isolated localhost SSH fixture through ZESS_TEST_SSH_CONFIG and tmux"]
 fn remote_sessions_keep_edits_and_undo_across_terminal_detachment() -> Result<()> {
@@ -431,7 +432,7 @@ fn remote_sessions_keep_edits_and_undo_across_terminal_detachment() -> Result<()
     assert_ne!(replacement, original);
     assert_ne!(restarted["server_instance"], info["server_instance"]);
     assert_eq!(restarted["workspace"], info["workspace"]);
-    let stale = fixture.run(&["connect", &original])?;
+    let stale = fixture.run(&["attach", &original])?;
     assert!(!stale.status.success());
     assert!(String::from_utf8_lossy(&stale.stderr).contains("was not found"));
     let entries = fixture.entries()?;
@@ -469,7 +470,6 @@ fn replaying_acknowledged_input_after_an_ssh_disconnect_does_not_repeat_the_edit
         "--remote-workspace",
         workspace.to_str().unwrap(),
         "--json",
-        file.to_str().unwrap(),
     ])?;
     let session = info["session_id"]
         .as_str()
@@ -477,14 +477,14 @@ fn replaying_acknowledged_input_after_an_ssh_disconnect_does_not_repeat_the_edit
         .to_owned();
     fixture.sessions.push(session.clone());
     let mut first = fixture.protocol(&session)?;
-    first.send(json!({"type":"attach", "client_id":"ssh-replay", "width":80, "height":24}))?;
+    first.send(json!({"type":"attach", "client_id":"ssh-replay", "expected_session":session, "files":[file.to_str().unwrap()], "width":80, "height":24}))?;
     let attached = first.receive("attached")?;
     let epoch = &attached["context_epoch"];
     first.input(epoch, 1, "i")?;
     first.input(epoch, 2, "X")?;
     drop(first);
     let mut second = fixture.protocol(&session)?;
-    second.send(json!({"type":"attach", "client_id":"ssh-replay", "context_epoch":epoch, "width":80, "height":24}))?;
+    second.send(json!({"type":"attach", "client_id":"ssh-replay", "expected_session":session, "context_epoch":epoch, "width":80, "height":24}))?;
     let resumed = second.receive("attached")?;
     assert_eq!(resumed["server_instance"], attached["server_instance"]);
     assert_eq!(resumed["acknowledged"], 2);

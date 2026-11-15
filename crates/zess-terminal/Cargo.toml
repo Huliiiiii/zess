@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+zess-build.workspace = true
 anyhow.workspace = true
 crossterm = { workspace = true, features = ["osc52"] }
 serde_json.workspace = true

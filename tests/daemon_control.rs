@@ -96,7 +96,7 @@ fn force_stop(server_binary: &Path, manager_binary: &Path) {
         thread::sleep(Duration::from_millis(2));
     }
     let mut manager = Command::new(manager_binary)
-        .args(["server", "stop", "--socket"])
+        .args(["session", "stop", "--socket"])
         .arg(&server.socket)
         .arg("--force")
         .env("XDG_CONFIG_HOME", server.root.path())
@@ -141,5 +141,65 @@ fn the_cli_force_stops_an_unresponsive_daemon() {
     force_stop(
         Path::new(env!("CARGO_BIN_EXE_zess")),
         Path::new(env!("CARGO_BIN_EXE_zess")),
+    );
+}
+
+#[test]
+fn force_restart_replaces_an_unresponsive_session_when_workspace_is_supplied() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_zess"));
+    let mut server = Server::new(binary);
+    server.signal("-STOP");
+    let mut manager = Command::new(binary)
+        .args(["session", "restart", "--socket"])
+        .arg(&server.socket)
+        .arg("--workspace")
+        .arg(server.root.path().join("workspace"))
+        .arg("--force")
+        .env("XDG_CONFIG_HOME", server.root.path())
+        .env("XDG_RUNTIME_DIR", server.root.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pending = server.status().lines().any(|line| {
+            line.strip_prefix("SigPnd:")
+                .or_else(|| line.strip_prefix("ShdPnd:"))
+                .is_some_and(|mask| u64::from_str_radix(mask.trim(), 16).unwrap() & (1 << 14) != 0)
+        });
+        if pending {
+            break;
+        }
+        assert!(
+            manager.try_wait().unwrap().is_none(),
+            "restart exited before termination"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "restart did not signal the session"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    server.signal("-CONT");
+    let output = manager.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.child.wait().unwrap();
+    let stop = Command::new(binary)
+        .args(["session", "stop", "--socket"])
+        .arg(&server.socket)
+        .arg("--force")
+        .env("XDG_CONFIG_HOME", server.root.path())
+        .env("XDG_RUNTIME_DIR", server.root.path())
+        .output()
+        .unwrap();
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
     );
 }
