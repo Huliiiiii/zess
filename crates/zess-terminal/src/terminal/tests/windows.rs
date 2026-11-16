@@ -6,22 +6,36 @@ use std::process::Command;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::System::Console::{
     AllocConsole, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
-    ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, GetConsoleMode, GetStdHandle,
+    ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE,
     STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
 };
-use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows_sys::Win32::System::Threading::DETACHED_PROCESS;
 
 use super::*;
 
 fn with_console(test_name: &str, test: impl FnOnce()) {
     if std::env::var("ZESS_TERMINAL_CONSOLE_TEST").as_deref() == Ok(test_name) {
-        assert_ne!(unsafe { AllocConsole() }, 0);
+        assert!(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("CONIN$")
+                .is_err(),
+            "helper already has a console"
+        );
+        let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        if unsafe { AllocConsole() } == 0 {
+            panic!("allocate helper console: {}", io::Error::last_os_error());
+        }
+        assert_eq!(unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }, stdout);
+        assert_eq!(unsafe { GetStdHandle(STD_ERROR_HANDLE) }, stderr);
         test();
     } else {
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test_name, "--nocapture"])
             .env("ZESS_TERMINAL_CONSOLE_TEST", test_name)
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(DETACHED_PROCESS)
             .output()
             .unwrap();
         assert!(
