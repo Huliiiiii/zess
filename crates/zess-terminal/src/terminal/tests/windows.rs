@@ -3,7 +3,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows_sys::Win32::System::Console::{
     AllocConsole, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
     ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE,
@@ -135,13 +135,25 @@ fn failed_screen_activation_restores_the_original_console_modes() {
             drop(CrosstermTerminal::enter().unwrap());
             let original = modes();
             let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+            let read_only = OpenOptions::new()
+                .read(true)
+                .open(std::env::current_exe().unwrap())
+                .unwrap();
             assert_ne!(
-                unsafe { SetStdHandle(STD_OUTPUT_HANDLE, INVALID_HANDLE_VALUE) },
+                unsafe { SetStdHandle(STD_OUTPUT_HANDLE, read_only.as_raw_handle()) },
                 0
             );
             let result = CrosstermTerminal::enter();
             assert_ne!(unsafe { SetStdHandle(STD_OUTPUT_HANDLE, output) }, 0);
-            assert!(result.is_err());
+            let error = result
+                .err()
+                .expect("read-only stdout must reject screen output");
+            assert_eq!(
+                error
+                    .downcast_ref::<io::Error>()
+                    .and_then(io::Error::raw_os_error),
+                Some(ERROR_ACCESS_DENIED as i32)
+            );
             assert_eq!(modes(), original);
         },
     );
