@@ -162,13 +162,15 @@ pub fn run_connection_with_platform(
     platform: &dyn Platform,
 ) -> Result<()> {
     let mut terminal = CrosstermTerminal::enter()?;
-    run_connection_with_devices_and_platform(
+    let result = run_connection_with_devices_and_platform(
         factory,
         files,
         &mut terminal,
         &mut TerminalClipboard::default(),
         platform,
-    )
+    );
+    let restored = terminal.restore();
+    result.and(restored)
 }
 
 /// Runs with caller-owned terminal and clipboard devices.
