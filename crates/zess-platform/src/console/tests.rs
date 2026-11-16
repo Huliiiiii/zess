@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use windows_sys::Win32::System::Console::{
     AllocConsole, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
 };
-use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows_sys::Win32::System::Threading::DETACHED_PROCESS;
 
 use super::*;
 use crate::{CancellationToken, ConsoleMode, ProcessRunner, ProcessSpec, SystemProcessRunner};
@@ -55,7 +55,7 @@ fn inherited_children_cannot_leave_changed_console_modes_after_exit_or_drop() {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture"])
                 .env(ROLE, "console")
-                .creation_flags(CREATE_NO_WINDOW)
+                .creation_flags(DETACHED_PROCESS)
                 .output()
                 .unwrap();
             assert!(
@@ -67,7 +67,17 @@ fn inherited_children_cannot_leave_changed_console_modes_after_exit_or_drop() {
         }
     }
     // The isolated helper owns this real console; no CI runner console is changed.
-    assert_ne!(unsafe { AllocConsole() }, 0);
+    assert!(
+        SavedMode::open("CONIN$").is_err(),
+        "helper already has a console"
+    );
+    let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    if unsafe { AllocConsole() } == 0 {
+        panic!("allocate helper console: {}", io::Error::last_os_error());
+    }
+    assert_eq!(unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }, stdout);
+    assert_eq!(unsafe { GetStdHandle(STD_ERROR_HANDLE) }, stderr);
     let original = modes();
     let mut spec = ProcessSpec::new(std::env::current_exe().unwrap());
     spec.args(["--exact", NAME, "--nocapture"]);
