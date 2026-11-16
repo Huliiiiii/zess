@@ -1,10 +1,8 @@
-use std::{ffi::OsStr, path::PathBuf, process::Output, sync::Mutex, time::SystemTime};
+use std::{path::PathBuf, sync::Mutex, time::SystemTime};
 
 use serde_json::json;
 use tempfile::TempDir;
-use zess_platform::{
-    CancellationToken, HostInfo, NativeFileSystem, NativePlatform, OwnedProcess, UserDirs,
-};
+use zess_platform::{CancellationToken, HostInfo, NativeFileSystem, NativePlatform, UserDirs};
 
 use super::*;
 
@@ -38,52 +36,37 @@ impl Platform for TestPlatform {
     }
 }
 
-struct Gh {
+struct ReleaseFixture {
     manifest: Vec<u8>,
     binary: Vec<u8>,
-    calls: Mutex<Vec<Vec<String>>>,
+    calls: Mutex<Vec<String>>,
 }
 
-impl ProcessRunner for Gh {
-    fn output(
+struct FixtureMiddleware(Arc<ReleaseFixture>);
+
+impl ureq::middleware::Middleware for FixtureMiddleware {
+    fn handle(
         &self,
-        spec: &ProcessSpec,
-        _: Option<&[u8]>,
-        cancellation: &dyn Cancellation,
-    ) -> Result<Output> {
-        cancellation.check()?;
-        assert_eq!(spec.program, OsStr::new("gh"));
-        let args: Vec<_> = spec
-            .args
-            .iter()
-            .map(|arg| arg.to_str().unwrap().to_owned())
-            .collect();
-        let name = args[args.iter().position(|arg| arg == "--pattern").unwrap() + 1].as_str();
-        let stdout = if name == "manifest.json" {
-            self.manifest.clone()
+        request: ureq::http::Request<ureq::SendBody>,
+        _: ureq::middleware::MiddlewareNext,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let url = request.uri().to_string();
+        let body = if url.ends_with("/manifest.json") {
+            self.0.manifest.clone()
         } else {
-            self.binary.clone()
+            self.0.binary.clone()
         };
-        self.calls.lock().unwrap().push(args);
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt;
-        #[cfg(windows)]
-        use std::os::windows::process::ExitStatusExt;
-        Ok(Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout,
-            stderr: Vec::new(),
-        })
-    }
-
-    fn spawn(&self, _: &ProcessSpec) -> Result<OwnedProcess> {
-        unreachable!()
+        self.0.calls.lock().unwrap().push(url);
+        Ok(ureq::http::Response::new(ureq::Body::builder().data(body)))
     }
 }
 
-fn fixture(build_id: &str, expected_hash: &str) -> (TempDir, Arc<Gh>, GithubReleaseArtifacts) {
+fn fixture(
+    build_id: &str,
+    expected_hash: &str,
+) -> (TempDir, Arc<ReleaseFixture>, GithubReleaseArtifacts) {
     let directory = tempfile::tempdir().unwrap();
-    let gh = Arc::new(Gh {
+    let release = Arc::new(ReleaseFixture {
         manifest: serde_json::to_vec(&json!({
             "build_id": build_id,
             "artifacts": [
@@ -94,64 +77,72 @@ fn fixture(build_id: &str, expected_hash: &str) -> (TempDir, Arc<Gh>, GithubRele
         binary: b"server executable".to_vec(),
         calls: Mutex::new(Vec::new()),
     });
-    let provider = GithubReleaseArtifacts::new(
+    let mut provider = GithubReleaseArtifacts::new(
         "owner/repo",
         Arc::new(NativeFileSystem),
         Arc::new(TestPlatform(directory.path().to_owned())),
-        gh.clone(),
     );
-    (directory, gh, provider)
+    provider.agent = ureq::Agent::config_builder()
+        .middleware(FixtureMiddleware(release.clone()))
+        .build()
+        .into();
+    (directory, release, provider)
 }
 
 #[test]
 fn matching_release_is_cached_for_the_selected_target() {
     let expected = SERVER_SHA256;
-    let (_directory, gh, provider) = fixture(zess_build::BUILD_ID, expected);
+    let (_directory, release, provider) = fixture(zess_build::BUILD_ID, expected);
     let cancellation = CancellationToken::new();
     let artifact = provider
         .get(ServerTarget::WindowsX86_64, &cancellation)
         .unwrap();
     assert_eq!(artifact.sha256, expected);
     assert_eq!(std::fs::read(&artifact.path).unwrap(), b"server executable");
-    let calls = gh.calls.lock().unwrap();
+    let calls = release.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
-    assert!(calls[0].contains(&format!("build-{}", zess_build::BUILD_ID)));
-    assert!(calls[1].contains(&"zess-server-x86_64-pc-windows-msvc.exe".to_owned()));
+    assert_eq!(
+        calls[0],
+        format!(
+            "https://github.com/owner/repo/releases/download/build-{}/manifest.json",
+            zess_build::BUILD_ID
+        )
+    );
+    assert!(calls[1].ends_with("/zess-server-x86_64-pc-windows-msvc.exe"));
     drop(calls);
     provider
         .get(ServerTarget::WindowsX86_64, &cancellation)
         .unwrap();
-    assert_eq!(gh.calls.lock().unwrap().len(), 2);
+    assert_eq!(release.calls.lock().unwrap().len(), 2);
 }
 
 #[test]
 fn linux_release_archive_is_selected_and_verified() {
-    let (_directory, gh, provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    let (_directory, release, provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
     let artifact = provider
         .get(ServerTarget::LinuxX86_64, &CancellationToken::new())
         .unwrap();
     assert_eq!(artifact.sha256, SERVER_SHA256);
     assert_eq!(std::fs::read(artifact.path).unwrap(), b"server executable");
     assert!(
-        gh.calls.lock().unwrap()[1]
-            .contains(&"zess-server-x86_64-unknown-linux-gnu.tar.gz".to_owned())
+        release.calls.lock().unwrap()[1].ends_with("/zess-server-x86_64-unknown-linux-gnu.tar.gz")
     );
 }
 
 #[test]
 fn release_with_another_build_id_is_rejected_before_download() {
-    let (_directory, gh, provider) = fixture("another-build", SERVER_SHA256);
+    let (_directory, release, provider) = fixture("another-build", SERVER_SHA256);
     assert!(
         provider
             .get(ServerTarget::WindowsX86_64, &CancellationToken::new())
             .is_err()
     );
-    assert_eq!(gh.calls.lock().unwrap().len(), 1);
+    assert_eq!(release.calls.lock().unwrap().len(), 1);
 }
 
 #[test]
 fn corrupted_cached_binary_is_downloaded_again() {
-    let (_directory, gh, provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    let (_directory, release, provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
     let cancellation = CancellationToken::new();
     let artifact = provider
         .get(ServerTarget::WindowsX86_64, &cancellation)
@@ -161,7 +152,57 @@ fn corrupted_cached_binary_is_downloaded_again() {
         .get(ServerTarget::WindowsX86_64, &cancellation)
         .unwrap();
     assert_eq!(std::fs::read(artifact.path).unwrap(), b"server executable");
-    assert_eq!(gh.calls.lock().unwrap().len(), 4);
+    assert_eq!(release.calls.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn cancellation_during_download_stops_before_publishing() {
+    struct CancelReader {
+        cancellation: CancellationToken,
+        manifest: std::io::Cursor<Vec<u8>>,
+    }
+    impl std::io::Read for CancelReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.manifest.read(buffer)?;
+            self.cancellation.cancel();
+            Ok(count)
+        }
+    }
+
+    struct CancelMiddleware {
+        cancellation: CancellationToken,
+        manifest: Vec<u8>,
+    }
+    impl ureq::middleware::Middleware for CancelMiddleware {
+        fn handle(
+            &self,
+            _: ureq::http::Request<ureq::SendBody>,
+            _: ureq::middleware::MiddlewareNext,
+        ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+            Ok(ureq::http::Response::new(ureq::Body::builder().reader(
+                CancelReader {
+                    cancellation: self.cancellation.clone(),
+                    manifest: std::io::Cursor::new(self.manifest.clone()),
+                },
+            )))
+        }
+    }
+
+    let (directory, release, mut provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    let cancellation = CancellationToken::new();
+    provider.agent = ureq::Agent::config_builder()
+        .middleware(CancelMiddleware {
+            cancellation: cancellation.clone(),
+            manifest: release.manifest.clone(),
+        })
+        .build()
+        .into();
+    let error = match provider.get(ServerTarget::WindowsX86_64, &cancellation) {
+        Ok(_) => panic!("cancelled download succeeded"),
+        Err(error) => error,
+    };
+    assert_eq!(error.to_string(), "operation was cancelled");
+    assert!(!directory.path().join("zess/servers").exists());
 }
 
 #[test]

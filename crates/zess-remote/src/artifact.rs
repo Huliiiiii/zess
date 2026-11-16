@@ -1,15 +1,17 @@
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zess_platform::{Cancellation, FileSystem, Platform, ProcessRunner, ProcessSpec};
+use zess_platform::{Cancellation, FileSystem, Platform};
 
 #[cfg(test)]
 mod tests;
@@ -53,7 +55,7 @@ pub struct GithubReleaseArtifacts {
     repository: String,
     file_system: Arc<dyn FileSystem>,
     platform: Arc<dyn Platform>,
-    runner: Arc<dyn ProcessRunner>,
+    agent: ureq::Agent,
 }
 
 #[derive(Deserialize)]
@@ -74,38 +76,48 @@ impl GithubReleaseArtifacts {
         repository: impl Into<String>,
         file_system: Arc<dyn FileSystem>,
         platform: Arc<dyn Platform>,
-        runner: Arc<dyn ProcessRunner>,
     ) -> Self {
         Self {
             repository: repository.into(),
             file_system,
             platform,
-            runner,
+            agent: ureq::Agent::config_builder()
+                .timeout_resolve(Some(Duration::from_secs(30)))
+                .timeout_connect(Some(Duration::from_secs(30)))
+                .timeout_send_request(Some(Duration::from_secs(30)))
+                .timeout_recv_response(Some(Duration::from_secs(30)))
+                .timeout_per_read(Some(Duration::from_secs(30)))
+                .https_only(true)
+                .build()
+                .into(),
         }
     }
 
     fn download(&self, name: &str, cancellation: &dyn Cancellation) -> Result<Vec<u8>> {
-        let mut spec = ProcessSpec::new("gh");
-        spec.args([
-            "release",
-            "download",
-            &format!("build-{}", zess_build::BUILD_ID),
-            "--repo",
-            &self.repository,
-            "--pattern",
-            name,
-            "--output",
-            "-",
-        ]);
-        let output = self
-            .runner
-            .output(&spec, None, cancellation)
-            .context("could not run GitHub CLI; install gh and run `gh auth login`")?;
-        ensure!(
-            output.status.success(),
-            "could not download release asset {name}; check repository access and run `gh auth login` if needed"
+        cancellation.check()?;
+        let url = format!(
+            "https://github.com/{}/releases/download/build-{}/{name}",
+            self.repository,
+            zess_build::BUILD_ID
         );
-        Ok(output.stdout)
+        let response = self.agent.get(&url).call();
+        cancellation.check()?;
+        let response =
+            response.with_context(|| format!("could not download release asset {name}"))?;
+        let mut reader = response.into_body().into_reader();
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            cancellation.check()?;
+            let count = reader.read(&mut buffer);
+            cancellation.check()?;
+            let count = count.with_context(|| format!("could not read release asset {name}"))?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        Ok(bytes)
     }
 
     fn publish(&self, path: &Path, bytes: &[u8]) -> Result<()> {
