@@ -136,6 +136,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
     let mut ssh_config = None;
     let mut ssh_jump = None;
     let mut remote_workspace = None;
+    let mut ssh_address = None;
     let mut arguments = initial.into_iter().peekable();
     if arguments
         .peek()
@@ -169,7 +170,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         match argument.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "Zess — terminal editor with Wisp plugins\n\nUsage: zess [OPTIONS] [FILES...]\n       zess session new [NAME] [OPTIONS]\n       zess session list [OPTIONS]\n       zess session attach [NAME|ID] [OPTIONS]\n       zess session stop [NAME|ID] [OPTIONS]\n       zess session restart [NAME|ID] [OPTIONS]\n\nOptions: --workspace DIR, --config FILE, --ssh HOST, --json\nCtrl-z detaches; :q exits when only a clean scratch remains.\nRestart creates a fresh session and resets open buffers, layout and undo history.\nRemote Zess must already be installed on the SSH host."
+                    "Zess — terminal editor with Wisp plugins\n\nUsage: zess [OPTIONS] [FILES...]\n       zess ssh://[USER@]HOST[:PORT]/WORKSPACE\n       zess session new [NAME] [OPTIONS]\n       zess session list [OPTIONS]\n       zess session attach [NAME|ID] [OPTIONS]\n       zess session stop [NAME|ID] [OPTIONS]\n       zess session restart [NAME|ID] [OPTIONS]\n\nOptions: --workspace DIR, --config FILE, --ssh HOST, --json\nCtrl-z detaches; :q exits when only a clean scratch remains.\nRestart creates a fresh session and resets open buffers, layout and undo history.\nRemote Zess must already be installed on the SSH host."
                 );
                 return Ok(());
             }
@@ -252,9 +253,39 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 files.extend(arguments.map(PathBuf::from));
                 break;
             }
+            _ if argument.starts_with("ssh://") => {
+                if ssh_address.replace(argument).is_some() {
+                    bail!("only one SSH address may be specified");
+                }
+            }
             _ if argument.starts_with('-') => bail!("unknown option {argument}"),
             _ => files.push(PathBuf::from(argument)),
         }
+    }
+    if let Some(address) = ssh_address.as_deref() {
+        let address = remote::SshAddress::parse(address)?;
+        if ssh_host.as_deref().is_some_and(|host| host != address.host)
+            || ssh_user
+                .as_deref()
+                .zip(address.user)
+                .is_some_and(|(explicit, parsed)| explicit != parsed)
+            || ssh_port
+                .zip(address.port)
+                .is_some_and(|(explicit, parsed)| explicit != parsed)
+        {
+            bail!("SSH address conflicts with explicit SSH options");
+        }
+        if remote_workspace
+            .as_deref()
+            .is_some_and(|path| path != address.workspace)
+            || (workspace_given && workspace.to_str() != Some(address.workspace))
+        {
+            bail!("SSH address conflicts with the specified workspace");
+        }
+        ssh_host = Some(address.host.to_owned());
+        ssh_user = ssh_user.or_else(|| address.user.map(str::to_owned));
+        ssh_port = ssh_port.or(address.port);
+        remote_workspace = Some(address.workspace.to_owned());
     }
     if connect_by_id && session_id.is_none() && !files.is_empty() {
         session_id = Some(remote::path_string(&files.remove(0))?);
