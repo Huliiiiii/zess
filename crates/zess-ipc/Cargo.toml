@@ -10,7 +10,6 @@ serde_json.workspace = true
 xxhash-rust.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-fnv.workspace = true
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]

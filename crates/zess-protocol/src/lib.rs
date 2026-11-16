@@ -435,6 +435,7 @@ pub enum ServerMessage {
         build_id: String,
     },
     Status {
+        build_id: String,
         session_id: SessionId,
         name: Option<String>,
         server_instance: ServerInstanceId,

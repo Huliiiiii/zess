@@ -14,6 +14,8 @@ fn main() {
         "plugins",
         "vendor",
         ".cargo",
+        ".github",
+        "scripts",
     ] {
         let path = root.join(path);
         println!("cargo:rerun-if-changed={}", path.display());

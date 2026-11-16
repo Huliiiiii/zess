@@ -1,9 +1,13 @@
+mod artifact;
+mod bootstrap;
 mod connection;
 mod ssh;
 
 #[cfg(test)]
 mod tests;
 
+pub use artifact::{GithubReleaseArtifacts, ServerArtifact, ServerArtifacts, ServerTarget};
+pub use bootstrap::{ServerBootstrap, SshBootstrap};
 pub use connection::SshConnection;
 pub use ssh::{Connector, SshConnector, SshTarget};
 
