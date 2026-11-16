@@ -24,6 +24,20 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def debian_owners(output, candidate):
+    owners = []
+    for line in output.splitlines():
+        match = re.fullmatch(
+            r"([a-z0-9][a-z0-9+.-]*(?::[a-z0-9-]+)?"
+            r"(?:, [a-z0-9][a-z0-9+.-]*(?::[a-z0-9-]+)?)*)"
+            r": (/.+)",
+            line,
+        )
+        if match and match.group(2) == str(candidate):
+            owners.extend(name.split(":")[0] for name in match.group(1).split(", "))
+    return owners
+
+
 def linux_bundle(binary, destination, patchelf, licenses):
     program_headers = subprocess.check_output(["readelf", "-l", str(binary)], text=True)
     match = re.search(r"Requesting program interpreter:\s*(\S+)\]", program_headers)
@@ -62,16 +76,18 @@ def linux_bundle(binary, destination, patchelf, licenses):
                         ["dpkg-query", "-S", str(candidate)],
                         capture_output=True,
                         text=True,
+                        env={**os.environ, "LC_ALL": "C", "LANGUAGE": "C"},
                     )
-                    if result.returncode == 0:
+                    owners = debian_owners(result.stdout, candidate)
+                    if result.returncode == 0 and owners:
                         break
                 else:
                     raise ValueError(f"cannot find package owning {path}")
-                package = result.stdout.split(": /", 1)[0].split(", ")[0].split(":")[0]
-                copyright = Path("/usr/share/doc") / package / "copyright"
-                if not copyright.is_file():
-                    raise ValueError(f"missing copyright information for {package}")
-                shutil.copyfile(copyright, root / "licenses" / f"{package}-copyright")
+                for package in owners:
+                    copyright = Path("/usr/share/doc") / package / "copyright"
+                    if not copyright.is_file():
+                        raise ValueError(f"missing copyright information for {package}")
+                    shutil.copyfile(copyright, root / "licenses" / f"{package}-copyright")
         with tarfile.open(destination, "w:gz") as archive:
             for path in sorted(root.iterdir()):
                 archive.add(path, arcname=path.name)
