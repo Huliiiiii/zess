@@ -1,0 +1,89 @@
+name: Server release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            binary: target/x86_64-unknown-linux-gnu/release/zess
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            binary: target/x86_64-pc-windows-msvc/release/zess.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install nightly-2026-11-14 --profile minimal --target "${{ matrix.target }}"
+          rustup default nightly-2026-11-14
+      - name: Build Linux server
+        if: runner.os == 'Linux'
+        run: cargo build --locked --release --bin zess --target "${{ matrix.target }}"
+      - name: Build Windows server
+        if: runner.os == 'Windows'
+        run: cargo build --locked --release --bin zess --target "${{ matrix.target }}"
+      - name: Package Linux server
+        if: runner.os == 'Linux'
+        env:
+          ZESS_DEBIAN_LICENSES: '1'
+        run: |
+          set -euo pipefail
+          mkdir -p patchelf licenses
+          curl -fsSL https://github.com/NixOS/patchelf/releases/download/0.19.3/patchelf-0.19.3-x86_64.tar.gz | tar -xz -C patchelf
+          curl -fsSL https://raw.githubusercontent.com/NixOS/patchelf/0.19.3/COPYING -o licenses/patchelf-GPL-3.0
+          curl -fsSL https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT -o licenses/musl-COPYRIGHT
+          cp /usr/share/doc/libc6/copyright licenses/glibc-copyright
+          cp /usr/share/doc/libgcc-s1/copyright licenses/gcc-copyright
+          python scripts/server-release.py package '${{ matrix.target }}' '${{ matrix.binary }}' dist patchelf/bin/patchelf licenses
+          mkdir smoke
+          tar -xzf dist/zess-server-x86_64-unknown-linux-gnu.tar.gz -C smoke
+          smoke/patchelf --set-interpreter "$PWD/smoke/lib/ld-linux-x86-64.so.2" --set-rpath "\$ORIGIN/lib" smoke/zess
+          smoke/zess --version
+      - name: Package Windows server
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/server-release.py package '${{ matrix.target }}' '${{ matrix.binary }}' dist
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: artifacts
+      - name: Verify artifacts and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          build_id=$(python scripts/server-release.py manifest artifacts release)
+          tag="build-$build_id"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            mkdir existing
+            gh release download "$tag" --dir existing
+            python scripts/server-release.py verify existing "$build_id"
+            echo "Release $tag already contains verified artifacts."
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes '' release/*
+          fi
