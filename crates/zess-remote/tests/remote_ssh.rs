@@ -4,6 +4,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
     os::unix::fs::PermissionsExt,
+    path::PathBuf,
     thread,
     time::{Duration, Instant},
 };
@@ -161,6 +162,7 @@ fn ssh_uses_preinstalled_server_and_preserves_workspace_data() -> Result<()> {
     });
     let encoded = serde_json::to_string(&request)?;
     let mut connector = SshConnector {
+        bootstrap: std::sync::Arc::new(Preinstalled),
         target: fixture.target.clone(),
         runner: SystemProcessRunner,
         request,
@@ -184,6 +186,7 @@ fn ssh_rejects_a_host_key_absent_from_known_hosts() -> Result<()> {
     let fixture = SshFixture::new()?;
     std::fs::write(fixture.directory.path().join("known_hosts"), "")?;
     let mut connector = SshConnector {
+        bootstrap: std::sync::Arc::new(Preinstalled),
         target: fixture.target.clone(),
         runner: SystemProcessRunner,
         request: ProxyRequest::new(ProxyOperation::Status),
@@ -238,6 +241,7 @@ fn cancelling_a_connection_interrupts_the_remote_ready_wait() -> Result<()> {
     let mut target = fixture.target.clone();
     target.cancellation = Some(token.clone());
     let mut connector = SshConnector {
+        bootstrap: std::sync::Arc::new(Preinstalled),
         target,
         runner: SystemProcessRunner,
         request: ProxyRequest::new(ProxyOperation::Status),
@@ -276,6 +280,7 @@ fn cancelling_after_ready_interrupts_a_blocking_response_read() -> Result<()> {
     let mut target = fixture.target.clone();
     target.cancellation = Some(token.clone());
     let mut connector = SshConnector {
+        bootstrap: std::sync::Arc::new(Preinstalled),
         target,
         runner: SystemProcessRunner,
         request: ProxyRequest::new(ProxyOperation::Status),
@@ -318,6 +323,7 @@ fn cancelling_interrupts_wait_for_ssh_exit() -> Result<()> {
     let mut target = fixture.target.clone();
     target.cancellation = Some(token.clone());
     let mut connector = SshConnector {
+        bootstrap: std::sync::Arc::new(Preinstalled),
         target,
         runner: SystemProcessRunner,
         request: ProxyRequest::new(ProxyOperation::Status),
@@ -333,5 +339,252 @@ fn cancelling_interrupts_wait_for_ssh_exit() -> Result<()> {
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
     });
+    Ok(())
+}
+
+struct Preinstalled;
+
+impl zess_remote::ServerBootstrap for Preinstalled {
+    fn prepare(
+        &self,
+        _: &SshTarget,
+        _: &dyn zess_platform::ProcessRunner,
+    ) -> anyhow::Result<String> {
+        Ok("zess remote-proxy".into())
+    }
+}
+
+struct FixtureArtifacts {
+    path: std::path::PathBuf,
+    hash: String,
+    requests: std::sync::atomic::AtomicUsize,
+}
+
+impl zess_remote::ServerArtifacts for FixtureArtifacts {
+    fn get(
+        &self,
+        target: zess_remote::ServerTarget,
+        cancellation: &dyn Cancellation,
+    ) -> Result<zess_remote::ServerArtifact> {
+        cancellation.check()?;
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(zess_remote::ServerArtifact {
+            target,
+            path: self.path.clone(),
+            sha256: self.hash.clone(),
+        })
+    }
+}
+
+fn standard_tools(directory: &std::path::Path) -> Result<PathBuf> {
+    let tools = directory.join("standard-tools");
+    std::fs::create_dir(&tools)?;
+    for name in [
+        "sh",
+        "uname",
+        "sha256sum",
+        "cat",
+        "mktemp",
+        "mkdir",
+        "tar",
+        "gzip",
+        "rm",
+        "chmod",
+        "ln",
+        "mv",
+    ] {
+        let command = format!("command -v {name}");
+        let path = String::from_utf8(run("sh", &["-c", &command])?)?;
+        std::os::unix::fs::symlink(path.trim(), tools.join(name))?;
+    }
+    Ok(tools)
+}
+
+#[test]
+fn ssh_deploys_and_reuses_a_verified_server() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use zess_remote::ServerBootstrap;
+    let fixture = SshFixture::new()?;
+    let wrapper = fixture.directory.path().join("wrapper.sh");
+    let tools = standard_tools(fixture.directory.path())?;
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexport HOME='{}'\nexport PATH='{}'\nexec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\"\n",
+            fixture.directory.path().display(),
+            tools.display()
+        ),
+    )?;
+    let package = fixture.directory.path().join("package");
+    std::fs::create_dir_all(package.join("lib"))?;
+    std::fs::copy(fixture.directory.path().join("zess"), package.join("zess"))?;
+    std::fs::write(package.join("patchelf"), "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(
+        package.join("patchelf"),
+        std::fs::Permissions::from_mode(0o700),
+    )?;
+    std::fs::write(package.join("lib/ld-linux-x86-64.so.2"), "loader")?;
+    let path = fixture.directory.path().join("server.tar.gz");
+    run(
+        "tar",
+        &[
+            "-czf",
+            path.to_str().unwrap(),
+            "-C",
+            package.to_str().unwrap(),
+            ".",
+        ],
+    )?;
+    let bytes = std::fs::read(&path)?;
+    let hash = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let artifacts = std::sync::Arc::new(FixtureArtifacts {
+        path,
+        hash,
+        requests: 0.into(),
+    });
+    let bootstrap = zess_remote::SshBootstrap {
+        artifacts: artifacts.clone(),
+        filesystem: std::sync::Arc::new(zess_platform::NativeFileSystem),
+    };
+    let command = bootstrap.prepare(&fixture.target, &SystemProcessRunner)?;
+    assert!(command.contains(zess_build::BUILD_ID));
+    assert_eq!(
+        bootstrap.prepare(&fixture.target, &SystemProcessRunner)?,
+        command
+    );
+    assert_eq!(
+        artifacts.requests.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let installed = fixture
+        .directory
+        .path()
+        .join(".cache/zess/servers")
+        .join(zess_build::BUILD_ID)
+        .join("current");
+    std::fs::write(installed.join("lib/ld-linux-x86-64.so.2"), "corrupt")?;
+    assert_eq!(
+        bootstrap.prepare(&fixture.target, &SystemProcessRunner)?,
+        command
+    );
+    assert_eq!(
+        artifacts.requests.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    let mut connector = SshConnector {
+        target: fixture.target.clone(),
+        bootstrap: std::sync::Arc::new(bootstrap),
+        runner: SystemProcessRunner,
+        request: ProxyRequest::new(ProxyOperation::Status),
+    };
+    let connection = connector.connect()?;
+    let mut reader = BufReader::new(connection);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    assert!(line.contains("status"));
+    Ok(())
+}
+
+#[test]
+fn ssh_rejects_an_artifact_with_the_wrong_hash() -> Result<()> {
+    use zess_remote::ServerBootstrap;
+    let fixture = SshFixture::new()?;
+    let artifacts = std::sync::Arc::new(FixtureArtifacts {
+        path: fixture.directory.path().join("zess"),
+        hash: "0".repeat(64),
+        requests: 0.into(),
+    });
+    let bootstrap = zess_remote::SshBootstrap {
+        artifacts,
+        filesystem: std::sync::Arc::new(zess_platform::NativeFileSystem),
+    };
+    assert!(
+        format!(
+            "{:#}",
+            bootstrap
+                .prepare(&fixture.target, &SystemProcessRunner)
+                .unwrap_err()
+        )
+        .contains("SHA-256 mismatch")
+    );
+    assert!(
+        !fixture
+            .directory
+            .path()
+            .join(".cache/zess/servers")
+            .exists()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires ZESS_TEST_SERVER_ARCHIVE containing a GNU Zess runtime package"]
+fn installed_server_starts_a_session_with_its_own_executable() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use zess_remote::ServerBootstrap;
+
+    let fixture = SshFixture::new()?;
+    let runtime = fixture.directory.path().join("runtime");
+    std::fs::create_dir(&runtime)?;
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+    let tools = standard_tools(fixture.directory.path())?;
+    std::fs::write(
+        fixture.directory.path().join("wrapper.sh"),
+        format!(
+            "#!/bin/sh\nexport HOME='{}' XDG_RUNTIME_DIR='{}' XDG_CONFIG_HOME='{}' PATH='{}'\nexec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\"\n",
+            fixture.directory.path().display(),
+            runtime.display(),
+            fixture.directory.path().join("config").display(),
+            tools.display()
+        ),
+    )?;
+    let path = PathBuf::from(
+        std::env::var_os("ZESS_TEST_SERVER_ARCHIVE")
+            .context("ZESS_TEST_SERVER_ARCHIVE is required")?,
+    );
+    let bytes = std::fs::read(&path)?;
+    let hash = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let bootstrap = zess_remote::SshBootstrap {
+        artifacts: std::sync::Arc::new(FixtureArtifacts {
+            path,
+            hash,
+            requests: 0.into(),
+        }),
+        filesystem: std::sync::Arc::new(zess_platform::NativeFileSystem),
+    };
+    bootstrap.prepare(&fixture.target, &SystemProcessRunner)?;
+    let executable = fixture
+        .directory
+        .path()
+        .join(".cache/zess/servers")
+        .join(zess_build::BUILD_ID)
+        .join("current/zess");
+    let workspace = fixture.directory.path().join("workspace");
+    std::fs::create_dir(&workspace)?;
+    let invoke = |args: &str| -> Result<Vec<u8>> {
+        let command = format!("'{}' {args}", executable.display());
+        let output =
+            SystemProcessRunner.output(&fixture.target.command(&command)?, None, &NeverCancel)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(output.stdout)
+    };
+    let result = invoke(&format!(
+        "session new --workspace '{}' --json",
+        workspace.display()
+    ))?;
+    let session: serde_json::Value = serde_json::from_slice(&result)?;
+    let id = session["id"].as_str().context("missing session ID")?;
+    invoke(&format!("session stop '{id}' --force"))?;
     Ok(())
 }

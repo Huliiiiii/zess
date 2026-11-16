@@ -2,6 +2,7 @@ use std::{
     ffi::OsString,
     io::{self, Read, Write},
     path::PathBuf,
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -11,7 +12,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use zess_platform::{Cancellation, CancellationToken, ConsoleMode, ProcessRunner, ProcessSpec};
 use zess_protocol::{ClientMessage, ServerMessage, check_build_id};
 
-use crate::{ProxyHandshake, SshConnection};
+use crate::{ProxyHandshake, ServerBootstrap, SshConnection};
 
 #[derive(Clone, Debug)]
 pub struct SshTarget {
@@ -82,6 +83,7 @@ pub trait Connector {
 
 pub struct SshConnector<R, Q> {
     pub target: SshTarget,
+    pub bootstrap: Arc<dyn ServerBootstrap>,
     pub runner: R,
     pub request: Q,
 }
@@ -91,7 +93,8 @@ impl<R: ProcessRunner, Q: Serialize> Connector for SshConnector<R, Q> {
 
     fn connect(&mut self) -> anyhow::Result<Self::Connection> {
         self.target.check_cancellation()?;
-        let spec = self.target.command("zess remote-proxy")?;
+        let command = self.bootstrap.prepare(&self.target, &self.runner)?;
+        let spec = self.target.command(&command)?;
         let mut connection = SshConnection::with_cancellation(
             self.runner.spawn(&spec)?,
             self.target.cancellation.clone(),
@@ -191,13 +194,13 @@ fn read_initial<T: DeserializeOwned>(
     serde_json::from_slice(&bytes).context("decode remote proxy handshake")
 }
 
-struct Deadline<'a> {
+pub(crate) struct Deadline<'a> {
     expires: Instant,
     cancellation: Option<&'a CancellationToken>,
 }
 
 impl<'a> Deadline<'a> {
-    fn new(target: &'a SshTarget) -> Self {
+    pub(crate) fn new(target: &'a SshTarget) -> Self {
         Self {
             expires: Instant::now() + Duration::from_secs(120),
             cancellation: target.cancellation.as_ref(),

@@ -17,6 +17,7 @@ use zess_protocol::{ClientMessage, ServerInstanceId, ServerMessage, SessionId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
+    pub build_id: String,
     pub id: String,
     pub endpoint: String,
     pub session_id: SessionId,
@@ -124,7 +125,9 @@ impl SessionManager {
             .ipc
             .connect(endpoint)
             .with_context(|| format!("connect to server at {}", endpoint.display()))?;
-        self.handshake(&mut stream)?;
+        if !matches!(message, ClientMessage::Status) {
+            self.handshake(&mut stream)?;
+        }
         self.request_on(&mut stream, message)
     }
 
@@ -172,11 +175,20 @@ impl SessionManager {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut response = framing::Decoder::default();
         let mut buffer = [0; 4096];
+        let mut received = false;
         loop {
             stream.set_read_timeout(Some(self.request_interval(deadline)?))?;
             match stream.read(&mut buffer) {
-                Ok(0) => bail!("server did not return a management response"),
+                Ok(0) if !received => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "server did not return a management response",
+                    )
+                    .into());
+                }
+                Ok(0) => bail!("server returned an incomplete management response"),
                 Ok(read) => {
+                    received = true;
                     response.push(&buffer[..read], 1024 * 1024)?;
                     if let Some(response) = response
                         .decode_next()
@@ -193,6 +205,15 @@ impl SessionManager {
                             | io::ErrorKind::WouldBlock
                             | io::ErrorKind::TimedOut
                     ) => {}
+                Err(error)
+                    if received
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                        ) =>
+                {
+                    bail!("server returned an incomplete management response: {error}");
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -201,6 +222,7 @@ impl SessionManager {
     fn decode_status(endpoint: &SocketPath, status: ServerMessage) -> Result<SessionInfo> {
         match status {
             ServerMessage::Status {
+                build_id,
                 session_id,
                 name,
                 server_instance,
@@ -210,6 +232,7 @@ impl SessionManager {
                 modified,
                 ..
             } => Ok(SessionInfo {
+                build_id,
                 id: endpoint
                     .server_id()
                     .map(|id| id.to_string())
@@ -243,18 +266,51 @@ impl SessionManager {
         let mut entries = Vec::new();
         for endpoint in self.ipc.discover()? {
             self.check_cancellation()?;
-            match self.inspect(&endpoint) {
-                Ok(info) => entries.push(info),
-                Err(error)
-                    if error
-                        .downcast_ref::<io::Error>()
-                        .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) => {}
-                Err(error) => return Err(error),
+            if let Some(info) = self.inspect_existing(&endpoint)? {
+                entries.push(info);
             }
             self.check_cancellation()?;
         }
         self.check_cancellation()?;
         Ok(entries)
+    }
+
+    fn inspect_existing(&self, endpoint: &SocketPath) -> Result<Option<SessionInfo>> {
+        match self.inspect(endpoint) {
+            Ok(info) => Ok(Some(info)),
+            Err(error) => {
+                let kind = error.downcast_ref::<io::Error>().map(io::Error::kind);
+                if matches!(
+                    kind,
+                    Some(io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
+                ) {
+                    return Ok(None);
+                }
+                if matches!(
+                    kind,
+                    Some(
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::ConnectionReset
+                    )
+                ) {
+                    if !self.ipc.is_present(endpoint)? {
+                        return Ok(None);
+                    }
+                    // A Unix socket path can remain after its listener closes.
+                    #[cfg(unix)]
+                    if self.ipc.connect(endpoint).is_err_and(|error| {
+                        matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                        )
+                    }) {
+                        return Ok(None);
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     pub fn endpoint_for_workspace(&self, workspace: &Path) -> Result<SocketPath> {
@@ -309,17 +365,11 @@ impl SessionManager {
         let mut first_error = None;
         for endpoint in self.ipc.discover()? {
             self.check_cancellation()?;
-            let status = self.inspect(&endpoint);
+            let status = self.inspect_existing(&endpoint);
             self.check_cancellation()?;
             let info = match status {
-                Ok(info) => info,
-                Err(error)
-                    if error
-                        .downcast_ref::<io::Error>()
-                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
-                {
-                    continue;
-                }
+                Ok(Some(info)) => info,
+                Ok(_) => continue,
                 Err(error) => {
                     first_error.get_or_insert(error);
                     continue;
@@ -362,16 +412,19 @@ impl SessionManager {
             .filter(|info| Path::new(&info.workspace) == workspace)
             .collect();
         match matches.as_slice() {
-            [info] => return Ok(info.clone()),
+            [info] => {
+                zess_protocol::check_build_id(&info.build_id)?;
+                return Ok(info.clone());
+            }
             [] => {}
             _ => bail!(
                 "multiple sessions exist for {}; select one explicitly",
                 workspace.display()
             ),
         }
-        if self.ipc.is_present(endpoint)? {
-            let info = self.inspect(endpoint)?;
+        if let Some(info) = self.inspect_existing(endpoint)? {
             self.check_workspace(&info, &workspace)?;
+            zess_protocol::check_build_id(&info.build_id)?;
             return Ok(info);
         }
         self.start(&workspace, endpoint, config, files)
@@ -399,9 +452,6 @@ impl SessionManager {
             }
             self.endpoint_for_workspace(&workspace)?
         };
-        if self.ipc.is_present(&endpoint)? {
-            bail!("session already exists at {}", endpoint.display());
-        }
         self.start_named(&workspace, &endpoint, config, files, name)
     }
 
@@ -428,7 +478,7 @@ impl SessionManager {
             .filesystem
             .canonicalize(workspace)
             .context("open workspace directory")?;
-        if self.ipc.is_present(endpoint)? {
+        if self.inspect_existing(endpoint)?.is_some() {
             bail!("session already exists at {}", endpoint.display());
         }
         self.check_cancellation()?;
@@ -462,8 +512,7 @@ impl SessionManager {
         let start = Instant::now();
         loop {
             self.check_cancellation()?;
-            if self.ipc.is_present(endpoint)? {
-                let info = self.inspect(endpoint)?;
+            if let Some(info) = self.inspect_existing(endpoint)? {
                 self.check_workspace(&info, &workspace)?;
                 return Ok(info);
             }
@@ -502,7 +551,6 @@ impl SessionManager {
     }
 
     fn status_on(&self, endpoint: &SocketPath, mut stream: Stream) -> Result<SessionInfo> {
-        self.handshake(&mut stream)?;
         let status = self.request_on(&mut stream, ClientMessage::Status)?;
         Self::decode_status(endpoint, status)
     }

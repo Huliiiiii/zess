@@ -172,7 +172,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         match argument.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "Zess — terminal editor with Wisp plugins\n\nUsage: zess [OPTIONS] [FILES...]\n       zess ssh://[USER@]HOST[:PORT]/WORKSPACE\n       zess session new [NAME] [OPTIONS]\n       zess session list [OPTIONS]\n       zess session attach [NAME|ID] [OPTIONS]\n       zess session stop [NAME|ID] [OPTIONS]\n       zess session restart [NAME|ID] [OPTIONS]\n\nOptions: --workspace DIR, --config FILE, --ssh HOST, --json\nCtrl-z detaches; :q exits when only a clean scratch remains.\nRestart creates a fresh session and resets open buffers, layout and undo history.\nRemote Zess must already be installed on the SSH host."
+                    "Zess — terminal editor with Wisp plugins\n\nUsage: zess [OPTIONS] [FILES...]\n       zess ssh://[USER@]HOST[:PORT]/WORKSPACE\n       zess session new [NAME] [OPTIONS]\n       zess session list [OPTIONS]\n       zess session attach [NAME|ID] [OPTIONS]\n       zess session stop [NAME|ID] [OPTIONS]\n       zess session restart [NAME|ID] [OPTIONS]\n\nOptions: --workspace DIR, --config FILE, --ssh HOST, --json\nCtrl-z detaches; :q exits when only a clean scratch remains.\nRestart creates a fresh session and resets open buffers, layout and undo history.\nA matching server is deployed automatically over SSH. Private releases require local gh auth login."
                 );
                 return Ok(());
             }
@@ -305,7 +305,22 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         target.identity_file = ssh_identity;
         target.config_file = ssh_config;
         target.jump_host = ssh_jump;
-        let remote = remote::RemoteOptions { target };
+        let artifacts = Arc::new(zess_remote::GithubReleaseArtifacts::new(
+            env!("CARGO_PKG_REPOSITORY")
+                .strip_prefix("https://github.com/")
+                .context("repository must be on GitHub")?
+                .trim_end_matches(".git"),
+            filesystem.clone(),
+            host.clone(),
+            processes.clone(),
+        ));
+        let remote = remote::RemoteOptions {
+            target,
+            bootstrap: Arc::new(zess_remote::SshBootstrap {
+                artifacts,
+                filesystem: filesystem.clone(),
+            }),
+        };
         let remote_workspace_given = remote_workspace.is_some() || workspace_given;
         let workspace = remote_workspace
             .or_else(|| workspace_given.then(|| workspace.to_string_lossy().into_owned()))
@@ -377,6 +392,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                                 || entry.name.as_deref() == Some(id.as_str())
                         })
                         .with_context(|| format!("remote session {id} was not found"))?;
+                    zess_protocol::check_build_id(&session.build_id)?;
                     let mut factory = remote.session_factory(session.session_id.0)?;
                     zess_terminal::run_connection_with_platform(&mut factory, &files, host.as_ref())
                 } else {
@@ -387,6 +403,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                             [session] => session,
                             _ => select_session(&sessions)?,
                         };
+                        zess_protocol::check_build_id(&selected.build_id)?;
                         let mut factory = remote.session_factory(selected.session_id.0.clone())?;
                         return zess_terminal::run_connection_with_platform(
                             &mut factory,
@@ -698,13 +715,14 @@ fn default_config(filesystem: &dyn FileSystem, host: &dyn Platform) -> Option<Pa
 }
 
 fn print_sessions(sessions: &[server::SessionInfo]) {
-    println!("NAME\tID\tSESSION\tPID\tCLIENT\tMODIFIED\tWORKSPACE");
+    println!("NAME\tID\tSESSION\tBUILD\tPID\tCLIENT\tMODIFIED\tWORKSPACE");
     for session in sessions {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             session.name.as_deref().unwrap_or("-"),
             session.id,
             session.session_id.0,
+            session.build_id,
             session.pid,
             if session.attached {
                 "attached"

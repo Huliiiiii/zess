@@ -298,7 +298,7 @@ fn restarting_replaces_the_daemon_and_preserves_the_workspace_endpoint() {
 #[test]
 fn a_malformed_status_from_another_server_does_not_block_a_session_id() {
     use zess_ipc::framing;
-    use zess_protocol::{ClientMessage, ServerMessage};
+    use zess_protocol::ClientMessage;
 
     let server = Server::new();
     let started = server.start();
@@ -336,18 +336,6 @@ fn a_malformed_status_from_another_server_does_not_block_a_session_id() {
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let frame = framing::read(&mut reader, 1024 * 1024).unwrap().unwrap();
-                assert!(matches!(
-                    framing::decode::<ClientMessage>(&frame).unwrap(),
-                    ClientMessage::Hello { .. }
-                ));
-                framing::write(
-                    &mut stream,
-                    &ServerMessage::Hello {
-                        build_id: zess_build::BUILD_ID.to_owned(),
-                    },
-                )
-                .unwrap();
                 let frame = framing::read(&mut reader, 1024 * 1024).unwrap().unwrap();
                 assert!(matches!(
                     framing::decode::<ClientMessage>(&frame).unwrap(),
@@ -440,8 +428,16 @@ fn a_build_mismatch_does_not_start_another_session() {
     .unwrap();
     stream
         .write_all(
-            &zess_ipc::framing::encode(&zess_protocol::ServerMessage::Hello {
+            &zess_ipc::framing::encode(&zess_protocol::ServerMessage::Status {
                 build_id: "different-build".into(),
+                session_id: zess_protocol::SessionId("old".into()),
+                name: None,
+                server_instance: zess_protocol::ServerInstanceId("old-instance".into()),
+                state_revision: 0,
+                pid: 123,
+                workspace: server.workspace.to_string_lossy().into_owned(),
+                attached: false,
+                modified: true,
             })
             .unwrap(),
         )
@@ -453,6 +449,133 @@ fn a_build_mismatch_does_not_start_another_session() {
             .is_some()
     );
     assert_eq!(server.daemons.spawns.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_session_with_a_different_build_does_not_block_another_workspace() {
+    let server = Server::new();
+    let other = server.root.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let new_endpoint = SocketPath::from(server.root.path().join("new.sock"));
+    let listener = NativeLocalIpc.bind(&server.endpoint).unwrap();
+    let old_workspace = server.workspace.clone();
+    let fixture = thread::spawn(move || {
+        let mut stream = listener.accept().unwrap();
+        let request = zess_ipc::framing::read(
+            &mut BufReader::new(stream.try_clone().unwrap()),
+            1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            zess_ipc::framing::decode::<zess_protocol::ClientMessage>(&request).unwrap(),
+            zess_protocol::ClientMessage::Status
+        ));
+        stream
+            .write_all(
+                &zess_ipc::framing::encode(&zess_protocol::ServerMessage::Status {
+                    build_id: "different-build".into(),
+                    session_id: zess_protocol::SessionId("old".into()),
+                    name: None,
+                    server_instance: zess_protocol::ServerInstanceId("old-instance".into()),
+                    state_revision: 0,
+                    pid: 123,
+                    workspace: old_workspace.to_string_lossy().into_owned(),
+                    attached: false,
+                    modified: true,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    });
+    let info = server
+        .manager
+        .ensure(&other, &new_endpoint, Some(&server.config), &[])
+        .unwrap();
+    fixture.join().unwrap();
+    assert_eq!(Path::new(&info.workspace), other.canonicalize().unwrap());
+    assert_eq!(info.build_id, zess_build::BUILD_ID);
+    assert_eq!(server.daemons.spawns.load(Ordering::Relaxed), 1);
+    server.manager.stop(&new_endpoint, true).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_lookup_resolves_symbolic_links() {
+    let server = Server::new();
+    let started = server.start();
+    let link = server.root.path().join("alias");
+    std::os::unix::fs::symlink(&server.workspace, &link).unwrap();
+    let sessions = server.manager.workspace_sessions(&link).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, started.session_id);
+}
+
+#[test]
+fn multiple_sessions_remain_visible_when_one_has_a_different_build() {
+    let server = Server::new();
+    let endpoints = [
+        server.endpoint.clone(),
+        SocketPath::from(server.root.path().join("unreachable.sock")),
+    ];
+    let mut fixtures = Vec::new();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        let listener = NativeLocalIpc.bind(endpoint).unwrap();
+        let workspace = server.workspace.clone();
+        fixtures.push(thread::spawn(move || {
+            for _ in 0..2 {
+                let mut stream = listener.accept().unwrap();
+                zess_ipc::framing::read(
+                    &mut BufReader::new(stream.try_clone().unwrap()),
+                    1024 * 1024,
+                )
+                .unwrap()
+                .unwrap();
+                stream
+                    .write_all(
+                        &zess_ipc::framing::encode(&zess_protocol::ServerMessage::Status {
+                            build_id: if index == 0 {
+                                "different-build"
+                            } else {
+                                zess_build::BUILD_ID
+                            }
+                            .into(),
+                            session_id: zess_protocol::SessionId(format!("session-{index}")),
+                            name: Some(format!("session-{index}")),
+                            server_instance: zess_protocol::ServerInstanceId(format!(
+                                "instance-{index}"
+                            )),
+                            state_revision: 0,
+                            pid: 123,
+                            workspace: workspace.to_string_lossy().into_owned(),
+                            attached: false,
+                            modified: false,
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+        }));
+    }
+    let sessions = server
+        .manager
+        .workspace_sessions(&server.workspace)
+        .unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session.build_id == "different-build")
+    );
+    let error = server
+        .manager
+        .ensure(&server.workspace, &server.endpoint, None, &[])
+        .unwrap_err();
+    assert!(error.to_string().contains("multiple sessions"));
+    assert_eq!(server.daemons.spawns.load(Ordering::Relaxed), 0);
+    for fixture in fixtures {
+        fixture.join().unwrap();
+    }
 }
 
 #[test]
@@ -506,21 +629,8 @@ fn management_responses_can_arrive_across_poll_intervals() {
     )
     .unwrap()
     .unwrap();
-    stream
-        .write_all(
-            &zess_ipc::framing::encode(&zess_protocol::ServerMessage::Hello {
-                build_id: zess_build::BUILD_ID.to_owned(),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-    zess_ipc::framing::read(
-        &mut BufReader::new(stream.try_clone().unwrap()),
-        1024 * 1024,
-    )
-    .unwrap()
-    .unwrap();
     let response = zess_ipc::framing::encode(&zess_protocol::ServerMessage::Status {
+        build_id: zess_build::BUILD_ID.to_owned(),
         session_id: zess_protocol::SessionId("fragmented-session".into()),
         name: None,
         server_instance: zess_protocol::ServerInstanceId("fragmented-instance".into()),
@@ -539,4 +649,105 @@ fn management_responses_can_arrive_across_poll_intervals() {
     assert_eq!(info.session_id.0, "fragmented-session");
     assert_eq!(info.pid, 42);
     assert_eq!(info.workspace, server.workspace.to_string_lossy());
+}
+
+#[test]
+fn discovery_skips_a_server_that_closes_before_its_status_response() {
+    let server = Server::new();
+    let listener = NativeLocalIpc.bind(&server.endpoint).unwrap();
+    let manager = server.manager.clone();
+    let worker = thread::spawn(move || manager.entries());
+    let stream = listener.accept().unwrap();
+    zess_ipc::framing::read(
+        &mut BufReader::new(stream.try_clone().unwrap()),
+        1024 * 1024,
+    )
+    .unwrap()
+    .unwrap();
+    drop(listener);
+    drop(stream);
+    assert!(worker.join().unwrap().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn discovery_skips_a_socket_left_by_a_dead_server() {
+    use std::io::Read;
+
+    let server = Server::new();
+    let listener = std::os::unix::net::UnixListener::bind(server.endpoint.as_path()).unwrap();
+    let manager = server.manager.clone();
+    let worker = thread::spawn(move || manager.entries());
+    let (mut stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    // Leave part of the request unread so closing the connection can reset it.
+    stream.read_exact(&mut [0]).unwrap();
+    drop(listener);
+
+    // A concurrently spawned daemon can briefly inherit the listener before exec.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match NativeLocalIpc.connect(&server.endpoint) {
+            Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => break,
+            _ => panic!("listener did not stop accepting connections"),
+        }
+    }
+    drop(stream);
+
+    assert!(worker.join().unwrap().unwrap().is_empty());
+    let session = server
+        .manager
+        .ensure(
+            &server.workspace,
+            &server.endpoint,
+            Some(&server.config),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(Path::new(&session.endpoint), server.endpoint.as_path());
+}
+
+#[test]
+fn discovery_reports_a_live_server_that_closes_without_a_status_response() {
+    let server = Server::new();
+    let listener = NativeLocalIpc.bind(&server.endpoint).unwrap();
+    let manager = server.manager.clone();
+    let worker = thread::spawn(move || manager.entries());
+    let stream = listener.accept().unwrap();
+    zess_ipc::framing::read(
+        &mut BufReader::new(stream.try_clone().unwrap()),
+        1024 * 1024,
+    )
+    .unwrap()
+    .unwrap();
+    drop(stream);
+    let error = worker.join().unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("did not return a management response")
+    );
+}
+
+#[test]
+fn discovery_reports_an_incomplete_status_response() {
+    let server = Server::new();
+    let listener = NativeLocalIpc.bind(&server.endpoint).unwrap();
+    let manager = server.manager.clone();
+    let worker = thread::spawn(move || manager.entries());
+    let mut stream = listener.accept().unwrap();
+    zess_ipc::framing::read(
+        &mut BufReader::new(stream.try_clone().unwrap()),
+        1024 * 1024,
+    )
+    .unwrap()
+    .unwrap();
+    stream.write_all(b"{\"type\":").unwrap();
+    drop(listener);
+    drop(stream);
+    let error = worker.join().unwrap().unwrap_err();
+    assert!(error.to_string().contains("incomplete management response"));
 }
