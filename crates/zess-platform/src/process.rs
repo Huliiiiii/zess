@@ -339,6 +339,8 @@ pub struct OwnedProcess {
     #[cfg(unix)]
     console: Option<unix::ConsoleGuard>,
     #[cfg(windows)]
+    console: Option<crate::ConsoleState>,
+    #[cfg(windows)]
     tree: windows::ProcessTree,
 }
 
@@ -380,6 +382,12 @@ impl OwnedProcess {
             }
         };
         #[cfg(windows)]
+        let console = if matches!(spec.console_mode, ConsoleMode::Inherit) {
+            crate::ConsoleState::capture()?
+        } else {
+            None
+        };
+        #[cfg(windows)]
         let tree = {
             use std::os::windows::process::CommandExt;
             use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
@@ -396,7 +404,6 @@ impl OwnedProcess {
         let process = Self {
             child,
             stage: ProcessStage::Running,
-            #[cfg(unix)]
             console,
             #[cfg(windows)]
             tree,
@@ -418,9 +425,12 @@ impl OwnedProcess {
 
     /// Returns the controlling terminal to the caller after interactive authentication.
     pub fn release_console(&mut self) -> io::Result<()> {
-        #[cfg(unix)]
         if let Some(console) = &mut self.console {
+            #[cfg(unix)]
             console.release()?;
+            #[cfg(windows)]
+            console.restore()?;
+            self.console = None;
         }
         Ok(())
     }

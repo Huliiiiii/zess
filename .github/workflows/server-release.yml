@@ -34,6 +34,12 @@ jobs:
       - name: Build Windows server
         if: runner.os == 'Windows'
         run: cargo build --locked --release --bin zess --target "${{ matrix.target }}"
+      - name: Test Windows console mode restoration
+        if: runner.os == 'Windows'
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc -p zess-platform --lib console::tests -- --nocapture
+      - name: Test Windows terminal lifecycle
+        if: runner.os == 'Windows'
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc -p zess-terminal --lib terminal::tests::windows -- --nocapture
       - name: Package Linux server
         if: runner.os == 'Linux'
         env:
