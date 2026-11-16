@@ -102,8 +102,7 @@ impl GithubReleaseArtifacts {
         );
         let response = self.agent.get(&url).call();
         cancellation.check()?;
-        let response =
-            response.with_context(|| format!("could not download release asset {name}"))?;
+        let response = response.with_context(|| format!("could not download {url}"))?;
         let mut reader = response.into_body().into_reader();
         let mut bytes = Vec::new();
         let mut buffer = [0; 64 * 1024];
@@ -111,7 +110,7 @@ impl GithubReleaseArtifacts {
             cancellation.check()?;
             let count = reader.read(&mut buffer);
             cancellation.check()?;
-            let count = count.with_context(|| format!("could not read release asset {name}"))?;
+            let count = count.with_context(|| format!("could not read {url}"))?;
             if count == 0 {
                 break;
             }
