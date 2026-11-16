@@ -6,6 +6,7 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/Huliiiiii/zess"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
@@ -63,6 +64,7 @@ name = "zess"
 default-run = "zess"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true

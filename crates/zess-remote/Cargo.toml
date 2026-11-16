@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22.1"
+sha2 = "0.11.1"
 serde.workspace = true
 serde_json.workspace = true
 zess-build.workspace = true

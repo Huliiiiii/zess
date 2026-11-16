@@ -446,7 +446,7 @@ pub fn serve_with_platform(
             if let Ok(messages) = messages {
                 for message in messages {
                     if matches!(connection.role, ConnectionRole::AwaitHello { .. })
-                        && !matches!(message, ClientMessage::Hello { .. })
+                        && !matches!(message, ClientMessage::Hello { .. } | ClientMessage::Status)
                     {
                         connection.send(&ServerMessage::Rejected {
                             reason:
@@ -472,9 +472,14 @@ pub fn serve_with_platform(
                             };
                         }
                         ClientMessage::Status
-                            if matches!(connection.role, ConnectionRole::Unidentified { .. }) =>
+                            if matches!(
+                                connection.role,
+                                ConnectionRole::Unidentified { .. }
+                                    | ConnectionRole::AwaitHello { .. }
+                            ) =>
                         {
                             connection.send(&ServerMessage::Status {
+                                build_id: zess_build::BUILD_ID.to_owned(),
                                 session_id: published.session_id.clone(),
                                 name: session.name().map(str::to_owned),
                                 server_instance: server_instance.clone(),

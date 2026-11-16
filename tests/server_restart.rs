@@ -347,69 +347,6 @@ fn default_servers_are_discovered_and_can_be_stopped_by_uppercase_id() {
 }
 
 #[test]
-fn existing_workspace_servers_are_reused_after_the_id_algorithm_changes() {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::os::unix::ffi::OsStrExt;
-
-    for legacy_id in [
-        (|workspace: &Path| {
-            let mut hasher = fnv::FnvHasher::default();
-            hasher.write(workspace.as_os_str().as_bytes());
-            hasher.finish()
-        }) as fn(&Path) -> u64,
-        |workspace: &Path| {
-            let mut hasher = DefaultHasher::new();
-            workspace.hash(&mut hasher);
-            hasher.finish()
-        },
-    ] {
-        let server = Server::with_socket(|workspace| {
-            Some(PathBuf::from(format!(
-                "zess/run/{:016x}.sock",
-                legacy_id(workspace)
-            )))
-        });
-        let mut duplicate = server
-            .cli()
-            .args(["server", "--workspace"])
-            .arg(&server.workspace)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while duplicate.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                duplicate.kill().unwrap();
-                duplicate.wait().unwrap();
-                panic!("a second server started for the existing workspace");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        let output = duplicate.wait_with_output().unwrap();
-        assert!(!output.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
-            format!(
-                "Error: a server is already listening at {}\n",
-                server.socket.display()
-            )
-        );
-        assert_eq!(server.status()["pid"], server.child.id());
-        let sockets = fs::read_dir(server.socket.parent().unwrap())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "sock")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(sockets, [server.socket.clone()]);
-    }
-}
-
-#[test]
 fn restarting_a_relative_socket_preserves_its_location() {
     let server = Server::with_socket(|_| Some(PathBuf::from("relative.sock")));
     let before = server.status();

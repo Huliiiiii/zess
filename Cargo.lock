@@ -3681,7 +3681,6 @@ name = "zess-ipc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "fnv",
  "libc",
  "serde",
  "serde_json",
@@ -3749,8 +3748,10 @@ name = "zess-remote"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "zess-build",
  "zess-ipc",

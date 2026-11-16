@@ -24,6 +24,13 @@ fn ssh_addresses_select_the_remote_workspace_and_connection() -> Result<()> {
     std::fs::write(
         &executable,
         r##"#!/bin/sh
+for arg do command=$arg; done
+case "$command" in
+    *uname*) printf '%s\n' Linux x86_64; exit 0 ;;
+    *sha256sum*) exit 0 ;;
+    *remote-proxy*) ;;
+    *) printf '%s\n' 'unexpected SSH command' >&2; exit 1 ;;
+esac
 printf '%s\n' "$@" > "$ZESS_CAPTURE.args"
 IFS= read -r hello
 printf '%s\n' "$hello"
@@ -202,6 +209,7 @@ impl RemoteSession {
         let mut target = SshTarget::new(self.host.clone());
         target.config_file = Some(self.ssh_config.clone());
         let mut connector = SshConnector {
+            bootstrap: std::sync::Arc::new(Preinstalled),
             target,
             runner: SystemProcessRunner,
             request: ProxyRequest::new(operation),
@@ -434,7 +442,8 @@ impl Drop for RemoteSession {
 }
 
 /// The SSH server must share this machine's temporary filesystem, isolate its runtime,
-/// and have the same build of zess preinstalled on PATH.
+/// have the same build of zess on PATH for direct connector checks, and make the
+/// matching server artifact available to the CLI deployment flow.
 #[test]
 #[ignore = "requires an isolated localhost SSH fixture through ZESS_TEST_SSH_CONFIG and tmux"]
 fn remote_sessions_keep_edits_and_undo_across_terminal_detachment() -> Result<()> {
@@ -620,4 +629,16 @@ fn replaying_acknowledged_input_after_an_ssh_disconnect_does_not_repeat_the_edit
     assert_eq!(stopped["status"], "stopped");
     fixture.sessions.clear();
     Ok(())
+}
+
+struct Preinstalled;
+
+impl zess_remote::ServerBootstrap for Preinstalled {
+    fn prepare(
+        &self,
+        _: &SshTarget,
+        _: &dyn zess_platform::ProcessRunner,
+    ) -> anyhow::Result<String> {
+        Ok("zess remote-proxy".into())
+    }
 }

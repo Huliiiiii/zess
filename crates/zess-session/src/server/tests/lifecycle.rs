@@ -87,6 +87,16 @@ impl Drop for Server {
     }
 }
 
+#[test]
+fn session_status_is_available_before_the_build_handshake() {
+    let server = Server::start("keep");
+    let (mut stream, mut reader) = server.connect();
+    framing::write(&mut stream, &ClientMessage::Status).unwrap();
+    assert!(
+        matches!(receive(&mut reader), ServerMessage::Status { build_id, name: Some(name), workspace, .. } if build_id == zess_build::BUILD_ID && name == "work" && workspace == server.root.to_string_lossy())
+    );
+}
+
 fn receive(reader: &mut BufReader<UnixStream>) -> ServerMessage {
     let mut line = String::new();
     assert!(reader.read_line(&mut line).unwrap() > 0);
