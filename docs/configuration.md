@@ -63,7 +63,7 @@ zess session attach --ssh my-host --session SESSION_ID
 
 SSH 地址接受 `ssh://[USER@]HOST[:PORT]/WORKSPACE`，HOST 可以是 SSH 配置别名。路径含空格时请为整个地址加引号。也可使用 `--ssh HOST --remote-workspace PATH`；两种方式使用本机 `ssh` 及其有效配置、known_hosts 和认证方式。主机密钥的确认与拒绝取决于该配置中的 [`StrictHostKeyChecking`](https://man.openbsd.org/ssh_config#StrictHostKeyChecking) 等选项。可用 `--ssh-config`、`--ssh-identity`、`--ssh-user`、`--ssh-port` 和 `--ssh-jump` 指定连接参数。远端登录和 shell 启动脚本不得向标准输出打印 banner。远端 workspace 默认是 `.`，文件参数和 `--config` 指向远端路径。
 
-远端必须预先安装与客户端 Build ID 相同的 Zess，并在远端 PATH 中可执行。Zess 不自动部署或更新远端程序。
+Zess 自动探测远端平台，并在远端用户缓存中准备与客户端 Build ID 匹配的服务端。首次部署需要本机安装 GitHub CLI，并使用 `gh auth login` 登录有权访问发布产物的账号；下载由本机完成，再通过 SSH 上传。已校验的远端缓存可直接复用。支持 Linux x86-64 和 Windows x86-64；客户端不会自动更新。
 
 本地和远端各自的用户目录、文件路径及外部程序属于各自主机。远端会话的编辑和文件操作发生在远端；剪贴板操作由本地客户端处理。SSH 的连接选项参见 [OpenSSH ssh 手册](https://man.openbsd.org/ssh) 和 [ssh_config 手册](https://man.openbsd.org/ssh_config)。
 

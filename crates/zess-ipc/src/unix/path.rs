@@ -1,8 +1,5 @@
 use std::{
-    collections::hash_map::DefaultHasher,
-    fs,
-    hash::{Hash, Hasher},
-    io,
+    fs, io,
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
@@ -11,7 +8,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use fnv::FnvHasher;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::{ServerId, Stream};
@@ -82,25 +78,8 @@ impl SocketPath {
         let directory = directory();
         ensure_private_directory(directory.parent().expect("runtime directory has a parent"))?;
         ensure_private_directory(&directory)?;
-        let bytes = workspace.as_os_str().as_bytes();
-        let socket = Self::in_directory(ServerId(xxh3_64(bytes)), &directory);
-        if matches!(fs::symlink_metadata(socket.as_path()), Err(error) if error.kind() == io::ErrorKind::NotFound)
-        {
-            let mut fnv = FnvHasher::default();
-            fnv.write(bytes);
-            let mut legacy = DefaultHasher::new();
-            workspace.hash(&mut legacy);
-            for id in [ServerId(fnv.finish()), ServerId(legacy.finish())] {
-                let legacy = Self::in_directory(id, &directory);
-                if fs::symlink_metadata(legacy.as_path())
-                    .is_ok_and(|metadata| metadata.file_type().is_socket())
-                    && Stream::connect(&legacy).is_ok()
-                {
-                    return Ok(legacy);
-                }
-            }
-        }
-        Ok(socket)
+        let id = ServerId(xxh3_64(workspace.as_os_str().as_bytes()));
+        Ok(Self::in_directory(id, &directory))
     }
 
     pub fn by_id(id: ServerId) -> Self {

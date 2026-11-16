@@ -15,6 +15,7 @@ use zess_protocol::{ClientMessage, ServerInstanceId, ServerMessage, SessionId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
+    pub build_id: String,
     pub id: String,
     pub endpoint: String,
     pub session_id: SessionId,
@@ -91,7 +92,9 @@ impl SessionManager {
             .ipc
             .connect(endpoint)
             .with_context(|| format!("connect to server at {}", endpoint.display()))?;
-        self.handshake(&mut stream)?;
+        if !matches!(message, ClientMessage::Status) {
+            self.handshake(&mut stream)?;
+        }
         self.request_on(&mut stream, message)
     }
 
@@ -168,6 +171,7 @@ impl SessionManager {
     pub fn inspect(&self, endpoint: &SocketPath) -> Result<SessionInfo> {
         match self.request(endpoint, ClientMessage::Status)? {
             ServerMessage::Status {
+                build_id,
                 session_id,
                 name,
                 server_instance,
@@ -177,6 +181,7 @@ impl SessionManager {
                 modified,
                 ..
             } => Ok(SessionInfo {
+                build_id,
                 id: endpoint
                     .server_id()
                     .map(|id| id.to_string())
@@ -296,7 +301,10 @@ impl SessionManager {
             .filter(|info| Path::new(&info.workspace) == workspace)
             .collect();
         match matches.as_slice() {
-            [info] => return Ok(info.clone()),
+            [info] => {
+                zess_protocol::check_build_id(&info.build_id)?;
+                return Ok(info.clone());
+            }
             [] => {}
             _ => bail!(
                 "multiple sessions exist for {}; select one explicitly",
@@ -306,6 +314,7 @@ impl SessionManager {
         if self.ipc.is_present(endpoint)? {
             let info = self.inspect(endpoint)?;
             self.check_workspace(&info, &workspace)?;
+            zess_protocol::check_build_id(&info.build_id)?;
             return Ok(info);
         }
         self.start(&workspace, endpoint, config, files)

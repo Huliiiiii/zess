@@ -62,6 +62,7 @@ fn attaching_a_remote_session_uses_the_managers_ipc_route() -> Result<()> {
         zess_remote::write_request(
             &mut peer,
             &zess_protocol::ServerMessage::Status {
+                build_id: zess_build::BUILD_ID.into(),
                 session_id: zess_protocol::SessionId("actual-session".into()),
                 name: None,
                 server_instance: zess_protocol::ServerInstanceId("instance".into()),

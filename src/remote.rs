@@ -23,6 +23,7 @@ mod tests;
 #[derive(Clone)]
 pub struct RemoteOptions {
     pub target: SshTarget,
+    pub bootstrap: Arc<dyn zess_remote::ServerBootstrap>,
 }
 
 pub struct SshAddress<'a> {
@@ -165,6 +166,7 @@ impl RemoteOptions {
     fn connector(&self, operation: ProxyOperation) -> Result<ConnectorImpl> {
         Ok(SshConnector {
             target: self.target.clone(),
+            bootstrap: self.bootstrap.clone(),
             runner: SystemProcessRunner,
             request: ProxyRequest::new(operation),
         })
