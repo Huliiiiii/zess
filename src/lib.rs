@@ -170,7 +170,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         match argument.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "Zess — terminal editor with Wisp plugins\n\nUsage: zess [OPTIONS] [FILES...]\n       zess ssh://[USER@]HOST[:PORT]/WORKSPACE\n       zess session new [NAME] [OPTIONS]\n       zess session list [OPTIONS]\n       zess session attach [NAME|ID] [OPTIONS]\n       zess session stop [NAME|ID] [OPTIONS]\n       zess session restart [NAME|ID] [OPTIONS]\n\nOptions: --workspace DIR, --config FILE, --ssh HOST, --json\nCtrl-z detaches; :q exits when only a clean scratch remains.\nRestart creates a fresh session and resets open buffers, layout and undo history.\nA matching server is deployed automatically over SSH. Private releases require local gh auth login."
+                    "Zess — terminal editor with Wisp plugins\n\nUsage: zess [OPTIONS] [FILES...]\n       zess ssh://[USER@]HOST[:PORT]/WORKSPACE\n       zess session new [NAME] [OPTIONS]\n       zess session list [OPTIONS]\n       zess session attach [NAME|ID] [OPTIONS]\n       zess session stop [NAME|ID] [OPTIONS]\n       zess session restart [NAME|ID] [OPTIONS]\n\nOptions: --workspace DIR, --config FILE, --ssh HOST, --json\nCtrl-z detaches; :q exits when only a clean scratch remains.\nRestart creates a fresh session and resets open buffers, layout and undo history.\nA matching server is deployed automatically over SSH."
                 );
                 return Ok(());
             }
@@ -310,7 +310,6 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 .trim_end_matches(".git"),
             filesystem.clone(),
             host.clone(),
-            processes.clone(),
         ));
         let remote = remote::RemoteOptions {
             target,
