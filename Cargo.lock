@@ -4031,6 +4031,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "libc",
  "serde_json",
  "unicode-segmentation",
  "unicode-width 0.2.2",
