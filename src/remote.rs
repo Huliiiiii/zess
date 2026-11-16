@@ -25,6 +25,65 @@ pub struct RemoteOptions {
     pub target: SshTarget,
 }
 
+pub struct SshAddress<'a> {
+    pub host: &'a str,
+    pub user: Option<&'a str>,
+    pub port: Option<u16>,
+    pub workspace: &'a str,
+}
+
+impl<'a> SshAddress<'a> {
+    pub fn parse(address: &'a str) -> Result<Self> {
+        let address = address
+            .strip_prefix("ssh://")
+            .context("invalid SSH address")?;
+        let authority = address
+            .split_once('/')
+            .map(|(authority, _)| authority)
+            .context("SSH address needs an absolute workspace path")?;
+        let workspace = &address[authority.len()..];
+        let (user, authority) = if let Some((user, host)) = authority.split_once('@') {
+            if user.is_empty() || user.contains([':', '@']) {
+                bail!("SSH address user must not contain a password");
+            }
+            (Some(user), host)
+        } else {
+            (None, authority)
+        };
+        let (host, port) = if let Some(host) = authority.strip_prefix('[') {
+            let (host, suffix) = host.split_once(']').context("invalid SSH IPv6 address")?;
+            host.parse::<std::net::Ipv6Addr>()
+                .context("invalid SSH IPv6 address")?;
+            let port = if suffix.is_empty() {
+                None
+            } else {
+                Some(suffix.strip_prefix(':').context("invalid SSH address")?)
+            };
+            (host, port)
+        } else if let Some((host, port)) = authority.split_once(':') {
+            if port.contains(':') {
+                bail!("IPv6 SSH addresses must be enclosed in brackets");
+            }
+            (host, Some(port))
+        } else {
+            (authority, None)
+        };
+        if host.is_empty() || host.contains('@') {
+            bail!("SSH address needs a host");
+        }
+        let port = port
+            .filter(|port| !port.is_empty())
+            .map(|port| port.parse().context("invalid SSH port"))
+            .transpose()?;
+        Ok(Self {
+            host,
+            user,
+            port,
+            workspace,
+        })
+    }
+}
+
 type ConnectorImpl = SshConnector<SystemProcessRunner, ProxyRequest>;
 
 pub struct RemoteConnectionFactory {
