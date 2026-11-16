@@ -18,7 +18,7 @@
 
 ## SSH 与会话消息
 
-[`zess-remote`](../crates/zess-remote/src/lib.rs) 使用 `SshTarget` 配置 SSH 连接。`SshConnector` 在连接前调用注入的 `ServerBootstrap` 准备服务端，再经标准流交换消息。`SshBootstrap` 探测远端平台、校验远端缓存，并在需要时通过 `ServerArtifacts` 获取匹配制品并上传；Linux 制品是自含动态链接器与依赖的归档，安装时修补可执行文件并校验安装结果。`GithubReleaseArtifacts` 使用本机 GitHub CLI 下载指定 Build ID 的发布产物。远端 shell 的标准输出不得混入 banner。客户端与代理、客户端与会话服务端分别交换 `Hello` 并要求 Build ID 一致，然后发送业务请求。会话发现可在 `Hello` 前发送只读 `Status`，返回的会话信息包含 Build ID；业务请求仍需匹配身份。代理处理管理请求，或转发与会话服务端的连接。
+[`zess-remote`](../crates/zess-remote/src/lib.rs) 使用 `SshTarget` 配置 SSH 连接。`SshConnector` 在连接前调用注入的 `ServerBootstrap` 准备服务端，再经标准流交换消息。`SshBootstrap` 探测远端平台、校验远端缓存，并在需要时通过 `ServerArtifacts` 获取匹配制品并上传；Linux 制品是自含动态链接器与依赖的归档，安装时修补可执行文件并校验安装结果。`GithubReleaseArtifacts` 通过 HTTPS 下载指定 Build ID 的发布产物。远端 shell 的标准输出不得混入 banner。客户端与代理、客户端与会话服务端分别交换 `Hello` 并要求 Build ID 一致，然后发送业务请求。会话发现可在 `Hello` 前发送只读 `Status`，返回的会话信息包含 Build ID；业务请求仍需匹配身份。代理处理管理请求，或转发与会话服务端的连接。
 
 [`zess-protocol`](../crates/zess-protocol/src/lib.rs) 定义 `ClientMessage`、`ServerMessage`、快照、增量及操作结果。快照和增量携带 session、server instance 和 revision；客户端在应用增量前检查身份与基础 revision。命令通过 `RequestId` 和 server instance 标识，结果为 `Pending`、`Completed { outcome, state_revision }` 或 `Unknown`。完成的 outcome 可表示已应用、已保存、Buffer 已关闭及实际后继，或失败；取消可体现为失败信息，剪贴板写入结果另有 `Cancelled`。`Unknown` 表示结果无法确认；普通命令显示提示，仍在服务端待处理的客户端动作则解除提交标记，允许重新提交并由动作 ID 防止重复消费。输入序列和确认用于跟踪客户端输入进度；重连是否允许重放由服务端返回的 `replay_allowed` 决定。
 
