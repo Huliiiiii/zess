@@ -55,12 +55,13 @@ set-view-options! 'git : obj 'diff-pager : obj 'program "delta" 'args : list "--
 以下编辑器启动与 attach 命令是互斥的连接方式；切换前先用 Ctrl-z 。
 
 ```sh
-zess --ssh my-host --remote-workspace /path/to/project
+zess ssh://my-host:/path/to/project
+zess ssh://my-host/path/to/project
 zess session list --ssh my-host
 zess session attach --ssh my-host --session SESSION_ID
 ```
 
-`--ssh` 接受主机名或 SSH 配置别名，使用本机 `ssh` 及其有效配置、known_hosts 和认证方式；主机密钥的确认与拒绝取决于该配置中的 [`StrictHostKeyChecking`](https://man.openbsd.org/ssh_config#StrictHostKeyChecking) 等选项。可用 `--ssh-config`、`--ssh-identity`、`--ssh-user`、`--ssh-port` 和 `--ssh-jump` 覆盖对应连接参数。远端登录和 shell 启动脚本不得向标准输出打印 banner。远端 workspace 默认是 `.`，文件参数和 `--config` 指向远端路径。
+SSH 地址接受 `ssh://[USER@]HOST[:PORT]/WORKSPACE`，HOST 可以是 SSH 配置别名。路径含空格时请为整个地址加引号。也可使用 `--ssh HOST --remote-workspace PATH`；两种方式使用本机 `ssh` 及其有效配置、known_hosts 和认证方式。主机密钥的确认与拒绝取决于该配置中的 [`StrictHostKeyChecking`](https://man.openbsd.org/ssh_config#StrictHostKeyChecking) 等选项。可用 `--ssh-config`、`--ssh-identity`、`--ssh-user`、`--ssh-port` 和 `--ssh-jump` 指定连接参数。远端登录和 shell 启动脚本不得向标准输出打印 banner。远端 workspace 默认是 `.`，文件参数和 `--config` 指向远端路径。
 
 远端必须预先安装与客户端 Build ID 相同的 Zess，并在远端 PATH 中可执行。Zess 不自动部署或更新远端程序。
 

@@ -15,6 +15,116 @@ use zess_remote::{
     Connector, ProxyOperation, ProxyRequest, SshConnection, SshConnector, SshTarget,
 };
 
+#[test]
+fn ssh_addresses_select_the_remote_workspace_and_connection() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir()?;
+    let executable = directory.path().join("ssh");
+    std::fs::write(
+        &executable,
+        r##"#!/bin/sh
+printf '%s\n' "$@" > "$ZESS_CAPTURE.args"
+IFS= read -r hello
+printf '%s\n' "$hello"
+IFS= read -r request
+printf '%s\n' "$request" > "$ZESS_CAPTURE.request"
+printf '%s\n' '{"status":"failed","message":"fixture stop"}'
+"##,
+    )?;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+    let capture = directory.path().join("capture");
+    for (uri, host, user, port, workspace) in [
+        ("ssh://pca:/path", "pca", None, None, "/path"),
+        (
+            "ssh://pca/目录 with space",
+            "pca",
+            None,
+            None,
+            "/目录 with space",
+        ),
+        (
+            "ssh://alice@pca:2222/work",
+            "pca",
+            Some("alice"),
+            Some("2222"),
+            "/work",
+        ),
+        ("ssh://[::1]:2200/work", "::1", None, Some("2200"), "/work"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_zess"))
+            .arg(uri)
+            .env("PATH", directory.path())
+            .env("ZESS_CAPTURE", &capture)
+            .output()?;
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("fixture stop"),
+            "{uri}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let args = std::fs::read_to_string(capture.with_extension("args"))?;
+        let args: Vec<_> = args.lines().collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--" && pair[1] == host)
+        );
+        if let Some(user) = user {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-l" && pair[1] == user)
+            );
+        }
+        if let Some(port) = port {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-p" && pair[1] == port)
+            );
+        }
+        let request: Value =
+            serde_json::from_slice(&std::fs::read(capture.with_extension("request"))?)?;
+        assert_eq!(request["operation"]["workspace"], workspace);
+    }
+    Ok(())
+}
+
+#[test]
+fn conflicting_ssh_addresses_are_rejected_before_connecting() -> Result<()> {
+    for args in [
+        vec!["ssh://pca:/path", "--ssh", "other"],
+        vec!["ssh://pca:/path", "--remote-workspace", "/other"],
+        vec!["ssh://alice@pca:22/path", "--ssh-user", "bob"],
+        vec!["ssh://pca:22/path", "--ssh-port", "23"],
+        vec!["ssh://pca:/path", "ssh://other:/path"],
+        vec!["ssh://user:password@pca/path"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_zess"))
+            .args(&args)
+            .output()?;
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("conflict")
+                || stderr.contains("only one")
+                || stderr.contains("password"),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_ssh_address_after_double_dash_remains_a_positional_argument() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_zess"))
+        .args(["session", "attach", "--", "ssh://pca:/path"])
+        .env("XDG_RUNTIME_DIR", directory.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown session: ssh://pca:/path"));
+    Ok(())
+}
+
 struct RemoteSession {
     directory: tempfile::TempDir,
     binary: PathBuf,
