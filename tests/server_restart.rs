@@ -6,7 +6,10 @@ use std::{
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -130,14 +133,21 @@ impl Drop for Server {
 }
 
 fn connect(socket: &Path) -> UnixStream {
+    static VERSION: LazyLock<String> = LazyLock::new(|| {
+        zess_build::RELEASE_VERSION
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                zess_build::development_version(Path::new(env!("CARGO_BIN_EXE_zess"))).unwrap()
+            })
+    });
     let mut stream = UnixStream::connect(socket).unwrap();
     send(
         &mut stream,
-        json!({"type": "hello", "build_id": zess_build::BUILD_ID}),
+        json!({"type": "hello", "build_id": VERSION.as_str()}),
     );
     let hello = receive(&mut BufReader::new(stream.try_clone().unwrap()));
     assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["build_id"], zess_build::BUILD_ID);
+    assert_eq!(hello["build_id"], VERSION.as_str());
     stream
 }
 
@@ -322,12 +332,18 @@ fn default_servers_are_discovered_and_can_be_stopped_by_uppercase_id() {
     let listed = server.command(&["session", "list"]);
     assert!(listed.status.success());
     let listing = String::from_utf8(listed.stdout).unwrap();
-    let entries = listing.lines().skip(1).collect::<Vec<_>>();
+    let mut lines = listing.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        "NAME\tID\tSESSION\tVERSION\tPID\tCLIENT\tMODIFIED\tWORKSPACE"
+    );
+    let entries = lines.collect::<Vec<_>>();
     assert_eq!(entries.len(), 1, "{listing}");
     let fields = entries[0].split('\t').collect::<Vec<_>>();
     assert_eq!(fields[1], id);
-    assert_eq!(fields[3], server.child.id().to_string());
-    assert_eq!(fields[6], server.workspace.to_str().unwrap());
+    assert_eq!(fields[3], server.status()["build_id"].as_str().unwrap());
+    assert_eq!(fields[4], server.child.id().to_string());
+    assert_eq!(fields[7], server.workspace.to_str().unwrap());
     let stopped = server.command(&["session", "stop", &id.to_ascii_uppercase()]);
     assert!(
         stopped.status.success(),

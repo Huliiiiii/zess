@@ -1,7 +1,7 @@
 use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -18,7 +18,8 @@ use zess_session::SessionLifetime;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
-    pub build_id: String,
+    #[serde(rename = "build_id")]
+    pub version: String,
     pub id: String,
     pub endpoint: String,
     pub session_id: SessionId,
@@ -38,6 +39,7 @@ pub struct SessionManager {
     ipc: Arc<dyn LocalIpc>,
     daemons: Arc<dyn DaemonControl>,
     host: Arc<dyn Platform>,
+    development_version: Arc<OnceLock<String>>,
     cancellation: Option<CancellationToken>,
 }
 
@@ -62,6 +64,7 @@ impl SessionManager {
             ipc,
             daemons,
             host,
+            development_version: Arc::default(),
             cancellation: None,
         }
     }
@@ -103,16 +106,28 @@ impl SessionManager {
         self.request_on(&mut stream, message)
     }
 
+    fn version(&self) -> Result<&str> {
+        if let Some(version) = zess_build::RELEASE_VERSION {
+            return Ok(version);
+        }
+        if let Some(version) = self.development_version.get() {
+            return Ok(version);
+        }
+        let version = zess_build::development_version(&self.host.current_exe()?)?;
+        Ok(self.development_version.get_or_init(|| version))
+    }
+
     fn handshake(&self, stream: &mut Stream) -> Result<()> {
+        let expected = self.version()?;
         self.request_on(
             stream,
             ClientMessage::Hello {
-                build_id: zess_build::BUILD_ID.to_owned(),
+                version: expected.to_owned(),
             },
         )
         .and_then(|reply| match reply {
-            ServerMessage::Hello { build_id } => {
-                zess_protocol::check_build_id(&build_id).map_err(Into::into)
+            ServerMessage::Hello { version } => {
+                zess_protocol::check_version(expected, &version).map_err(Into::into)
             }
             _ => Err(anyhow::anyhow!("unexpected server handshake")),
         })
@@ -194,7 +209,7 @@ impl SessionManager {
     fn decode_status(endpoint: &SocketPath, status: ServerMessage) -> Result<SessionInfo> {
         match status {
             ServerMessage::Status {
-                build_id,
+                version,
                 session_id,
                 name,
                 server_instance,
@@ -205,7 +220,7 @@ impl SessionManager {
                 pending,
                 ..
             } => Ok(SessionInfo {
-                build_id,
+                version,
                 id: endpoint
                     .server_id()
                     .map(|id| id.to_string())
@@ -467,7 +482,7 @@ impl SessionManager {
         };
         if let Some(info) = existing {
             self.check_workspace(&info, &workspace)?;
-            zess_protocol::check_build_id(&info.build_id)?;
+            zess_protocol::check_version(self.version()?, &info.version)?;
             ensure!(
                 !info.pending,
                 "the workspace session is awaiting its first attach"
@@ -490,7 +505,7 @@ impl SessionManager {
                 started.pending,
                 "the new session was published before its first attach"
             );
-            zess_protocol::check_build_id(&started.build_id)?;
+            zess_protocol::check_version(self.version()?, &started.version)?;
             let mut stream = self.connect(endpoint)?;
             let claimed = Self::decode_status(
                 endpoint,

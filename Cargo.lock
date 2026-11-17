@@ -3949,7 +3949,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "zess-build",
  "zess-ui",
 ]
 

@@ -8,30 +8,30 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
-pub struct BuildMismatch {
-    pub expected: &'static str,
+pub struct VersionMismatch {
+    pub expected: String,
     pub actual: String,
 }
 
-impl std::fmt::Display for BuildMismatch {
+impl std::fmt::Display for VersionMismatch {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "zess build mismatch: expected {}, received {}",
+            "zess version mismatch: expected {}, received {}",
             self.expected, self.actual
         )
     }
 }
 
-impl std::error::Error for BuildMismatch {}
+impl std::error::Error for VersionMismatch {}
 
-pub fn check_build_id(build_id: &str) -> Result<(), BuildMismatch> {
-    if build_id == zess_build::BUILD_ID {
+pub fn check_version(expected: &str, actual: &str) -> Result<(), VersionMismatch> {
+    if actual == expected {
         Ok(())
     } else {
-        Err(BuildMismatch {
-            expected: zess_build::BUILD_ID,
-            actual: build_id.to_owned(),
+        Err(VersionMismatch {
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
         })
     }
 }
@@ -364,7 +364,8 @@ pub enum ClientMessage {
     },
     ConfirmAttach,
     Hello {
-        build_id: String,
+        #[serde(rename = "build_id")]
+        version: String,
     },
     Status,
     Stop {
@@ -438,10 +439,12 @@ pub enum ServerMessage {
     AttachPending,
     AttachConfirmed,
     Hello {
-        build_id: String,
+        #[serde(rename = "build_id")]
+        version: String,
     },
     Status {
-        build_id: String,
+        #[serde(rename = "build_id")]
+        version: String,
         session_id: SessionId,
         name: Option<String>,
         server_instance: ServerInstanceId,

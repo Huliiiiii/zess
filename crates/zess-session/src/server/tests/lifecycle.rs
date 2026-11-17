@@ -72,7 +72,7 @@ impl Drop for Server {
             let _ = framing::write(
                 &mut stream,
                 &ClientMessage::Hello {
-                    build_id: zess_build::BUILD_ID.into(),
+                    version: zess_build::version().into(),
                 },
             );
             let _ = framing::write(&mut stream, &ClientMessage::Stop { force: true });
@@ -93,7 +93,7 @@ fn session_status_is_available_before_the_build_handshake() {
     let (mut stream, mut reader) = server.connect();
     framing::write(&mut stream, &ClientMessage::Status).unwrap();
     assert!(
-        matches!(receive(&mut reader), ServerMessage::Status { build_id, name: Some(name), workspace, .. } if build_id == zess_build::BUILD_ID && name == "work" && workspace == server.root.to_string_lossy())
+        matches!(receive(&mut reader), ServerMessage::Status { version, name: Some(name), workspace, .. } if version == zess_build::version() && name == "work" && workspace == server.root.to_string_lossy())
     );
 }
 
@@ -107,12 +107,12 @@ fn hello(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>) {
     framing::write(
         stream,
         &ClientMessage::Hello {
-            build_id: zess_build::BUILD_ID.into(),
+            version: zess_build::version().into(),
         },
     )
     .unwrap();
     assert!(
-        matches!(receive(reader), ServerMessage::Hello { build_id } if build_id == zess_build::BUILD_ID)
+        matches!(receive(reader), ServerMessage::Hello { version } if version == zess_build::version())
     );
 }
 
@@ -128,13 +128,13 @@ fn stopping_requires_a_matching_build_handshake() {
     framing::write(
         &mut stream,
         &ClientMessage::Hello {
-            build_id: "different".into(),
+            version: "different".into(),
         },
     )
     .unwrap();
     framing::write(&mut stream, &ClientMessage::Stop { force: true }).unwrap();
     assert!(
-        matches!(receive(&mut reader), ServerMessage::Hello { build_id } if build_id == zess_build::BUILD_ID)
+        matches!(receive(&mut reader), ServerMessage::Hello { version } if version == zess_build::version())
     );
     assert_eq!(reader.read(&mut [0]).unwrap(), 0);
     assert!(

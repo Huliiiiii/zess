@@ -272,7 +272,7 @@ impl ConnectionFactory for RemoteConnectionFactory {
                 }
             };
             if let Some(session) = selected {
-                zess_protocol::check_build_id(&session.build_id)?;
+                zess_protocol::check_version(zess_build::version(), &session.version)?;
                 self.session_id = Some(session.session_id.clone());
             }
         }
@@ -452,16 +452,16 @@ pub fn serve_proxy(
 ) -> Result<()> {
     let mut input = BufReader::new(io::stdin());
     let hello: zess_protocol::ClientMessage = zess_remote::read_request(&mut input)?;
-    let zess_protocol::ClientMessage::Hello { build_id } = hello else {
+    let zess_protocol::ClientMessage::Hello { version } = hello else {
         bail!("remote proxy expected hello");
     };
     zess_remote::write_request(
         &mut io::stdout().lock(),
         &zess_protocol::ServerMessage::Hello {
-            build_id: zess_build::BUILD_ID.into(),
+            version: zess_build::version().into(),
         },
     )?;
-    zess_protocol::check_build_id(&build_id)?;
+    zess_protocol::check_version(zess_build::version(), &version)?;
     let prepared = zess_remote::read_request(&mut input)
         .and_then(|request| prepare_proxy(request, &manager, filesystem.as_ref(), host.as_ref()));
     let output = match prepared {
