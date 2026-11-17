@@ -1,11 +1,19 @@
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use sha2::{Digest, Sha256};
-use zess_platform::{Cancellation, FileSystem, ProcessRunner};
+use zess_platform::{Cancellation, FileSystem, InputProgress, ProcessRunner};
 
-use crate::{ServerArtifacts, ServerTarget, SshTarget};
+use crate::{
+    ProgressReporter, RemoteProgress, RemoteStage, ServerArtifacts, ServerTarget, SshTarget,
+};
+
+#[cfg(all(test, unix))]
+mod tests;
 
 pub trait ServerBootstrap: Send + Sync {
     /// Returns a complete SSH command that starts the prepared proxy.
@@ -19,13 +27,13 @@ pub struct SshBootstrap {
 
 impl ServerBootstrap for SshBootstrap {
     fn prepare(&self, target: &SshTarget, runner: &dyn ProcessRunner) -> Result<String> {
-        let cancellation = super::ssh::Deadline::new(target);
+        target.report(RemoteProgress::Stage(RemoteStage::DetectingPlatform));
         let posix = execute(
             runner,
             target,
             "sh -c 'uname -s; uname -m'",
             None,
-            &cancellation,
+            &super::ssh::Deadline::new(target),
         );
         let platform = match &posix {
             Ok(bytes) => {
@@ -38,8 +46,8 @@ impl ServerBootstrap for SshBootstrap {
                 }
             }
             Err(_) => {
-                cancellation.check()?;
-                let output = execute(runner, target, &powershell("[Console]::WriteLine('Windows');if($env:PROCESSOR_ARCHITEW6432){[Console]::WriteLine($env:PROCESSOR_ARCHITEW6432)}else{[Console]::WriteLine($env:PROCESSOR_ARCHITECTURE)}"), None, &cancellation).context("detect remote platform")?;
+                target.check_cancellation()?;
+                let output = execute(runner, target, &powershell("[Console]::WriteLine('Windows');if($env:PROCESSOR_ARCHITEW6432){[Console]::WriteLine($env:PROCESSOR_ARCHITEW6432)}else{[Console]::WriteLine($env:PROCESSOR_ARCHITECTURE)}"), None, &super::ssh::Deadline::new(target)).context("detect remote platform")?;
                 let output = String::from_utf8_lossy(&output);
                 let mut lines = output.trim_start_matches('\u{feff}').lines();
                 match (lines.next(), lines.next()) {
@@ -53,11 +61,22 @@ impl ServerBootstrap for SshBootstrap {
             }
         };
         let remote = RemotePlatform::new(platform);
-        if execute(runner, target, &remote.check(), None, &cancellation).is_ok() {
+        target.report(RemoteProgress::Stage(RemoteStage::CheckingCache));
+        if execute(
+            runner,
+            target,
+            &remote.check(),
+            None,
+            &super::ssh::Deadline::new(target),
+        )
+        .is_ok()
+        {
             return Ok(remote.proxy());
         }
-        cancellation.check()?;
-        let artifact = self.artifacts.get(platform, &cancellation)?;
+        target.check_cancellation()?;
+        let artifact = self
+            .artifacts
+            .get(platform, target, target.progress.as_deref())?;
         ensure!(
             artifact.target == platform,
             "server artifact targets the wrong platform"
@@ -74,16 +93,36 @@ impl ServerBootstrap for SshBootstrap {
             hash == artifact.sha256.to_ascii_lowercase(),
             "local server SHA-256 mismatch"
         );
+        target.report(RemoteProgress::Stage(RemoteStage::Uploading));
+        let upload = UploadProgress {
+            reporter: target.progress.as_deref(),
+            target,
+            state: Mutex::new(UploadState {
+                last_progress: Instant::now(),
+                completed: 0,
+                finished: false,
+            }),
+        };
+        execute_upload(
+            runner,
+            target,
+            &remote.install(&hash, bytes.len()),
+            &bytes,
+            &upload,
+            &upload,
+        )
+        .context("install remote server")?;
+        if !upload.state.lock().unwrap().finished {
+            target.report(RemoteProgress::Stage(RemoteStage::Installing));
+        }
         execute(
             runner,
             target,
-            &remote.install(&hash),
-            Some(&bytes),
-            &cancellation,
+            &remote.check(),
+            None,
+            &super::ssh::Deadline::new(target),
         )
-        .context("install remote server")?;
-        execute(runner, target, &remote.check(), None, &cancellation)
-            .context("verify remote server cache")?;
+        .context("verify remote server cache")?;
         Ok(remote.proxy())
     }
 }
@@ -102,6 +141,82 @@ fn execute(
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(output.stdout)
+}
+
+struct UploadProgress<'a> {
+    reporter: Option<&'a dyn ProgressReporter>,
+    target: &'a SshTarget,
+    state: Mutex<UploadState>,
+}
+
+struct UploadState {
+    last_progress: Instant,
+    completed: u64,
+    finished: bool,
+}
+
+impl Cancellation for UploadProgress<'_> {
+    fn check(&self) -> Result<()> {
+        self.target.check_cancellation()?;
+        let state = self.state.lock().unwrap();
+        ensure!(
+            state.last_progress.elapsed() < Duration::from_secs(120),
+            if state.finished {
+                "remote server installation timed out"
+            } else {
+                "SSH server upload stalled"
+            }
+        );
+        Ok(())
+    }
+}
+
+impl InputProgress for UploadProgress<'_> {
+    fn written(&self, completed: u64, total: u64) {
+        let mut state = self.state.lock().unwrap();
+        if completed > state.completed {
+            state.completed = completed;
+            state.last_progress = Instant::now();
+        }
+        let finished = completed == total && !state.finished;
+        if finished {
+            state.finished = true;
+            state.last_progress = Instant::now();
+        }
+        drop(state);
+        if let Some(reporter) = self.reporter {
+            reporter.report(RemoteProgress::Transfer {
+                stage: RemoteStage::Uploading,
+                completed,
+                total: Some(total),
+            });
+            if finished {
+                reporter.report(RemoteProgress::Stage(RemoteStage::Installing));
+            }
+        }
+    }
+}
+
+fn execute_upload(
+    runner: &dyn ProcessRunner,
+    target: &SshTarget,
+    command: &str,
+    input: &[u8],
+    cancellation: &dyn Cancellation,
+    progress: &UploadProgress<'_>,
+) -> Result<()> {
+    let output = runner.output_with_progress(
+        &target.command(command)?,
+        Some(input),
+        cancellation,
+        progress,
+    )?;
+    ensure!(
+        output.status.success(),
+        "SSH command failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 struct RemotePlatform(ServerTarget);
@@ -130,13 +245,13 @@ impl RemotePlatform {
         self.command(&posix, &windows)
     }
 
-    fn install(&self, hash: &str) -> String {
+    fn install(&self, hash: &str, length: usize) -> String {
         let posix = format!(
-            "set -eu; umask 077; base=\"$HOME/.cache/zess/servers/{}\"; d=\"$base/current\"; mkdir -p \"$base\"; t=$(mktemp -d \"$base/install.XXXXXXXX\"); link=\"$base/.current.$$\"; trap 'rm -f \"$link\"; if [ -n \"$t\" ]; then rm -rf \"$t\"; fi' EXIT HUP INT TERM; cat > \"$t/archive.tar.gz\"; h=$(sha256sum \"$t/archive.tar.gz\"); h=${{h%% *}}; [ \"$h\" = '{hash}' ] || {{ echo 'server SHA-256 mismatch' >&2; exit 1; }}; tar -xzf \"$t/archive.tar.gz\" -C \"$t\"; rm \"$t/archive.tar.gz\"; test -x \"$t/patchelf\"; test -f \"$t/lib/ld-linux-x86-64.so.2\"; \"$t/patchelf\" --set-interpreter \"$d/lib/ld-linux-x86-64.so.2\" --set-rpath '$ORIGIN/lib' \"$t/zess\"; chmod 700 \"$t/zess\"; printf '%s' '{hash}' > \"$t/source.sha256\"; (cd \"$t\"; sha256sum zess lib/* > installed.sha256); ln -s \"$t\" \"$link\"; mv -Tf \"$link\" \"$d\"; t=''",
+            "set -eu; umask 077; base=\"$HOME/.cache/zess/servers/{}\"; d=\"$base/current\"; mkdir -p \"$base\"; t=$(mktemp -d \"$base/install.XXXXXXXX\"); link=\"$base/.current.$$\"; trap 'rm -f \"$link\"; if [ -n \"$t\" ]; then rm -rf \"$t\"; fi' EXIT; trap 'exit 1' HUP INT TERM; head -c {length} > \"$t/archive.tar.gz\"; test \"$(wc -c < \"$t/archive.tar.gz\")\" -eq {length} || {{ echo 'server upload truncated' >&2; exit 1; }}; h=$(sha256sum \"$t/archive.tar.gz\"); h=${{h%% *}}; [ \"$h\" = '{hash}' ] || {{ echo 'server SHA-256 mismatch' >&2; exit 1; }}; tar -xzf \"$t/archive.tar.gz\" -C \"$t\"; rm \"$t/archive.tar.gz\"; test -x \"$t/patchelf\"; test -f \"$t/lib/ld-linux-x86-64.so.2\"; \"$t/patchelf\" --set-interpreter \"$d/lib/ld-linux-x86-64.so.2\" --set-rpath '$ORIGIN/lib' \"$t/zess\"; chmod 700 \"$t/zess\"; printf '%s' '{hash}' > \"$t/source.sha256\"; (cd \"$t\"; sha256sum zess lib/* > installed.sha256); ln -s \"$t\" \"$link\"; mv -Tf \"$link\" \"$d\"; t=''",
             zess_build::BUILD_ID
         );
         let windows = format!(
-            "$ErrorActionPreference='Stop';{} [IO.Directory]::CreateDirectory($d)>$null;$t=Join-Path $d ([Guid]::NewGuid().ToString()+'.tmp');try{{$f=[IO.File]::Create($t);try{{[Console]::OpenStandardInput().CopyTo($f)}}finally{{$f.Dispose()}};if((Get-FileHash -Algorithm SHA256 -LiteralPath $t).Hash.ToLowerInvariant() -ne '{hash}'){{throw 'server SHA-256 mismatch'}};$dest=Join-Path $d 'zess.exe';if(Test-Path -LiteralPath $dest){{[IO.File]::Replace($t,$dest,[NullString]::Value)}}else{{[IO.File]::Move($t,$dest)}};[IO.File]::WriteAllText((Join-Path $d 'sha256'),'{hash}')}}catch{{[Console]::Error.WriteLine($_);exit 1}}finally{{if(Test-Path -LiteralPath $t){{Remove-Item -LiteralPath $t -Force}}}}",
+            "$ErrorActionPreference='Stop';{} [IO.Directory]::CreateDirectory($d)>$null;$t=Join-Path $d ([Guid]::NewGuid().ToString()+'.tmp');try{{$f=[IO.File]::Create($t);try{{$source=[Console]::OpenStandardInput();$remaining=[long]{length};$buffer=New-Object byte[] 65536;while($remaining -gt 0){{$n=$source.Read($buffer,0,[int][Math]::Min($buffer.Length,$remaining));if($n -eq 0){{throw 'server upload truncated'}};$f.Write($buffer,0,$n);$remaining-=$n}}}}finally{{$f.Dispose()}};if((Get-FileHash -Algorithm SHA256 -LiteralPath $t).Hash.ToLowerInvariant() -ne '{hash}'){{throw 'server SHA-256 mismatch'}};$dest=Join-Path $d 'zess.exe';if(Test-Path -LiteralPath $dest){{[IO.File]::Replace($t,$dest,[NullString]::Value)}}else{{[IO.File]::Move($t,$dest)}};[IO.File]::WriteAllText((Join-Path $d 'sha256'),'{hash}')}}catch{{[Console]::Error.WriteLine($_);exit 1}}finally{{if(Test-Path -LiteralPath $t){{Remove-Item -LiteralPath $t -Force}}}}",
             windows_dir()
         );
         self.command(&posix, &windows)

@@ -28,6 +28,10 @@ impl From<PathBuf> for SocketPath {
 }
 
 impl SocketPath {
+    pub fn private(path: PathBuf) -> Self {
+        Self(path)
+    }
+
     pub fn server_id(&self) -> Option<ServerId> {
         self.0.file_stem()?.to_str()?.parse().ok()
     }
