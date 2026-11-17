@@ -121,6 +121,45 @@ fn conflicting_ssh_addresses_are_rejected_before_connecting() -> Result<()> {
 }
 
 #[test]
+fn stop_and_restart_reject_ambiguous_targets_before_connecting() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    for (command, args, expected) in [
+        ("stop", vec!["first", "second"], "select a session once"),
+        ("restart", vec!["first", "second"], "select a session once"),
+        (
+            "stop",
+            vec!["first", "--session", "second"],
+            "select a session once",
+        ),
+        (
+            "restart",
+            vec!["--session", "first", "--session", "second"],
+            "select a session once",
+        ),
+        (
+            "stop",
+            vec!["first", "--remote-workspace", "/other"],
+            "usage: zess session stop",
+        ),
+        (
+            "stop",
+            vec!["--workspace", "/one", "--remote-workspace", "/two"],
+            "conflicts",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_zess"))
+            .args(["session", command, "--ssh", "test.invalid", "--force"])
+            .args(args)
+            .env("PATH", directory.path())
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+    Ok(())
+}
+
+#[test]
 fn an_ssh_address_after_double_dash_remains_a_positional_argument() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let output = Command::new(env!("CARGO_BIN_EXE_zess"))
