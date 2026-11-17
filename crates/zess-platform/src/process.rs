@@ -105,6 +105,11 @@ impl Cancellation for CancellationToken {
     }
 }
 
+/// Reports bytes successfully written to a child's standard input.
+pub trait InputProgress: Send + Sync {
+    fn written(&self, completed: u64, total: u64);
+}
+
 pub trait ProcessRunner: Send + Sync {
     /// Returns an environment value inherited by this runner's commands.
     fn environment(&self, _name: &OsStr) -> Option<OsString> {
@@ -117,6 +122,15 @@ pub trait ProcessRunner: Send + Sync {
         input: Option<&[u8]>,
         cancellation: &dyn Cancellation,
     ) -> Result<Output>;
+    fn output_with_progress(
+        &self,
+        spec: &ProcessSpec,
+        input: Option<&[u8]>,
+        cancellation: &dyn Cancellation,
+        _progress: &dyn InputProgress,
+    ) -> Result<Output> {
+        self.output(spec, input, cancellation)
+    }
     fn spawn(&self, spec: &ProcessSpec) -> Result<OwnedProcess>;
 }
 
@@ -135,7 +149,25 @@ impl ProcessRunner for SystemProcessRunner {
     ) -> Result<Output> {
         cancellation.check()?;
         let child = OwnedProcess::spawn(spec, input.is_some())?;
-        collect_output(child, input, cancellation, spec.output_limit)
+        collect_output(child, input, cancellation, spec.output_limit, None)
+    }
+
+    fn output_with_progress(
+        &self,
+        spec: &ProcessSpec,
+        input: Option<&[u8]>,
+        cancellation: &dyn Cancellation,
+        progress: &dyn InputProgress,
+    ) -> Result<Output> {
+        cancellation.check()?;
+        let child = OwnedProcess::spawn(spec, input.is_some())?;
+        collect_output(
+            child,
+            input,
+            cancellation,
+            spec.output_limit,
+            Some(progress),
+        )
     }
 
     fn spawn(&self, spec: &ProcessSpec) -> Result<OwnedProcess> {
@@ -148,6 +180,7 @@ fn collect_output(
     input: Option<&[u8]>,
     cancellation: &dyn Cancellation,
     output_limit: Option<usize>,
+    progress: Option<&dyn InputProgress>,
 ) -> Result<Output> {
     thread::scope(|scope| {
         // The process guard must drop before the scope waits for pipe workers.
@@ -157,7 +190,35 @@ fn collect_output(
             Some(
                 thread::Builder::new()
                     .name("zess-process-stdin".into())
-                    .spawn_scoped(scope, move || stdin.write_all(input))?,
+                    .spawn_scoped(scope, move || {
+                        let total = input.len() as u64;
+                        let mut completed = 0;
+                        if let Some(progress) = progress {
+                            progress.written(completed, total);
+                        }
+                        for mut chunk in input.chunks(64 * 1024) {
+                            while !chunk.is_empty() {
+                                match stdin.write(chunk) {
+                                    Ok(0) => {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::WriteZero,
+                                            "process input closed before all bytes were written",
+                                        ));
+                                    }
+                                    Ok(count) => {
+                                        chunk = &chunk[count..];
+                                        completed += count as u64;
+                                        if let Some(progress) = progress {
+                                            progress.written(completed, total);
+                                        }
+                                    }
+                                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                        }
+                        Ok(())
+                    })?,
             )
         } else {
             drop(child.take_stdin());
@@ -285,8 +346,13 @@ impl ProcessJob {
         let worker = thread::Builder::new()
             .name("zess-process-job".into())
             .spawn(move || {
-                let output =
-                    collect_output(child, input.as_deref(), &cancellation, Some(output_limit));
+                let output = collect_output(
+                    child,
+                    input.as_deref(),
+                    &cancellation,
+                    Some(output_limit),
+                    None,
+                );
                 let _ = sender.send(output);
             })?;
         Ok(Self {
