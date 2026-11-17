@@ -51,14 +51,8 @@ fn attaching_a_remote_session_uses_the_managers_ipc_route() -> Result<()> {
         let mut peer = listener.accept()?;
         peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
         let mut input = BufReader::new(peer.try_clone()?);
-        let _: zess_protocol::ClientMessage = zess_remote::read_request(&mut input)?;
-        zess_remote::write_request(
-            &mut peer,
-            &zess_protocol::ServerMessage::Hello {
-                build_id: zess_build::BUILD_ID.into(),
-            },
-        )?;
-        let _: zess_protocol::ClientMessage = zess_remote::read_request(&mut input)?;
+        let request: zess_protocol::ClientMessage = zess_remote::read_request(&mut input)?;
+        assert!(matches!(request, zess_protocol::ClientMessage::Status));
         zess_remote::write_request(
             &mut peer,
             &zess_protocol::ServerMessage::Status {
