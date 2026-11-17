@@ -95,7 +95,7 @@ fn matching_release_is_cached_for_the_selected_target() {
     let (_directory, release, provider) = fixture(zess_build::BUILD_ID, expected);
     let cancellation = CancellationToken::new();
     let artifact = provider
-        .get(ServerTarget::WindowsX86_64, &cancellation)
+        .get(ServerTarget::WindowsX86_64, &cancellation, None)
         .unwrap();
     assert_eq!(artifact.sha256, expected);
     assert_eq!(std::fs::read(&artifact.path).unwrap(), b"server executable");
@@ -111,7 +111,7 @@ fn matching_release_is_cached_for_the_selected_target() {
     assert!(calls[1].ends_with("/zess-server-x86_64-pc-windows-msvc.exe"));
     drop(calls);
     provider
-        .get(ServerTarget::WindowsX86_64, &cancellation)
+        .get(ServerTarget::WindowsX86_64, &cancellation, None)
         .unwrap();
     assert_eq!(release.calls.lock().unwrap().len(), 2);
 }
@@ -120,7 +120,7 @@ fn matching_release_is_cached_for_the_selected_target() {
 fn linux_release_archive_is_selected_and_verified() {
     let (_directory, release, provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
     let artifact = provider
-        .get(ServerTarget::LinuxX86_64, &CancellationToken::new())
+        .get(ServerTarget::LinuxX86_64, &CancellationToken::new(), None)
         .unwrap();
     assert_eq!(artifact.sha256, SERVER_SHA256);
     assert_eq!(std::fs::read(artifact.path).unwrap(), b"server executable");
@@ -134,7 +134,7 @@ fn release_with_another_build_id_is_rejected_before_download() {
     let (_directory, release, provider) = fixture("another-build", SERVER_SHA256);
     assert!(
         provider
-            .get(ServerTarget::WindowsX86_64, &CancellationToken::new())
+            .get(ServerTarget::WindowsX86_64, &CancellationToken::new(), None)
             .is_err()
     );
     assert_eq!(release.calls.lock().unwrap().len(), 1);
@@ -145,11 +145,11 @@ fn corrupted_cached_binary_is_downloaded_again() {
     let (_directory, release, provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
     let cancellation = CancellationToken::new();
     let artifact = provider
-        .get(ServerTarget::WindowsX86_64, &cancellation)
+        .get(ServerTarget::WindowsX86_64, &cancellation, None)
         .unwrap();
     std::fs::write(&artifact.path, b"corrupt").unwrap();
     let artifact = provider
-        .get(ServerTarget::WindowsX86_64, &cancellation)
+        .get(ServerTarget::WindowsX86_64, &cancellation, None)
         .unwrap();
     assert_eq!(std::fs::read(artifact.path).unwrap(), b"server executable");
     assert_eq!(release.calls.lock().unwrap().len(), 4);
@@ -197,7 +197,7 @@ fn cancellation_during_download_stops_before_publishing() {
         })
         .build()
         .into();
-    let error = match provider.get(ServerTarget::WindowsX86_64, &cancellation) {
+    let error = match provider.get(ServerTarget::WindowsX86_64, &cancellation, None) {
         Ok(_) => panic!("cancelled download succeeded"),
         Err(error) => error,
     };
@@ -210,8 +210,191 @@ fn wrong_hash_is_not_published_to_the_cache() {
     let (directory, _, provider) = fixture(zess_build::BUILD_ID, &"0".repeat(64));
     assert!(
         provider
-            .get(ServerTarget::WindowsX86_64, &CancellationToken::new())
+            .get(ServerTarget::WindowsX86_64, &CancellationToken::new(), None)
             .is_err()
     );
     assert!(!directory.path().join("zess/servers").exists());
+}
+
+#[test]
+fn cancelling_a_blocked_download_returns_without_publishing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct Reporter(Mutex<Vec<RemoteProgress>>);
+    impl ProgressReporter for Reporter {
+        fn report(&self, event: RemoteProgress) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    struct BlockingReader {
+        started: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        reads: Arc<AtomicUsize>,
+        dropped: mpsc::Sender<()>,
+    }
+    impl Drop for BlockingReader {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(());
+        }
+    }
+    impl Read for BlockingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let _ = self.started.send(());
+            let _ = self.release.lock().unwrap().recv();
+            buffer[0] = b'x';
+            Ok(1)
+        }
+    }
+    struct BlockingMiddleware {
+        reader: Mutex<Option<BlockingReader>>,
+    }
+    impl ureq::middleware::Middleware for BlockingMiddleware {
+        fn handle(
+            &self,
+            _: ureq::http::Request<ureq::SendBody>,
+            _: ureq::middleware::MiddlewareNext,
+        ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+            Ok(ureq::http::Response::new(
+                ureq::Body::builder().reader(self.reader.lock().unwrap().take().unwrap()),
+            ))
+        }
+    }
+
+    let (directory, _, mut provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    let cancellation = CancellationToken::new();
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::channel();
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+    let reads = Arc::new(AtomicUsize::new(0));
+    provider.agent = ureq::Agent::config_builder()
+        .middleware(BlockingMiddleware {
+            reader: Mutex::new(Some(BlockingReader {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+                reads: reads.clone(),
+                dropped: dropped_tx,
+            })),
+        })
+        .build()
+        .into();
+    let token = cancellation.clone();
+    let reporter = Arc::new(Reporter(Mutex::new(Vec::new())));
+    let worker_reporter = reporter.clone();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = provider.get(
+            ServerTarget::WindowsX86_64,
+            &token,
+            Some(worker_reporter.as_ref()),
+        );
+        finished_tx
+            .send(result.err().map(|error| error.to_string()))
+            .unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    cancellation.cancel();
+    assert_eq!(
+        finished_rx
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap(),
+        Some("operation was cancelled".to_owned())
+    );
+    assert!(!directory.path().join("zess/servers").exists());
+    release_tx.send(()).unwrap();
+    dropped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    assert!(
+        !reporter
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, RemoteProgress::Transfer { .. }))
+    );
+}
+
+#[test]
+fn download_progress_reports_bytes_and_known_length() {
+    struct Reporter(Mutex<Vec<RemoteProgress>>);
+    impl ProgressReporter for Reporter {
+        fn report(&self, event: RemoteProgress) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    struct LengthMiddleware(Arc<ReleaseFixture>);
+    impl ureq::middleware::Middleware for LengthMiddleware {
+        fn handle(
+            &self,
+            request: ureq::http::Request<ureq::SendBody>,
+            _: ureq::middleware::MiddlewareNext,
+        ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+            let bytes = if request.uri().path().ends_with("manifest.json") {
+                self.0.manifest.clone()
+            } else {
+                self.0.binary.clone()
+            };
+            Ok(ureq::http::Response::builder()
+                .header("content-length", bytes.len())
+                .body(ureq::Body::builder().data(bytes))
+                .unwrap())
+        }
+    }
+    let (_directory, release, mut provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    provider.agent = ureq::Agent::config_builder()
+        .middleware(LengthMiddleware(release))
+        .build()
+        .into();
+    let reporter = Reporter(Mutex::new(Vec::new()));
+    provider
+        .get(
+            ServerTarget::WindowsX86_64,
+            &CancellationToken::new(),
+            Some(&reporter),
+        )
+        .unwrap();
+    assert!(
+        reporter
+            .0
+            .lock()
+            .unwrap()
+            .contains(&RemoteProgress::Transfer {
+                stage: RemoteStage::Downloading,
+                completed: b"server executable".len() as u64,
+                total: Some(b"server executable".len() as u64),
+            })
+    );
+}
+
+#[test]
+fn download_progress_preserves_an_unknown_length() {
+    struct Reporter(Mutex<Vec<RemoteProgress>>);
+    impl ProgressReporter for Reporter {
+        fn report(&self, event: RemoteProgress) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    let (_directory, _, provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    let reporter = Reporter(Mutex::new(Vec::new()));
+    provider
+        .get(
+            ServerTarget::WindowsX86_64,
+            &CancellationToken::new(),
+            Some(&reporter),
+        )
+        .unwrap();
+    assert!(
+        reporter
+            .0
+            .lock()
+            .unwrap()
+            .contains(&RemoteProgress::Transfer {
+                stage: RemoteStage::Downloading,
+                completed: b"server executable".len() as u64,
+                total: None,
+            })
+    );
 }

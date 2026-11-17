@@ -1,14 +1,20 @@
 mod artifact;
+mod askpass;
 mod bootstrap;
 mod connection;
+mod progress;
 mod ssh;
 
 #[cfg(test)]
 mod tests;
 
 pub use artifact::{GithubReleaseArtifacts, ServerArtifact, ServerArtifacts, ServerTarget};
+pub use askpass::{
+    AskpassBroker, AskpassConfig, SshPrompt, SshPromptHandler, SshPromptKind, run_askpass,
+};
 pub use bootstrap::{ServerBootstrap, SshBootstrap};
 pub use connection::SshConnection;
+pub use progress::{ProgressReporter, RemoteProgress, RemoteStage};
 pub use ssh::{Connector, SshConnector, SshTarget};
 
 use std::io::{BufRead, Write};
