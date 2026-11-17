@@ -25,9 +25,7 @@ jobs:
           submodules: recursive
       - name: Install Rust toolchain
         shell: bash
-        run: |
-          rustup toolchain install nightly-2026-11-14 --profile minimal --target "${{ matrix.target }}"
-          rustup default nightly-2026-11-14
+        run: bash scripts/server-build.sh prepare '${{ matrix.target }}'
       - name: Test Windows console mode restoration
         if: runner.os == 'Windows'
         run: cargo test --locked --release --target x86_64-pc-windows-msvc -p zess-platform --lib console::tests -- --nocapture
@@ -36,23 +34,16 @@ jobs:
         run: cargo test --locked --release --target x86_64-pc-windows-msvc -p zess-terminal --lib terminal::tests::windows -- --nocapture
       - name: Build Linux server
         if: runner.os == 'Linux'
-        run: cargo build --locked --release --bin zess --target "${{ matrix.target }}"
+        run: bash scripts/server-build.sh build '${{ matrix.target }}'
       - name: Build Windows server
         if: runner.os == 'Windows'
-        run: cargo build --locked --release --bin zess --target "${{ matrix.target }}"
+        shell: bash
+        run: bash scripts/server-build.sh build '${{ matrix.target }}'
       - name: Package Linux server
         if: runner.os == 'Linux'
-        env:
-          ZESS_DEBIAN_LICENSES: '1'
         run: |
           set -euo pipefail
-          mkdir -p patchelf licenses
-          curl -fsSL https://github.com/NixOS/patchelf/releases/download/0.19.3/patchelf-0.19.3-x86_64.tar.gz | tar -xz -C patchelf
-          curl -fsSL https://raw.githubusercontent.com/NixOS/patchelf/0.19.3/COPYING -o licenses/patchelf-GPL-3.0
-          curl -fsSL https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT -o licenses/musl-COPYRIGHT
-          cp /usr/share/doc/libc6/copyright licenses/glibc-copyright
-          cp /usr/share/doc/libgcc-s1/copyright licenses/gcc-copyright
-          python scripts/server-release.py package '${{ matrix.target }}' '${{ matrix.binary }}' dist patchelf/bin/patchelf licenses
+          bash scripts/server-build.sh package '${{ matrix.target }}' '${{ matrix.binary }}'
           mkdir smoke
           tar -xzf dist/zess-server-x86_64-unknown-linux-gnu.tar.gz -C smoke
           smoke/patchelf --set-interpreter "$PWD/smoke/lib/ld-linux-x86-64.so.2" --set-rpath "\$ORIGIN/lib" smoke/zess
@@ -60,7 +51,7 @@ jobs:
       - name: Package Windows server
         if: runner.os == 'Windows'
         shell: bash
-        run: python scripts/server-release.py package '${{ matrix.target }}' '${{ matrix.binary }}' dist
+        run: bash scripts/server-build.sh package '${{ matrix.target }}' '${{ matrix.binary }}'
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.target }}
