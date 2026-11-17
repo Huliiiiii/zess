@@ -180,11 +180,9 @@ pub fn run() -> Result<()> {
                 return Ok(());
             }
             "--version" | "-V" => {
-                println!(
-                    "zess {} (build {})",
-                    env!("CARGO_PKG_VERSION"),
-                    zess_build::BUILD_ID
-                );
+                let version = zess_build::RELEASE_VERSION
+                    .unwrap_or(concat!(env!("CARGO_PKG_VERSION"), "-dev"));
+                println!("zess {version}");
                 return Ok(());
             }
             "--json" => json = true,
@@ -674,7 +672,7 @@ pub fn run() -> Result<()> {
                 [session] => session,
                 _ => select_session(&sessions)?,
             };
-            zess_protocol::check_build_id(&session.build_id)?;
+            zess_protocol::check_version(zess_build::version(), &session.version)?;
             LocalSessionTarget::Session {
                 endpoint: SocketPath::from(PathBuf::from(&session.endpoint)),
                 id: session.session_id.clone(),
@@ -728,14 +726,14 @@ fn default_config(filesystem: &dyn FileSystem, host: &dyn Platform) -> Option<Pa
 }
 
 fn print_sessions(sessions: &[server::SessionInfo]) {
-    println!("NAME\tID\tSESSION\tBUILD\tPID\tCLIENT\tMODIFIED\tWORKSPACE");
+    println!("NAME\tID\tSESSION\tVERSION\tPID\tCLIENT\tMODIFIED\tWORKSPACE");
     for session in sessions {
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             session.name.as_deref().unwrap_or("-"),
             session.id,
             session.session_id.0,
-            session.build_id,
+            session.version,
             session.pid,
             if session.attached {
                 "attached"

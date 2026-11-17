@@ -6,6 +6,7 @@ use zess_platform::{CancellationToken, HostInfo, NativeFileSystem, NativePlatfor
 
 use super::*;
 
+const TEST_VERSION: &str = "0.1.0-dev.42";
 const SERVER_SHA256: &str = "49ef64922d20ae181f0ace1d4e9d738cc5c000611b56004a8ed9d83a77c11173";
 
 struct TestPlatform(PathBuf);
@@ -62,13 +63,13 @@ impl ureq::middleware::Middleware for FixtureMiddleware {
 }
 
 fn fixture(
-    build_id: &str,
+    version: &str,
     expected_hash: &str,
 ) -> (TempDir, Arc<ReleaseFixture>, GithubReleaseArtifacts) {
     let directory = tempfile::tempdir().unwrap();
     let release = Arc::new(ReleaseFixture {
         manifest: serde_json::to_vec(&json!({
-            "build_id": build_id,
+            "version": version,
             "artifacts": [
                 { "target": "x86_64-unknown-linux-gnu", "file": "zess-server-x86_64-unknown-linux-gnu.tar.gz", "sha256": SERVER_SHA256 },
                 { "target": "x86_64-pc-windows-msvc", "file": "zess-server-x86_64-pc-windows-msvc.exe", "sha256": expected_hash }
@@ -82,6 +83,7 @@ fn fixture(
         Arc::new(NativeFileSystem),
         Arc::new(TestPlatform(directory.path().to_owned())),
     );
+    provider.release_version = Some(TEST_VERSION);
     provider.agent = ureq::Agent::config_builder()
         .middleware(FixtureMiddleware(release.clone()))
         .build()
@@ -90,9 +92,18 @@ fn fixture(
 }
 
 #[test]
+fn a_development_build_without_a_release_does_not_request_assets() {
+    let (_directory, release, mut provider) = fixture(TEST_VERSION, SERVER_SHA256);
+    provider.release_version = None;
+    let error = provider.get(ServerTarget::LinuxX86_64, &CancellationToken::new(), None);
+    assert!(matches!(error, Err(error) if error.to_string().contains("has no published server")));
+    assert!(release.calls.lock().unwrap().is_empty());
+}
+
+#[test]
 fn matching_release_is_cached_for_the_selected_target() {
     let expected = SERVER_SHA256;
-    let (_directory, release, provider) = fixture(zess_build::BUILD_ID, expected);
+    let (_directory, release, provider) = fixture(TEST_VERSION, expected);
     let cancellation = CancellationToken::new();
     let artifact = provider
         .get(ServerTarget::WindowsX86_64, &cancellation, None)
@@ -104,8 +115,8 @@ fn matching_release_is_cached_for_the_selected_target() {
     assert_eq!(
         calls[0],
         format!(
-            "https://github.com/owner/repo/releases/download/build-{}/manifest.json",
-            zess_build::BUILD_ID
+            "https://github.com/owner/repo/releases/download/v{}/manifest.json",
+            TEST_VERSION
         )
     );
     assert!(calls[1].ends_with("/zess-server-x86_64-pc-windows-msvc.exe"));
@@ -118,7 +129,7 @@ fn matching_release_is_cached_for_the_selected_target() {
 
 #[test]
 fn linux_release_archive_is_selected_and_verified() {
-    let (_directory, release, provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    let (_directory, release, provider) = fixture(TEST_VERSION, SERVER_SHA256);
     let artifact = provider
         .get(ServerTarget::LinuxX86_64, &CancellationToken::new(), None)
         .unwrap();
@@ -130,8 +141,8 @@ fn linux_release_archive_is_selected_and_verified() {
 }
 
 #[test]
-fn release_with_another_build_id_is_rejected_before_download() {
-    let (_directory, release, provider) = fixture("another-build", SERVER_SHA256);
+fn release_with_another_version_is_rejected_before_download() {
+    let (_directory, release, provider) = fixture("0.1.0-dev.43", SERVER_SHA256);
     assert!(
         provider
             .get(ServerTarget::WindowsX86_64, &CancellationToken::new(), None)
@@ -142,7 +153,7 @@ fn release_with_another_build_id_is_rejected_before_download() {
 
 #[test]
 fn corrupted_cached_binary_is_downloaded_again() {
-    let (_directory, release, provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    let (_directory, release, provider) = fixture(TEST_VERSION, SERVER_SHA256);
     let cancellation = CancellationToken::new();
     let artifact = provider
         .get(ServerTarget::WindowsX86_64, &cancellation, None)
@@ -188,7 +199,7 @@ fn cancellation_during_download_stops_before_publishing() {
         }
     }
 
-    let (directory, release, mut provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    let (directory, release, mut provider) = fixture(TEST_VERSION, SERVER_SHA256);
     let cancellation = CancellationToken::new();
     provider.agent = ureq::Agent::config_builder()
         .middleware(CancelMiddleware {
@@ -207,7 +218,7 @@ fn cancellation_during_download_stops_before_publishing() {
 
 #[test]
 fn wrong_hash_is_not_published_to_the_cache() {
-    let (directory, _, provider) = fixture(zess_build::BUILD_ID, &"0".repeat(64));
+    let (directory, _, provider) = fixture(TEST_VERSION, &"0".repeat(64));
     assert!(
         provider
             .get(ServerTarget::WindowsX86_64, &CancellationToken::new(), None)
@@ -264,7 +275,7 @@ fn cancelling_a_blocked_download_returns_without_publishing() {
         }
     }
 
-    let (directory, _, mut provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    let (directory, _, mut provider) = fixture(TEST_VERSION, SERVER_SHA256);
     let cancellation = CancellationToken::new();
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::channel();
@@ -343,7 +354,7 @@ fn download_progress_reports_bytes_and_known_length() {
                 .unwrap())
         }
     }
-    let (_directory, release, mut provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    let (_directory, release, mut provider) = fixture(TEST_VERSION, SERVER_SHA256);
     provider.agent = ureq::Agent::config_builder()
         .middleware(LengthMiddleware(release))
         .build()
@@ -377,7 +388,7 @@ fn download_progress_preserves_an_unknown_length() {
             self.0.lock().unwrap().push(event);
         }
     }
-    let (_directory, _, provider) = fixture(zess_build::BUILD_ID, SERVER_SHA256);
+    let (_directory, _, provider) = fixture(TEST_VERSION, SERVER_SHA256);
     let reporter = Reporter(Mutex::new(Vec::new()));
     provider
         .get(

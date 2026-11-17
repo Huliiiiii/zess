@@ -73,7 +73,7 @@ fn wait_for_exit(child: &mut std::process::Child) {
 }
 
 fn installs(home: &std::path::Path) -> std::path::PathBuf {
-    home.join(".cache/zess/servers").join(zess_build::BUILD_ID)
+    home.join(".cache/zess/servers").join(zess_build::version())
 }
 
 #[test]

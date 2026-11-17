@@ -419,7 +419,7 @@ fn a_limit_sized_message_and_the_next_message_can_share_a_socket_read() {
     let mut peer = listener.accept().unwrap();
     peer.write_all(
         &framing::encode(&ServerMessage::Hello {
-            build_id: zess_build::BUILD_ID.into(),
+            version: zess_build::version().into(),
         })
         .unwrap(),
     )

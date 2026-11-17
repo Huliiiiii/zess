@@ -2,12 +2,41 @@ name: Server release
 
 on:
   workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        type: choice
+        options:
+          - preview
+          - stable
+        default: preview
 
 permissions:
   contents: read
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Set release version
+        id: version
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [ "$CHANNEL" = preview ]; then
+            version="$version-dev.$GITHUB_RUN_NUMBER"
+          fi
+          echo "release=$version" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: version
+    env:
+      ZESS_RELEASE_VERSION: ${{ needs.version.outputs.release }}
     strategy:
       fail-fast: false
       matrix:
@@ -74,7 +103,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -87,15 +116,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          ZESS_RELEASE_VERSION: ${{ needs.version.outputs.release }}
+          CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
-          build_id=$(python scripts/server-release.py manifest artifacts release)
-          tag="build-$build_id"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            mkdir existing
-            gh release download "$tag" --dir existing
-            python scripts/server-release.py verify existing "$build_id"
-            echo "Release $tag already contains verified artifacts."
-          else
-            gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes '' release/*
+          python3 scripts/server-release.py manifest artifacts release "$ZESS_RELEASE_VERSION"
+          tag="v$ZESS_RELEASE_VERSION"
+          flags=()
+          if [ "$CHANNEL" = preview ]; then
+            flags+=(--prerelease)
           fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes '' "${flags[@]}" release/*

@@ -61,7 +61,7 @@ printf '%s\n' '{"status":"failed","message":"fixture stop"}'
         ("ssh://[::1]:2200/work", "::1", None, Some("2200"), "/work"),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_zess"))
-            .arg(uri)
+            .args(["session", "new", uri])
             .env("PATH", directory.path())
             .env("ZESS_CAPTURE", &capture)
             .output()?;
@@ -181,6 +181,10 @@ fn a_disconnected_proxy_leaves_the_workspace_available_for_a_fresh_attach() -> R
         std::fs::create_dir(path)?;
     }
     let binary = Path::new(env!("CARGO_BIN_EXE_zess"));
+    let version = match zess_build::RELEASE_VERSION {
+        Some(version) => version.to_owned(),
+        None => zess_build::development_version(binary)?,
+    };
     let command = || {
         let mut command = Command::new(binary);
         command
@@ -209,13 +213,11 @@ fn a_disconnected_proxy_leaves_the_workspace_available_for_a_fresh_attach() -> R
         zess_remote::write_request(
             &mut input,
             &ClientMessage::Hello {
-                build_id: zess_build::BUILD_ID.into(),
+                version: version.clone(),
             },
         )?;
         let hello: ServerMessage = zess_remote::read_request(&mut output)?;
-        ensure!(
-            matches!(hello, ServerMessage::Hello { build_id } if build_id == zess_build::BUILD_ID)
-        );
+        ensure!(matches!(hello, ServerMessage::Hello { version: peer } if peer == version));
         let operation = ProxyOperation::Attach {
             workspace: workspace.to_str().unwrap().to_owned(),
             files: Vec::new(),
@@ -259,13 +261,11 @@ fn a_disconnected_proxy_leaves_the_workspace_available_for_a_fresh_attach() -> R
         zess_remote::write_request(
             &mut input,
             &ClientMessage::Hello {
-                build_id: zess_build::BUILD_ID.into(),
+                version: version.clone(),
             },
         )?;
         let hello: ServerMessage = zess_remote::read_request(&mut output)?;
-        ensure!(
-            matches!(hello, ServerMessage::Hello { build_id } if build_id == zess_build::BUILD_ID)
-        );
+        ensure!(matches!(hello, ServerMessage::Hello { version: peer } if peer == version));
         zess_remote::write_request(
             &mut input,
             &ClientMessage::Attach {
@@ -318,6 +318,10 @@ struct RemoteSession {
 
 impl RemoteSession {
     fn new() -> Result<Self> {
+        ensure!(
+            zess_build::RELEASE_VERSION.is_some(),
+            "build the SSH test harness and its client and server with the same ZESS_RELEASE_VERSION"
+        );
         let directory = tempfile::Builder::new()
             .prefix("zess-ssh-sessions-")
             .tempdir()?;
@@ -398,15 +402,15 @@ impl RemoteSession {
         zess_remote::write_request(
             &mut connection,
             &zess_protocol::ClientMessage::Hello {
-                build_id: zess_build::BUILD_ID.into(),
+                version: zess_build::version().into(),
             },
         )?;
         let hello: zess_protocol::ServerMessage =
             zess_remote::read_request(&mut io::BufReader::new(&mut connection))?;
-        let zess_protocol::ServerMessage::Hello { build_id } = hello else {
+        let zess_protocol::ServerMessage::Hello { version } = hello else {
             anyhow::bail!("missing server hello")
         };
-        zess_protocol::check_build_id(&build_id)?;
+        zess_protocol::check_version(zess_build::version(), &version)?;
         connection.set_nonblocking(true)?;
         Ok(RemoteWire {
             connection,

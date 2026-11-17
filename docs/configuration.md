@@ -65,7 +65,11 @@ zess session attach --ssh my-host --session SESSION_ID
 
 SSH 地址接受 `ssh://[USER@]HOST[:PORT]/WORKSPACE`，HOST 可以是 SSH 配置别名。路径含空格时请为整个地址加引号。也可使用 `--ssh HOST --remote-workspace PATH`；两种方式使用本机 `ssh` 及其有效配置、known_hosts 和认证方式。主机密钥的确认与拒绝取决于该配置中的 [`StrictHostKeyChecking`](https://man.openbsd.org/ssh_config#StrictHostKeyChecking) 等选项。可用 `--ssh-config`、`--ssh-identity`、`--ssh-user`、`--ssh-port` 和 `--ssh-jump` 指定连接参数。远端登录和 shell 启动脚本不得向标准输出打印 banner。远端 workspace 默认是 `.`，文件参数和 `--config` 指向远端路径。
 
-Zess 自动探测远端平台，并在远端用户缓存中准备与客户端 Build ID 匹配的服务端。发布产物由本机通过 HTTPS 下载，再通过 SSH 上传；已校验的远端缓存可直接复用。支持 Linux x86-64 和 Windows x86-64；客户端不会自动更新。
+Zess 自动探测远端平台，并在远端用户缓存中准备与客户端完整版本匹配的服务端。发布产物由本机通过 HTTPS 下载，再通过 SSH 上传；已校验的远端缓存可直接复用。支持 Linux x86-64 和 Windows x86-64；客户端不会自动更新。
+
+可通过 Server release 工作流发布配对产物。预览版使用类似 `0.1.0-dev.42` 的版本，正式版使用 Cargo 工作区版本。
+用该发布的客户端执行同一条 SSH 命令即可部署对应的远端服务端。
+直接运行 `cargo run` 生成的本地开发版没有对应的线上发布包。
 
 在 SSH 会话中，输入、选区和剪贴板由本地客户端处理。文本修改同步到远端 Session，保存写入远端文件，Git 命令在远端工作区执行。SSH 的连接选项参见 [OpenSSH ssh 手册](https://man.openbsd.org/ssh) 和 [ssh_config 手册](https://man.openbsd.org/ssh_config)。
 

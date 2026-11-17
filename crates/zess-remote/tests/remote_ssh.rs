@@ -113,7 +113,7 @@ impl SshFixture {
         )?;
         let binary = root.join("zess");
         let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
-            build_id: zess_build::BUILD_ID.into(),
+            version: zess_build::version().into(),
         })?;
         let script = format!(
             "#!/bin/sh\nset -eu\n[ \"$1\" = remote-proxy ]\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"session_id\":null}}'\nprintf '%s\\n' \"$request\"\nexec cat\n"
@@ -230,7 +230,7 @@ fn cancelling_a_connection_interrupts_the_remote_ready_wait() -> Result<()> {
     let fixture = SshFixture::new()?;
     let marker = fixture.directory.path().join("waiting-for-ready");
     let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
-        build_id: zess_build::BUILD_ID.into(),
+        version: zess_build::version().into(),
     })?;
     let script = format!(
         "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\ntouch '{}'\nexec cat >/dev/null\n",
@@ -270,7 +270,7 @@ fn cancelling_a_connection_interrupts_the_remote_ready_wait() -> Result<()> {
 fn cancelling_after_ready_interrupts_a_blocking_response_read() -> Result<()> {
     let fixture = SshFixture::new()?;
     let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
-        build_id: zess_build::BUILD_ID.into(),
+        version: zess_build::version().into(),
     })?;
     let script = format!(
         "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"session_id\":null}}'\nexec cat >/dev/null\n"
@@ -313,7 +313,7 @@ fn waiting_for_ssh_exit_reports_failure_status() -> Result<()> {
 fn cancelling_interrupts_wait_for_ssh_exit() -> Result<()> {
     let fixture = SshFixture::new()?;
     let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
-        build_id: zess_build::BUILD_ID.into(),
+        version: zess_build::version().into(),
     })?;
     let script = format!(
         "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"session_id\":null}}'\nexec cat >/dev/null\n"
@@ -530,7 +530,7 @@ fn ssh_deploys_and_reuses_a_verified_server() -> Result<()> {
                 total: Some(bytes.len() as u64),
             })
     );
-    assert!(command.contains(zess_build::BUILD_ID));
+    assert!(command.contains(zess_build::version()));
     assert_eq!(bootstrap.prepare(&target, &SystemProcessRunner)?, command);
     assert_eq!(
         artifacts.requests.load(std::sync::atomic::Ordering::SeqCst),
@@ -540,7 +540,7 @@ fn ssh_deploys_and_reuses_a_verified_server() -> Result<()> {
         .directory
         .path()
         .join(".cache/zess/servers")
-        .join(zess_build::BUILD_ID)
+        .join(zess_build::version())
         .join("current");
     std::fs::write(installed.join("lib/ld-linux-x86-64.so.2"), "corrupt")?;
     assert_eq!(bootstrap.prepare(&target, &SystemProcessRunner)?, command);
@@ -637,7 +637,7 @@ fn installed_server_starts_a_session_with_its_own_executable() -> Result<()> {
         .directory
         .path()
         .join(".cache/zess/servers")
-        .join(zess_build::BUILD_ID)
+        .join(zess_build::version())
         .join("current/zess");
     let workspace = fixture.directory.path().join("workspace");
     std::fs::create_dir(&workspace)?;
@@ -672,7 +672,7 @@ fn ssh_diagnostics_are_reported_to_the_observer() -> Result<()> {
     }
     let fixture = SshFixture::new()?;
     let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
-        build_id: zess_build::BUILD_ID.into(),
+        version: zess_build::version().into(),
     })?;
     std::fs::write(
         fixture.directory.path().join("zess"),
@@ -780,7 +780,7 @@ fn cancelling_an_ssh_upload_removes_only_the_new_staging_directory() -> Result<(
         .directory
         .path()
         .join(".cache/zess/servers")
-        .join(zess_build::BUILD_ID);
+        .join(zess_build::version());
     let existing = base.join("existing");
     std::fs::create_dir_all(&existing)?;
     std::fs::write(existing.join("keep"), "active installation")?;
