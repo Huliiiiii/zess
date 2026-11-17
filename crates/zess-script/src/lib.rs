@@ -66,6 +66,7 @@ struct Handler {
 struct StatuslineRegion {
     handler: Handler,
     components: Vec<String>,
+    elements: Vec<zess_plugin::StatusElement>,
 }
 
 impl steel::rvals::Custom for StatuslineRegion {}
@@ -78,6 +79,7 @@ struct StatuslineLayout {
 }
 
 pub enum CommandOutput {
+    Native { name: String, argument: Value },
     Request(HostRequest),
     Value(Value),
 }
@@ -95,8 +97,12 @@ struct ScriptState {
 struct ScriptRegistry {
     plugins: Registry<Handler>,
     builtin_statuslines: BTreeSet<String>,
+    builtin_statusline_components: BTreeSet<String>,
     statusline_components: BTreeMap<String, Handler>,
     statusline_layouts: BTreeMap<String, StatuslineLayout>,
+    status_mode_labels: BTreeMap<String, String>,
+    status_formats: BTreeMap<String, String>,
+    status_revision: u64,
     host: Box<dyn Fn(String, Value) -> Value>,
 }
 
@@ -149,8 +155,12 @@ impl ScriptRuntime {
         let registry = Rc::new(RefCell::new(ScriptRegistry {
             plugins: Registry::with_identities(identities),
             builtin_statuslines: BTreeSet::new(),
+            builtin_statusline_components: BTreeSet::new(),
             statusline_components: BTreeMap::new(),
             statusline_layouts: BTreeMap::new(),
+            status_mode_labels: BTreeMap::new(),
+            status_formats: BTreeMap::new(),
+            status_revision: 0,
             host: Box::new(host),
         }));
         let id = registration::register(&mut engine, &registry);
@@ -533,10 +543,10 @@ impl ScriptRuntime {
         };
 
         match implementation {
-            CommandImplementation::Native => Ok(CommandOutput::Request(HostRequest::Action {
+            CommandImplementation::Native => Ok(CommandOutput::Native {
                 name,
                 argument: argument.clone(),
-            })),
+            }),
             CommandImplementation::Request(request) => Ok(CommandOutput::Request(request)),
             CommandImplementation::External(handler) => {
                 let argument = Json(argument.clone())
@@ -738,6 +748,38 @@ impl ScriptRuntime {
 
     pub fn with_commands<R>(&self, use_commands: impl FnOnce(&CommandCatalog) -> R) -> R {
         use_commands(self.registry.borrow().plugins.catalog())
+    }
+
+    pub fn binding_catalog(&self) -> zess_plugin::BindingCatalog {
+        let registry = self.registry.borrow();
+        let mut catalog = registry.plugins.binding_catalog();
+        catalog.status = zess_plugin::StatusConfig {
+            layouts: registry
+                .statusline_layouts
+                .iter()
+                .map(|(kind, layout)| {
+                    (
+                        kind.clone(),
+                        zess_plugin::StatusLayout {
+                            left: layout.left.as_ref().map(|region| region.elements.clone()),
+                            center: layout.center.as_ref().map(|region| region.elements.clone()),
+                            right: layout.right.as_ref().map(|region| region.elements.clone()),
+                        },
+                    )
+                })
+                .collect(),
+            mode_labels: registry.status_mode_labels.clone(),
+            status_formats: registry.status_formats.clone(),
+            builtin_statuslines: registry.builtin_statuslines.clone(),
+            builtin_components: registry.builtin_statusline_components.clone(),
+            view_options: registry.plugins.all_view_options(),
+        };
+        catalog
+    }
+
+    pub fn binding_revision(&self) -> u64 {
+        let registry = self.registry.borrow();
+        registry.plugins.binding_revision() + registry.status_revision
     }
 
     pub fn with_keymap<R>(&self, use_keymap: impl FnOnce(&Keymap) -> R) -> R {

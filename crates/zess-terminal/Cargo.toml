@@ -11,12 +11,19 @@ serde_json.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
 zess-ui.workspace = true
+zess-git.workspace = true
+zess-filter.workspace = true
+zess-plugin.workspace = true
 zess-protocol.workspace = true
+zess-text.workspace = true
 zess-ipc.workspace = true
 zess-platform = { path = "../zess-platform" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+hegel.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc.workspace = true

@@ -37,6 +37,8 @@ native_commands!(EditorCommand, EDITOR_COMMANDS, {
     BufferNext => ("buffer-next", "Next buffer"),
     BufferPrevious => ("buffer-previous", "Previous buffer"),
     Reload => ("reload", "Discard changes and reload the current file"),
+    KeepLocal => ("document.keep-local", "Resolve the conflict using the local document"),
+    UseWorkspace => ("document.use-workspace", "Resolve the conflict using the workspace document"),
     SetLanguage => ("set-language", "Set or show the current buffer language"),
     ConfigReload => ("config-reload", "Restart plugin scripts"),
     CommandPrompt => ("command-prompt", "Enter a command"),
@@ -106,6 +108,7 @@ native_commands!(PreviewCommand, PREVIEW_COMMANDS, {
 });
 
 native_commands!(PromptCommand, PROMPT_COMMANDS, {
+    InsertText => ("prompt.insert-text", "Insert text at the prompt cursor"),
     Submit => ("prompt.submit", "Submit prompt"),
     Cancel => ("prompt.cancel", "Cancel prompt"),
     DeleteBackward => ("prompt.delete-backward", "Delete previous character"),
@@ -275,7 +278,7 @@ impl Session {
                     origin == self.focus,
                     "prompt commands require the focused view"
                 );
-                return self.prompt_command(command);
+                return self.prompt_command(command, &argument);
             }
             NativeAction::Data(command) => return self.data_command(origin, command),
             NativeAction::Help(command) => {
@@ -358,6 +361,9 @@ impl Session {
             .unwrap_or("")
             .trim();
         match command {
+            EditorCommand::KeepLocal | EditorCommand::UseWorkspace => {
+                bail!("conflict resolution requires a conflicting document in the client");
+            }
             EditorCommand::CommandPrompt => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Command,
@@ -399,7 +405,7 @@ impl Session {
                         text.save(path.as_deref())?;
                         self.operation_outcome = Some(zess_protocol::CommandOutcome::Saved {
                             buffer_id: buffer,
-                            version: text.version(),
+                            version: text.document_version(),
                         });
                         self.services.borrow_mut().invalidate_fs();
                         self.message = format!("{} written", text.path().unwrap().display());
@@ -433,12 +439,7 @@ impl Session {
             }
             EditorCommand::New => {
                 self.ensure_buffer_switch_allowed(origin)?;
-                let text = TextBuffer::with_capabilities(
-                    "",
-                    self.services.borrow().file_system(),
-                    self.syntax_provider.clone(),
-                );
-                let buffer = self.add_buffer(Buffer::Text(text));
+                let buffer = self.add_scratch_buffer();
                 self.switch_buffer_with(origin, buffer, Value::Null)?;
             }
             EditorCommand::Vsplit => self.split(origin, Axis::Vertical)?,
@@ -481,16 +482,7 @@ impl Session {
             }
             EditorCommand::SetLanguage => {
                 let buffer = self.views[&origin].location.buffer;
-                let text = self
-                    .buffers
-                    .get_mut(&buffer)
-                    .and_then(Buffer::text)
-                    .context("command requires a text buffer")?;
-                if argument.is_empty() {
-                    self.message = text.language_id().unwrap_or("text").to_owned();
-                } else {
-                    text.set_language((argument != "text").then_some(argument))?;
-                }
+                self.set_document_language(buffer, argument)?;
             }
             EditorCommand::Reload => {
                 let buffer = self.views[&origin].location.buffer;
@@ -515,6 +507,7 @@ impl Session {
                     bail!("save or undo pending buffer changes before reloading");
                 }
                 self.reload()?;
+                let resource_refresh = self.reload_resource_pages();
                 self.cancel_input_context()
                     .context("could not reset input after installing the configuration")?;
                 let ids = self
@@ -547,8 +540,14 @@ impl Session {
                 }
                 self.emit_event("reload", json!({"generation":self.generation}))
                     .context("reload hook failed after installing the configuration")?;
+                resource_refresh?;
                 if self.message.is_empty() {
                     self.message = "user plugins reloaded".into();
+                }
+                if self.current_operation.is_some() {
+                    let message = std::mem::take(&mut self.message);
+                    self.operation_outcome
+                        .get_or_insert(zess_protocol::CommandOutcome::Message { message });
                 }
             }
             EditorCommand::BrowserOpenSource => {
@@ -556,5 +555,69 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn resolve_command(
+        &mut self,
+        name: &str,
+        argument: &Value,
+    ) -> Result<CommandOutput> {
+        self.scripts
+            .as_mut()
+            .context("plugin runtime unavailable")?
+            .command(name, argument)
+    }
+
+    pub(super) fn execute_view_command(
+        &mut self,
+        owner: ViewId,
+        command: Result<CommandOutput>,
+    ) -> Result<()> {
+        self.views.get_mut(&owner).unwrap().jump = None;
+        let result = (|| -> Result<bool> {
+            Ok(match command? {
+                CommandOutput::Native { name, argument }
+                | CommandOutput::Request(HostRequest::Action { name, argument }) => {
+                    let action = NativeAction::resolve(&name)?;
+                    if !matches!(
+                        action,
+                        NativeAction::Text(_)
+                            | NativeAction::Prompt(_)
+                            | NativeAction::Editor(EditorCommand::Help)
+                    ) {
+                        self.cancel_text_command(owner);
+                    }
+                    self.native_command(owner, action, argument)?;
+                    matches!(
+                        action,
+                        NativeAction::Count(_) | NativeAction::Data(DataCommand::SelectRegister)
+                    )
+                }
+                CommandOutput::Request(request) => {
+                    self.cancel_text_command(owner);
+                    self.request(owner, request)?;
+                    false
+                }
+                CommandOutput::Value(value) => {
+                    self.cancel_text_command(owner);
+                    if !value.is_null() {
+                        self.message = value.to_string();
+                    }
+                    false
+                }
+            })
+        })();
+        if !matches!(result, Ok(true))
+            && let Some(view) = self.views.get_mut(&owner)
+        {
+            view.count.clear();
+            view.register = RegisterInput::None;
+        }
+        result.map(|_| ())
+    }
+
+    pub(super) fn execute_command(&mut self, name: &str, argument: Value) -> Result<()> {
+        let command = self.resolve_command(name, &argument);
+        self.execute_view_command(self.focus, command)
     }
 }

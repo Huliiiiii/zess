@@ -46,6 +46,10 @@ impl HelixSyntaxProvider {
         }
     }
 
+    pub(crate) fn language_for_filename(&self, filename: &Path) -> Option<Language> {
+        self.loader.language_for_filename(filename)
+    }
+
     fn initialize_runtime(&self) -> Result<(), String> {
         crate::runtime::initialize_with_platform(
             None,

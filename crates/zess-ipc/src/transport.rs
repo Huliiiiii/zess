@@ -37,6 +37,10 @@ pub trait LocalIpc: Send + Sync {
         endpoint.log_path()
     }
 
+    fn remove_stale(&self, endpoint: &SocketPath) -> Result<()> {
+        endpoint.remove_stale()
+    }
+
     fn prepare(&self, endpoint: &SocketPath) -> Result<()>;
     fn connect(&self, endpoint: &SocketPath) -> io::Result<Stream>;
     fn bind(&self, endpoint: &SocketPath) -> Result<Listener>;

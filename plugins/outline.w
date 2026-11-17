@@ -92,7 +92,7 @@ define : outline-update input
         selection
           if (equal? event "filter_changed")
             item-selection first (if first (list first) '()) first
-            . selection
+            . #f
       buffer-result
         outline-state (text-context-id text) : text-context-version text
         outline-view collapsed compiled-filter

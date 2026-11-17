@@ -80,6 +80,7 @@ fn building_the_bundled_grammar_installs_inherited_language_queries() {
         assert!(directory.join("queries/python/highlights.scm").is_file());
         let mut buffer =
             crate::TextBuffer::new_with_path("\ndefine : example\n  #t\n", Path::new("example.w"));
+        crate::tests::wait_for_highlight_refresh(&mut buffer);
         let frame = buffer.render(1, 40, 4, false);
         assert_eq!(
             frame

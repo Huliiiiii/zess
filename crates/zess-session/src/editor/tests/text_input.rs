@@ -29,7 +29,7 @@ fn a_mode_change_does_not_consume_the_first_inserted_character_as_an_old_prefix(
     let mut session = fixture.session(&[]);
     session.input("g");
     session.set_mode(session.focus, "insert").unwrap();
-    assert!(session.frame().prompt.is_empty());
+    assert!(session.key_sequence.keys().is_empty());
     session.input("x");
     assert_eq!(Input::new(&mut session).text_state().source, "x");
 }
@@ -136,19 +136,15 @@ fn script_commands_can_forward_counted_text_actions() {
 }
 
 #[test]
-fn clipboard_waiting_feedback_clears_when_the_read_is_cancelled() {
+fn cancelling_a_clipboard_read_rejects_its_later_reply() {
     let fixture = Fixture::new();
     let mut session = fixture.session(&[]);
     for key in ["\"", "+", "p"] {
         session.input(key);
     }
     let (request, _) = session.clipboard_request().unwrap();
-    assert_eq!(
-        session.frame().prompt,
-        "Reading register \"+ · Esc to cancel"
-    );
     session.input("Esc");
-    assert!(session.frame().prompt.is_empty());
+    assert!(session.clipboard_request().is_none());
     session.complete_clipboard_read(request, Some("stale".into()), None);
     let buffer = session.views[&session.focus].location.buffer;
     let Buffer::Text(text) = &session.buffers[&buffer] else {
@@ -158,7 +154,7 @@ fn clipboard_waiting_feedback_clears_when_the_read_is_cancelled() {
 }
 
 #[test]
-fn item_jump_feedback_identifies_the_missing_letter_until_cancelled_or_completed() {
+fn item_jump_waits_for_both_letters_and_can_be_cancelled() {
     let fixture = Fixture::new();
     for name in ["a.txt", "b.txt", "c.txt"] {
         fs::write(fixture.0.join(name), "").unwrap();
@@ -166,26 +162,34 @@ fn item_jump_feedback_identifies_the_missing_letter_until_cancelled_or_completed
     let mut session = fixture.session(&[]);
     session.command("files").unwrap();
     settle(&mut session);
-    session.frame();
+    session.snapshot();
     for key in ["g", "w"] {
         session.input(key);
     }
     assert_eq!(
-        session.frame().prompt,
+        session.views[&session.focus]
+            .jump
+            .as_ref()
+            .unwrap()
+            .prompt(),
         "Goto item: type a highlighted label · Esc to cancel"
     );
     session.input("a");
     assert_eq!(
-        session.frame().prompt,
+        session.views[&session.focus]
+            .jump
+            .as_ref()
+            .unwrap()
+            .prompt(),
         "Goto item: a_ · type the second letter · Esc to cancel"
     );
     session.input("Esc");
-    assert!(session.frame().prompt.is_empty());
+    assert!(session.views[&session.focus].jump.is_none());
     assert_eq!(selected_row(&session, session.focus).id, "a.txt");
     for key in ["g", "w", "a", "b"] {
         session.input(key);
     }
-    assert!(session.frame().prompt.is_empty());
+    assert!(session.views[&session.focus].jump.is_none());
     assert_eq!(selected_row(&session, session.focus).id, "b.txt");
 }
 
@@ -201,19 +205,21 @@ fn counts_and_key_prefixes_remain_separate_until_cancelled() {
         for key in ["2", "C-w"] {
             session.input(key);
         }
-        assert_eq!(session.frame().prompt, "2 · C-w … · Esc to cancel");
+        assert_eq!(session.command_count().value(), Some(2));
+        assert_eq!(session.key_sequence.keys(), ["C-w"]);
         session.input("Esc");
-        assert!(session.frame().prompt.is_empty());
+        assert!(session.key_sequence.keys().is_empty());
+        assert!(session.command_count().is_empty());
     }
 }
 
 #[test]
-fn changing_key_bindings_clears_the_previous_prefix_before_rendering_hints() {
+fn publishing_updated_bindings_clears_the_previous_prefix() {
     let scripts = Fixture::new();
     let fixture = Fixture::new();
     let mut session = fixture.session(&[]);
     session.input("g");
-    assert_eq!(session.frame().prompt, "g … · Esc to cancel");
+    assert_eq!(session.key_sequence.keys(), ["g"]);
     session
         .scripts
         .as_mut()
@@ -223,6 +229,6 @@ fn changing_key_bindings_clears_the_previous_prefix_before_rendering_hints() {
             "map-modal \"text\" \"z\" \"text.move-right\"\n",
         ))
         .unwrap();
-    assert!(session.frame().prompt.is_empty());
+    session.snapshot();
     assert!(session.key_sequence.keys().is_empty());
 }

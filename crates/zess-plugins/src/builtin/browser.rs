@@ -87,7 +87,7 @@ pub(super) fn reconcile(event: Event, input: &PluginInput, output: &mut PluginOu
     let mut selection = output
         .selection
         .take()
-        .unwrap_or_else(|| input.selection.clone());
+        .unwrap_or_else(|| input.view_selection().clone());
     if event == Event::FilterChanged
         || !rows
             .iter()

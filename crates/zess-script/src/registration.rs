@@ -29,6 +29,10 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
         ("register-statusline", "statusline"),
         ("%register-builtin-statusline", "builtin-statusline"),
         ("%register-statusline-component", "statusline-component"),
+        (
+            "%register-builtin-statusline-component",
+            "builtin-statusline-component",
+        ),
     ] {
         engine.register_fn(
             function,
@@ -51,20 +55,30 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
                         .register_buffer(&name, BufferBackend::External(handler));
                     return Ok(());
                 }
-                if category == "statusline-component" {
+                if matches!(
+                    category,
+                    "statusline-component" | "builtin-statusline-component"
+                ) {
                     if registry.statusline_components.contains_key(&name) {
                         return Err(SteelErr::new(
                             ErrorKind::Generic,
                             format!("statusline component already registered: {name}"),
                         ));
                     }
+                    if category == "builtin-statusline-component" {
+                        registry.builtin_statusline_components.insert(name.clone());
+                    }
                     registry.statusline_components.insert(name, handler);
+                    registry.status_revision += 1;
                     return Ok(());
                 }
                 if category == "builtin-statusline" {
                     registry.builtin_statuslines.insert(name.clone());
                 } else if category == "statusline" {
                     registry.builtin_statuslines.remove(&name);
+                }
+                if matches!(category, "builtin-statusline" | "statusline") {
+                    registry.status_revision += 1;
                 }
                 let entries = match category {
                     "api" => &mut registry.plugins.apis,
@@ -82,7 +96,10 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
 
     engine.register_fn(
         "%make-statusline-region",
-        |function: SteelVal, components: Vec<String>| -> steel::rvals::Result<StatuslineRegion> {
+        |function: SteelVal,
+         components: Vec<String>,
+         elements: Vec<SteelVal>|
+         -> steel::rvals::Result<StatuslineRegion> {
             if !function.is_function() {
                 return Err(SteelErr::new(
                     ErrorKind::TypeMismatch,
@@ -92,9 +109,31 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
             Ok(StatuslineRegion {
                 handler: Handler { function },
                 components,
+                elements: elements
+                    .into_iter()
+                    .map(status_element)
+                    .collect::<steel::rvals::Result<_>>()?,
             })
         },
     );
+    for (function, mode_labels) in [
+        ("%set-status-mode-labels", true),
+        ("%set-status-formats", false),
+    ] {
+        engine.register_fn(function, move |values: Json| -> steel::rvals::Result<()> {
+            let values = serde_json::from_value(values.0)
+                .map_err(|error| SteelErr::new(ErrorKind::TypeMismatch, error.to_string()))?;
+            let registry = registry_for(id)?;
+            let mut registry = registry.borrow_mut();
+            if mode_labels {
+                registry.status_mode_labels = values;
+            } else {
+                registry.status_formats = values;
+            }
+            registry.status_revision += 1;
+            Ok(())
+        });
+    }
     engine.register_fn(
         "%register-statusline-layout",
         move |kind: SteelVal,
@@ -115,6 +154,7 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
             if let Some(right) = right {
                 layout.right = Some(right);
             }
+            registry.status_revision += 1;
             Ok(())
         },
     );
@@ -239,6 +279,7 @@ pub(super) fn register(engine: &mut Engine, registry: &Rc<RefCell<ScriptRegistry
             for kind in kinds {
                 registry.plugins.set_view_options(&kind, options.clone());
             }
+            registry.status_revision += 1;
 
             Ok(())
         },
@@ -426,6 +467,43 @@ fn name_string(value: SteelVal) -> steel::rvals::Result<String> {
         _ => Err(SteelErr::new(
             ErrorKind::TypeMismatch,
             "expected string or symbol name".into(),
+        )),
+    }
+}
+
+fn status_element(value: SteelVal) -> steel::rvals::Result<zess_plugin::StatusElement> {
+    use zess_plugin::StatusElement;
+    match value {
+        SteelVal::StringV(text) => Ok(StatusElement::Literal(text.to_string())),
+        SteelVal::SymbolV(name) => Ok(StatusElement::Component(name.to_string())),
+        value @ SteelVal::ListV(_) => {
+            let mut values = Vec::<SteelVal>::from_steelval(&value)?.into_iter();
+            let name = values.next().ok_or_else(|| {
+                SteelErr::new(ErrorKind::TypeMismatch, "empty statusline element".into())
+            })?;
+            if name_string(name)? != "join" {
+                return Err(SteelErr::new(
+                    ErrorKind::TypeMismatch,
+                    "invalid statusline element".into(),
+                ));
+            }
+            let separator = values.next().ok_or_else(|| {
+                SteelErr::new(
+                    ErrorKind::TypeMismatch,
+                    "missing statusline separator".into(),
+                )
+            })?;
+            let separator = String::from_steelval(&separator)?;
+            Ok(StatusElement::Join {
+                separator,
+                elements: values
+                    .map(status_element)
+                    .collect::<steel::rvals::Result<_>>()?,
+            })
+        }
+        _ => Err(SteelErr::new(
+            ErrorKind::TypeMismatch,
+            "invalid statusline element".into(),
         )),
     }
 }

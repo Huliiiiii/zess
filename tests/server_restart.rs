@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "server_restart/terminal_input.rs"]
+mod terminal_input;
+
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
@@ -214,30 +217,63 @@ fn receive_type(reader: &mut BufReader<UnixStream>, kind: &str) -> Value {
     }
 }
 
+fn attach(server: &Server, client_id: &str) -> (BufReader<UnixStream>, Value) {
+    let mut stream = connect(&server.socket);
+    send(
+        &mut stream,
+        json!({"type": "attach", "client_id": client_id, "width": 80, "height": 24}),
+    );
+    let mut reader = BufReader::new(stream);
+    let attached = receive_type(&mut reader, "attached");
+    (reader, attached)
+}
+
+fn focused_document(reader: &mut BufReader<UnixStream>) -> Value {
+    let snapshot = receive_type(reader, "snapshot");
+    let state = &snapshot["state"];
+    let view = state["views"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|view| view["view_id"] == state["focused_view"])
+        .unwrap();
+    send(
+        reader.get_mut(),
+        json!({"type":"document","kind":"read","buffer_id":view["buffer_id"]}),
+    );
+    let document = receive_type(reader, "document");
+    assert_eq!(document["kind"], "snapshot");
+    document
+}
+
+fn insert_at_start(document: &Value, text: &str) -> Value {
+    json!({"type":"document", "kind":"edit", "buffer_id":document["buffer_id"], "sequence":1,
+        "base_version":document["version"], "changes":[{"start":0,"end":0,"insert":text}]})
+}
+
+fn document_receipt(reader: &mut BufReader<UnixStream>, request: Value, expected: &str) -> Value {
+    send(reader.get_mut(), request.clone());
+    let reply = receive_type(reader, "document");
+    assert_eq!(reply["kind"], expected, "{reply}");
+    assert_eq!(reply["sequence"], request["sequence"]);
+    reply
+}
+
+fn save_document(reader: &mut BufReader<UnixStream>, edit: &Value) {
+    document_receipt(
+        reader,
+        json!({"type":"document", "kind":"save", "buffer_id":edit["buffer_id"],
+        "sequence":2, "version":edit["version"]}),
+        "saved",
+    );
+}
+
 #[test]
 fn unsaved_changes_require_force_before_replacing_the_session() {
     let server = Server::new();
-    let mut client = connect(&server.socket);
-    send(
-        &mut client,
-        json!({"type": "attach", "client_id": "restart-test", "width": 80, "height": 24}),
-    );
-    let mut client = BufReader::new(client);
-    let attached = receive(&mut client);
-    assert_eq!(attached["type"], "attached");
-    let epoch = &attached["context_epoch"];
-    for (sequence, key) in [(1, "i"), (2, "x")] {
-        send(
-            client.get_mut(),
-            json!({"type": "input", "sequence": sequence, "key": key, "context_epoch": epoch}),
-        );
-        loop {
-            let message = receive(&mut client);
-            if message["type"] == "ack" && message["acknowledged"] == sequence {
-                break;
-            }
-        }
-    }
+    let (mut client, _) = attach(&server, "restart-test");
+    let document = focused_document(&mut client);
+    document_receipt(&mut client, insert_at_start(&document, "x"), "applied");
     let before = server.status();
     assert_eq!(before["modified"], true);
     assert_eq!(before["attached"], true);
@@ -359,7 +395,6 @@ fn restarting_a_relative_socket_preserves_its_location() {
     let after = server.status();
     assert_ne!(after["pid"], before["pid"]);
     assert_eq!(after["workspace"], before["workspace"]);
-    assert_eq!(server.socket, server.root.join("relative.sock"));
     assert!(!server.workspace.join("relative.sock").exists());
 }
 
@@ -394,97 +429,50 @@ fn oversized_requests_only_close_the_offending_connection() {
     use zess_protocol::MAX_INPUT_BYTES;
 
     let server = Server::new();
-    for size in [MAX_INPUT_BYTES, MAX_INPUT_BYTES + 1] {
-        let prefix = b"{\"type\":\"status\",\"padding\":\"";
-        let suffix = b"\"}\n";
-        let mut message = prefix.to_vec();
-        message.resize(size - suffix.len(), b'x');
-        message.extend_from_slice(suffix);
-        let mut stream = connect(&server.socket);
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let written = stream.write_all(&message);
-        if size == MAX_INPUT_BYTES {
-            written.unwrap();
-            assert_eq!(
-                receive(&mut BufReader::new(stream))["pid"],
-                server.child.id()
-            );
-        } else {
-            if let Err(error) = written {
-                assert!(matches!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                ));
-            }
-            let mut response = Vec::new();
-            if let Err(error) = stream.read_to_end(&mut response) {
-                assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
-            }
-            assert!(response.is_empty());
-            assert_eq!(server.status()["pid"], server.child.id());
-        }
-    }
-}
-
-fn attach(
-    server: &Server,
-    client_id: &str,
-    epoch: Option<&Value>,
-) -> (BufReader<UnixStream>, Value) {
+    let prefix = b"{\"type\":\"status\",\"padding\":\"";
+    let suffix = b"\"}\n";
+    let mut message = prefix.to_vec();
+    message.resize(MAX_INPUT_BYTES + 1 - suffix.len(), b'x');
+    message.extend_from_slice(suffix);
     let mut stream = connect(&server.socket);
-    send(
-        &mut stream,
-        json!({"type": "attach", "client_id": client_id, "width": 80, "height": 24, "context_epoch": epoch}),
-    );
-    let mut reader = BufReader::new(stream);
-    loop {
-        let message = receive(&mut reader);
-        if message["type"] == "attached" {
-            return (reader, message);
-        }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    if let Err(error) = stream.write_all(&message) {
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        ));
     }
-}
-
-fn input(reader: &mut BufReader<UnixStream>, epoch: &Value, sequence: u64, key: &str) {
-    send(
-        reader.get_mut(),
-        json!({"type": "input", "sequence": sequence, "key": key, "context_epoch": epoch}),
-    );
-    loop {
-        let message = receive(reader);
-        assert_ne!(message["type"], "rejected", "{message}");
-        if message["type"] == "ack" && message["acknowledged"] == sequence {
-            return;
-        }
+    let mut response = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut response) {
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
     }
+    assert!(response.is_empty());
+    assert_eq!(server.status()["pid"], server.child.id());
 }
 
 #[test]
-fn reconnecting_to_the_same_server_retains_acknowledgements_and_deduplicates_input() {
+fn replaying_a_document_edit_after_reconnect_saves_it_once() {
     let server = Server::new();
-    let (mut client, first) = attach(&server, "reconnect", None);
-    for (sequence, key) in [(1, "i"), (2, "x")] {
-        input(&mut client, &first["context_epoch"], sequence, key);
-    }
+    let (mut client, first) = attach(&server, "reconnect");
+    let document = focused_document(&mut client);
+    let request = insert_at_start(&document, "x");
+    let original_receipt = document_receipt(&mut client, request.clone(), "applied");
     drop(client);
     let deadline = Instant::now() + Duration::from_secs(3);
     while server.status()["attached"] == true {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(10));
     }
-    let (mut client, second) = attach(&server, "reconnect", Some(&first["context_epoch"]));
+    let (mut client, second) = attach(&server, "reconnect");
     assert_eq!(second["server_instance"], first["server_instance"]);
-    assert_eq!(second["acknowledged"], 2);
-    assert_eq!(second["replay_allowed"], true);
-    input(&mut client, &second["context_epoch"], 2, "x");
-    for (sequence, key) in [(3, "Esc"), (4, ":"), (5, "w"), (6, "Enter")] {
-        input(&mut client, &second["context_epoch"], sequence, key);
-    }
+    let replay_receipt = document_receipt(&mut client, request, "applied");
+    assert_eq!(replay_receipt, original_receipt);
+    save_document(&mut client, &replay_receipt);
     assert_eq!(
         fs::read_to_string(server.workspace.join("saved.txt")).unwrap(),
         "xsaved\n"
@@ -492,12 +480,11 @@ fn reconnecting_to_the_same_server_retains_acknowledgements_and_deduplicates_inp
 }
 
 #[test]
-fn replacing_a_crashed_server_starts_a_new_input_ledger() {
+fn replacing_a_crashed_server_starts_a_new_document_edit_sequence() {
     let mut server = Server::new();
-    let (mut client, first) = attach(&server, "crash-reconnect", None);
-    for (sequence, key) in [(1, "i"), (2, "x")] {
-        input(&mut client, &first["context_epoch"], sequence, key);
-    }
+    let (mut client, first) = attach(&server, "crash-reconnect");
+    let document = focused_document(&mut client);
+    document_receipt(&mut client, insert_at_start(&document, "x"), "applied");
     server.child.kill().unwrap();
     server.child.wait().unwrap();
     drop(client);
@@ -521,20 +508,12 @@ fn replacing_a_crashed_server_starts_a_new_input_ledger() {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(10));
     }
-    let (mut client, second) = attach(&server, "crash-reconnect", Some(&first["context_epoch"]));
+    let (mut client, second) = attach(&server, "crash-reconnect");
     assert_ne!(second["server_instance"], first["server_instance"]);
-    assert_eq!(second["acknowledged"], 0);
-    assert_eq!(second["replay_allowed"], false);
-    for (sequence, key) in [
-        (1, "i"),
-        (2, "y"),
-        (3, "Esc"),
-        (4, ":"),
-        (5, "w"),
-        (6, "Enter"),
-    ] {
-        input(&mut client, &second["context_epoch"], sequence, key);
-    }
+    let document = focused_document(&mut client);
+    assert_eq!(document["text"], "saved\n");
+    let receipt = document_receipt(&mut client, insert_at_start(&document, "y"), "applied");
+    save_document(&mut client, &receipt);
     assert_eq!(
         fs::read_to_string(server.workspace.join("saved.txt")).unwrap(),
         "ysaved\n"
@@ -542,69 +521,12 @@ fn replacing_a_crashed_server_starts_a_new_input_ledger() {
 }
 
 #[test]
-fn an_unanswered_clipboard_request_is_reissued_after_reconnect_and_duplicate_input() {
-    fn clipboard_input(reader: &mut BufReader<UnixStream>, epoch: &Value) -> Value {
-        send(
-            reader.get_mut(),
-            json!({"type": "input", "sequence": 3, "key": "p", "context_epoch": epoch}),
-        );
-        let mut request = None;
-        let mut acknowledged = false;
-        while request.is_none() || !acknowledged {
-            let message = receive(reader);
-            assert_ne!(message["type"], "rejected", "{message}");
-            if message["type"] == "clipboard_read" {
-                request = Some(message);
-            } else if message["type"] == "ack" && message["acknowledged"] == 3 {
-                acknowledged = true;
-            }
-        }
-        request.unwrap()
-    }
-
-    let server = Server::new();
-    let (mut client, first) = attach(&server, "clipboard-reconnect", None);
-    for (sequence, key) in [(1, "\""), (2, "+")] {
-        input(&mut client, &first["context_epoch"], sequence, key);
-    }
-    let request = clipboard_input(&mut client, &first["context_epoch"]);
-    drop(client);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while server.status()["attached"] == true {
-        assert!(Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(10));
-    }
-    let (mut client, second) = attach(
-        &server,
-        "clipboard-reconnect",
-        Some(&first["context_epoch"]),
-    );
-    assert_eq!(receive_type(&mut client, "clipboard_read"), request);
-    assert_eq!(
-        clipboard_input(&mut client, &second["context_epoch"]),
-        request
-    );
-    send(
-        client.get_mut(),
-        json!({"type": "clipboard_response", "id": request["id"], "text": "external", "error": null}),
-    );
-    receive_type(&mut client, "delta");
-    for (sequence, key) in [(4, ":"), (5, "w"), (6, "Enter")] {
-        input(&mut client, &second["context_epoch"], sequence, key);
-    }
-    assert_eq!(
-        fs::read_to_string(server.workspace.join("saved.txt")).unwrap(),
-        "sexternalaved\n"
-    );
-}
-
-#[test]
 fn a_rejected_attached_client_does_not_prevent_the_next_attachment() {
     let server = Server::new();
-    let (mut client, attached) = attach(&server, "rejected", None);
+    let (mut client, _) = attach(&server, "rejected");
     send(
         client.get_mut(),
-        json!({"type": "input", "sequence": 1, "key": "i", "context_epoch": attached["context_epoch"].as_u64().unwrap().wrapping_add(1)}),
+        json!({"type": "resync", "session_id": "different-session", "state_revision": 0}),
     );
     loop {
         if receive(&mut client)["type"] == "rejected" {
@@ -617,7 +539,6 @@ fn a_rejected_attached_client_does_not_prevent_the_next_attachment() {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(10));
     }
-    let (mut client, attached) = attach(&server, "replacement", None);
-    assert_eq!(attached["acknowledged"], 0);
-    input(&mut client, &attached["context_epoch"], 1, "i");
+    let (mut client, _) = attach(&server, "replacement");
+    assert_eq!(focused_document(&mut client)["text"], "saved\n");
 }

@@ -1,32 +1,107 @@
 use super::*;
 use zess_protocol::{CommandAction, CommandOutcome, ViewContent, ViewSelection};
 
-fn normalized(mut frame: Frame) -> Frame {
-    for row in &mut frame.rows {
-        let mut spans: Vec<Span> = Vec::new();
-        for span in std::mem::take(&mut row.spans) {
-            if span.text.is_empty() {
-                continue;
-            }
-            if let Some(previous) = spans.last_mut().filter(|previous| {
-                previous.style == span.style && previous.base_style == span.base_style
-            }) {
-                previous.text.push_str(&span.text);
-            } else {
-                spans.push(span);
-            }
-        }
-        row.spans = spans;
-    }
-    frame
+#[test]
+fn opening_an_existing_workspace_document_returns_its_buffer() {
+    let fixture = Fixture::new();
+    let path = fixture.write("note.txt", "note\n");
+    let mut session = fixture.session(&[path]);
+    let before = session.snapshot();
+    let buffer_id = before.views[0].buffer_id;
+
+    let outcome = session.begin_operation(
+        "open",
+        &CommandAction::OpenDocument {
+            path: Some("note.txt".into()),
+        },
+    );
+
+    assert_eq!(outcome, Some(CommandOutcome::DocumentOpened { buffer_id }));
+    let after = session.snapshot();
+    assert_eq!(after.buffers, before.buffers);
+    assert_eq!(after.client_actions, before.client_actions);
 }
 
 #[test]
-fn cached_text_renders_syntax_unicode_and_selection_after_horizontal_scrolling() {
+fn opening_a_workspace_document_leaves_the_host_view_in_place() {
     let fixture = Fixture::new();
-    let path = fixture.write("source.w", "\tdefine 文 a\u{301}🙂 \"hello\" ; comment\n");
+    let mut session = fixture.session(&[]);
+    let before = session.snapshot();
+
+    let Some(CommandOutcome::DocumentOpened { buffer_id }) =
+        session.begin_operation("new", &CommandAction::OpenDocument { path: None })
+    else {
+        panic!("scratch creation must return the new buffer ID");
+    };
+
+    let after = session.snapshot();
+    assert_eq!(after.views, before.views);
+    assert_eq!(after.focused_view, before.focused_view);
+    assert_eq!(after.buffers.len(), before.buffers.len() + 1);
+    assert_eq!(session.document(buffer_id).unwrap().text(), "");
+    assert!(matches!(
+        &after.client_actions[..],
+        [zess_protocol::ClientAction { kind: zess_protocol::ClientActionKind::Open { buffer_id: opened }, .. }] if *opened == buffer_id
+    ));
+}
+
+#[test]
+fn discarding_an_unused_scratch_rebinds_the_host_without_activating_a_pane() {
+    let fixture = Fixture::new();
+    let mut session = fixture.session(&[]);
+    let before = session.snapshot();
+    let scratch = before.views[0].buffer_id;
+    let Some(CommandOutcome::DocumentOpened { buffer_id }) =
+        session.begin_operation("new", &CommandAction::OpenDocument { path: None })
+    else {
+        panic!("expected the replacement scratch buffer");
+    };
+
+    assert_eq!(
+        session.begin_operation(
+            "discard",
+            &CommandAction::DiscardScratch {
+                buffer_id: scratch,
+                replacement: buffer_id
+            },
+        ),
+        Some(CommandOutcome::ScratchDiscarded {
+            buffer_id: scratch,
+            replacement: buffer_id
+        }),
+    );
+    let after = session.snapshot();
+    assert_eq!(after.focused_view, before.focused_view);
+    assert_eq!(after.views[0].buffer_id, buffer_id);
+    assert_eq!(after.workspace.current, Some(buffer_id));
+    assert_eq!(after.workspace.buffers, [buffer_id]);
+    assert_eq!(
+        after
+            .buffers
+            .iter()
+            .map(|buffer| buffer.id)
+            .collect::<Vec<_>>(),
+        [buffer_id]
+    );
+    assert!(matches!(
+        &after.client_actions[..],
+        [zess_protocol::ClientAction { kind: zess_protocol::ClientActionKind::Open { buffer_id: opened }, .. }] if *opened == buffer_id
+    ));
+}
+
+#[test]
+fn scrolled_text_retains_source_positions_syntax_and_selection() {
+    let fixture = Fixture::new();
+    let path = fixture.write(
+        "source.w",
+        &format!(
+            "\tdefine 文 a\u{301}🙂 \"hello\" ; {}\n",
+            "comment".repeat(16)
+        ),
+    );
     let mut session = fixture.session(&[path]);
     session.resize(45, 8);
+    session.snapshot();
     for key in ["v", "l"] {
         session.input(key);
     }
@@ -38,33 +113,33 @@ fn cached_text_renders_syntax_unicode_and_selection_after_horizontal_scrolling()
         .and_then(Buffer::text)
         .unwrap()
         .scroll_view(view, 4, 0);
-    let frame = session.frame();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let view = loop {
+        session.tick();
+        let view = session
+            .snapshot()
+            .views
+            .into_iter()
+            .find(|snapshot| snapshot.view_id == view)
+            .unwrap();
+        if matches!(&view.content, ViewContent::Text { lines } if !lines[0].highlights.is_empty()) {
+            break view;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    assert!(matches!(view.selection, ViewSelection::Text { ref ranges, .. } if !ranges.is_empty()));
+    assert_eq!(view.horizontal_scroll, 4);
+    let ViewContent::Text { lines } = &view.content else {
+        panic!("expected source text")
+    };
+    let line = &lines[0];
+    assert!(line.text.contains("文 a\u{301}🙂"));
+    assert!(line.first_char > 0);
     assert!(
-        frame
-            .rows
+        line.highlights
             .iter()
-            .flat_map(|row| &row.spans)
-            .any(|span| span.style == "keyword")
-    );
-    assert!(
-        frame
-            .rows
-            .iter()
-            .flat_map(|row| &row.spans)
-            .any(|span| span.style == "selection")
-    );
-    let state = session.snapshot_with_frame(&frame);
-    assert!(
-        state
-            .render_plan
-            .rows
-            .iter()
-            .flat_map(|row| &row.spans)
-            .any(|span| matches!(span.content, zess_ui::RenderContent::Text { .. }))
-    );
-    assert_eq!(
-        normalized(zess_protocol::render_snapshot(&state).unwrap()),
-        normalized(frame)
+            .any(|range| range.style == "keyword" && range.start >= line.first_char)
     );
 }
 
@@ -74,21 +149,12 @@ fn search_prompts_keep_the_cached_document_as_the_render_source() {
     let path = fixture.write("note.txt", "source text\n");
     let mut session = fixture.session(&[path]);
     session.input("/");
-    let frame = session.frame();
-    let state = session.snapshot_with_frame(&frame);
+    let state = session.snapshot();
     assert!(state.prompt.is_some());
-    assert!(
-        state
-            .render_plan
-            .rows
-            .iter()
-            .flat_map(|row| &row.spans)
-            .any(|span| matches!(span.content, zess_ui::RenderContent::Text { .. }))
-    );
-    assert_eq!(
-        normalized(zess_protocol::render_snapshot(&state).unwrap()),
-        normalized(frame)
-    );
+    let ViewContent::Text { lines } = &state.views[0].content else {
+        panic!("expected document")
+    };
+    assert!(lines.iter().any(|line| line.text.contains("source text")));
 }
 
 #[test]
@@ -119,32 +185,17 @@ fn cached_file_browser_renders_item_cells_and_wrapped_preview_text() {
         .dispatch(session.focus, "navigate", json!({"path":"note.w"}))
         .unwrap();
     settle(&mut session);
-    session.frame();
+    session.snapshot();
     session.input("J");
-    let frame = session.frame();
-    let state = session.snapshot_with_frame(&frame);
+    let state = session.snapshot();
     let surface = &state.surfaces[0];
     assert!(surface.scroll > 0);
-    assert!(state.render_plan.rows.iter().flat_map(|row| &row.spans).any(|span| matches!(span.content, zess_ui::RenderContent::Text { buffer_id, .. } if buffer_id == surface.buffer_id)));
-    assert!(
-        state
-            .render_plan
-            .rows
-            .iter()
-            .flat_map(|row| &row.spans)
-            .any(|span| matches!(
-                span.content,
-                zess_ui::RenderContent::Item { cell: Some(_), .. }
-            ))
-    );
-    assert_eq!(
-        normalized(zess_protocol::render_snapshot(&state).unwrap()),
-        normalized(frame)
-    );
+    assert!(matches!(&surface.content, ViewContent::Text { lines } if !lines.is_empty()));
+    assert!(state.views.iter().any(|view| matches!(&view.content, ViewContent::Items { rows } if rows.iter().any(|row| !row.cells.is_empty()))));
 }
 
 #[test]
-fn cached_diffs_render_visible_fragments_after_horizontal_scrolling() {
+fn scrolled_diffs_retain_the_source_line_and_its_number() {
     let fixture = Fixture::new();
     assert!(
         std::process::Command::new("git")
@@ -169,12 +220,11 @@ fn cached_diffs_render_visible_fragments_after_horizontal_scrolling() {
     session.command("git").unwrap();
     settle(&mut session);
     session.focus_preview(session.focus).unwrap();
-    session.frame();
+    session.snapshot();
     session
         .execute_command("preview.move-right", json!({}))
         .unwrap();
-    let frame = session.frame();
-    let state = session.snapshot_with_frame(&frame);
+    let state = session.snapshot();
     let view = state
         .views
         .iter()
@@ -183,33 +233,10 @@ fn cached_diffs_render_visible_fragments_after_horizontal_scrolling() {
     let ViewContent::Items { rows } = &view.content else {
         panic!("expected diff rows")
     };
+    let expected = format!("+{}界", "changed ".repeat(100));
     assert!(
         rows.iter()
-            .all(|row| UnicodeWidthStr::width(row.text.as_str()) <= usize::from(frame.width))
-    );
-    assert!(state.render_plan.rows.iter().flat_map(|row| &row.spans).any(|span| matches!(&span.content, zess_ui::RenderContent::Item {source: zess_ui::ContentSource::View {view_id}, ..} if *view_id == view.view_id)));
-    assert_eq!(
-        normalized(zess_protocol::render_snapshot(&state).unwrap()),
-        normalized(frame)
-    );
-}
-
-#[test]
-fn preview_source_maps_remain_attached_to_each_viewport() {
-    let mut text = TextBuffer::new("abcdefg");
-    let mut narrow = zess_text::PreviewViewport::default();
-    let mut wide = zess_text::PreviewViewport::default();
-    text.render_preview(&mut narrow, 3, 1, true);
-    text.render_preview(&mut wide, 5, 1, true);
-    assert_eq!(narrow.hit_positions, vec![vec![0, 1, 2]]);
-    assert_eq!(wide.hit_positions, vec![vec![0, 1, 2, 3, 4]]);
-    assert_eq!(
-        text.preview_visible_source_lines(&narrow, true),
-        vec![(0, 0, "abc".into())]
-    );
-    assert_eq!(
-        text.preview_visible_source_lines(&wide, true),
-        vec![(0, 0, "abcde".into())]
+            .any(|row| row.text == expected && row.line_number == Some(1))
     );
 }
 
@@ -499,7 +526,7 @@ fn saving_rejects_a_stale_buffer_version() {
     let mut session = fixture.session(&[path.clone()]);
     let buffer_id = session.views[&session.focus].location.buffer;
     let version = match &session.buffers[&buffer_id] {
-        Buffer::Text(text) => text.version(),
+        Buffer::Text(text) => text.document_version(),
         _ => unreachable!(),
     };
     for key in ["i", "!", "Esc"] {
@@ -510,30 +537,15 @@ fn saving_rejects_a_stale_buffer_version() {
     assert!(matches!(outcome, Some(CommandOutcome::Failed { .. })));
     assert_eq!(fs::read_to_string(&path).unwrap(), "old");
     let version = match &session.buffers[&buffer_id] {
-        Buffer::Text(text) => text.version(),
+        Buffer::Text(text) => text.document_version(),
         _ => unreachable!(),
     };
-    assert_eq!(
+    assert!(matches!(
         session.begin_operation("save", &CommandAction::Save { buffer_id, version }),
-        Some(CommandOutcome::Saved { buffer_id, version })
-    );
+        Some(CommandOutcome::Saved { buffer_id: saved_buffer, version: saved })
+            if saved_buffer == buffer_id && saved > version
+    ));
     assert_eq!(fs::read_to_string(path).unwrap(), "!old");
-}
-
-#[test]
-fn tracked_prompt_submission_returns_the_save_error() {
-    let fixture = Fixture::new();
-    let mut session = fixture.session(&[]);
-    for key in [":", "w"] {
-        session.input(key);
-    }
-    assert_eq!(
-        session.tracked_input("save", "Enter"),
-        Some(CommandOutcome::Failed {
-            message: "buffer has no file name".into()
-        })
-    );
-    assert!(session.take_operation_completions().is_empty());
 }
 
 #[test]

@@ -58,7 +58,19 @@ fn file_actions_follow_the_selected_worktree_or_commit() {
             settle(&mut session);
         }
         session.input("y");
-        let frame = rendered(&mut session);
+        let entries = {
+            let (scopes, mode) = session.key_context();
+            let runtime = session.scripts.as_ref().unwrap();
+            runtime.with_keymap(|keymap| {
+                runtime.with_commands(|catalog| {
+                    zess_plugin::command_menu::binding_entries(
+                        catalog,
+                        keymap.effective_bindings(&scopes, &mode),
+                        session.key_sequence.keys(),
+                    )
+                })
+            })
+        };
         for description in [
             "Yank relative paths",
             "Yank absolute paths",
@@ -66,7 +78,10 @@ fn file_actions_follow_the_selected_worktree_or_commit() {
             "Yank file contents",
             "Yank file diffs",
         ] {
-            assert!(frame.contains(description), "{frame}");
+            assert!(
+                entries.iter().any(|(_, text)| text == description),
+                "{description}"
+            );
         }
         session.input("Esc");
         for (key, expected) in [

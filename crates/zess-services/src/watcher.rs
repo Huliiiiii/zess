@@ -221,6 +221,7 @@ impl Registration {
 }
 
 /// Keeps a query's watches alive and tracks this consumer's acknowledged changes.
+#[derive(Clone)]
 pub struct Observation {
     query: Arc<Query>,
     seen: u64,

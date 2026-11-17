@@ -7,8 +7,9 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
 use crate::{
-    BufferKindId, BufferPluginHandle, CommandCatalog, CommandImplementation, EditorOptions,
-    HostRequest, IdentityRegistry, Keymap, ModeId, PluginRegistrar,
+    BindingCatalog, BindingCommand, BufferKindId, BufferPluginHandle, CommandCatalog,
+    CommandImplementation, EditorOptions, HostRequest, IdentityRegistry, Keymap, ModeId,
+    PluginRegistrar,
 };
 
 #[derive(Clone)]
@@ -33,6 +34,7 @@ pub struct Registry<H> {
     buffers: BTreeMap<BufferKindId, BufferBackend<H>>,
     catalog: CommandCatalog,
     commands: BTreeMap<String, CommandImplementation<H>>,
+    command_revision: u64,
     pub apis: BTreeMap<String, H>,
     pub events: BTreeMap<String, H>,
     contexts: BTreeMap<BufferKindId, Vec<ContextRegistration>>,
@@ -59,6 +61,7 @@ impl<H> Registry<H> {
             buffers: BTreeMap::new(),
             catalog: CommandCatalog::default(),
             commands: BTreeMap::new(),
+            command_revision: 0,
             apis: BTreeMap::new(),
             events: BTreeMap::new(),
             contexts: BTreeMap::new(),
@@ -107,6 +110,39 @@ impl<H> Registry<H> {
         &self.catalog
     }
 
+    pub fn binding_revision(&self) -> u64 {
+        self.command_revision + self.keymap.revision()
+    }
+
+    pub fn binding_catalog(&self) -> BindingCatalog {
+        let implementations = self
+            .commands
+            .iter()
+            .map(|(name, command)| {
+                let implementation = match command {
+                    CommandImplementation::Native => BindingCommand::Native,
+                    CommandImplementation::Request(request) => {
+                        BindingCommand::Request(request.clone())
+                    }
+                    CommandImplementation::External(_) => BindingCommand::Script,
+                    CommandImplementation::BufferEvent { kind, event } => {
+                        BindingCommand::BufferEvent {
+                            kind: kind.clone(),
+                            event: event.clone(),
+                        }
+                    }
+                };
+                (name.clone(), implementation)
+            })
+            .collect();
+        BindingCatalog {
+            commands: self.catalog.clone(),
+            status: crate::StatusConfig::default(),
+            implementations,
+            keymap: self.keymap.definition(),
+        }
+    }
+
     pub fn register_command(
         &mut self,
         id: &str,
@@ -123,15 +159,18 @@ impl<H> Registry<H> {
         description: &str,
         implementation: CommandImplementation<H>,
     ) {
+        self.command_revision += 1;
         self.catalog.register_action(id, description);
         self.commands.insert(id.to_owned(), implementation);
     }
 
     pub fn register_command_line(&mut self, id: &str, name: &str) {
+        self.command_revision += 1;
         self.catalog.register_command_line(id, name);
     }
 
     pub fn register_command_alias(&mut self, alias: &str, name: &str) {
+        self.command_revision += 1;
         self.catalog.register_alias(alias, name);
     }
 
@@ -201,6 +240,18 @@ impl<H> Registry<H> {
 
     pub fn view_options(&self, kind: &str) -> Value {
         self.view_options_with_overrides(kind, None)
+    }
+
+    pub fn all_view_options(&self) -> BTreeMap<String, Value> {
+        self.view_defaults
+            .keys()
+            .chain(self.view_options.keys())
+            .map(|kind| {
+                let name = self.identities.buffer_kind_name(*kind).to_string();
+                let options = self.view_options(&name);
+                (name, options)
+            })
+            .collect()
     }
 
     pub fn validate_view_options_value(&self, kind: Option<&str>, options: &Value) -> Result<()> {

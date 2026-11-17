@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 
-use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
 
-use crate::{FrameRow, Span, StyleAttribute, StyleColor, TextStyle};
+use crate::{FrameRow, Span, StyleAttribute, StyleColor, TextStyle, fitting_prefix};
 
 #[cfg(test)]
 mod tests;
@@ -41,7 +40,7 @@ impl AnsiText {
             row: FrameRow::default(),
             style: TextStyle::reset(),
             style_key: String::new(),
-            column: 0,
+            text_after_tab: (0, 0),
             diff_metadata: Vec::new(),
         };
         vte::Parser::new().advance(&mut decoder, text.as_bytes());
@@ -57,7 +56,7 @@ struct Decoder {
     row: FrameRow,
     style: TextStyle,
     style_key: String,
-    column: usize,
+    text_after_tab: (usize, usize),
     diff_metadata: Vec<DiffLineMetadata>,
 }
 
@@ -67,7 +66,7 @@ impl Decoder {
         self.output
             .diff_metadata
             .push(std::mem::take(&mut self.diff_metadata));
-        self.column = 0;
+        self.text_after_tab = (0, 0);
     }
 
     fn attribute(&mut self, attribute: StyleAttribute, enabled: bool) {
@@ -109,7 +108,6 @@ impl Perform for Decoder {
                 style: self.style_key.clone(),
             });
         }
-        self.column += ch.width().unwrap_or(0);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -118,9 +116,20 @@ impl Perform for Decoder {
                 self.finish_row();
             }
             b'\t' => {
-                for _ in 0..8 - self.column % 8 {
+                let (index, bytes) = self.text_after_tab;
+                let parts = self.row.spans[index..].iter().enumerate().map(|(i, span)| {
+                    if i == 0 {
+                        &span.text[bytes..]
+                    } else {
+                        span.text.as_str()
+                    }
+                });
+                let (_, columns) = fitting_prefix(parts, usize::MAX);
+                for _ in 0..8 - columns % 8 {
                     self.print(' ');
                 }
+                let index = self.row.spans.len() - 1;
+                self.text_after_tab = (index, self.row.spans[index].text.len());
             }
             _ => {}
         }

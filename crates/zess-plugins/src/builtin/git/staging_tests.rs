@@ -19,8 +19,8 @@ fn pending_line_counts_are_distinct_from_completed_unknown_counts() {
         LineCountState::Loading,
     );
     let row = &tree.nodes["file:binary.bin"].row;
-    assert_eq!(row.cells[1].spans[0].text, "+…");
-    assert_eq!(row.cells[2].spans[0].text, "-…");
+    assert!(row.cells[1].spans[0].text.trim().is_empty());
+    assert!(row.cells[2].spans[0].text.trim().is_empty());
     tree.rebuild(
         vec![TreeFile::Changed(entry)],
         GitTreeMode::Flat,

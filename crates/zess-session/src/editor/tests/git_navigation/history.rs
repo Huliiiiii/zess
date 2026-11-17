@@ -83,11 +83,13 @@ fn history_file_selection_survives_republication_and_tracks_the_focused_row() {
         session.views[&target].location.selection.primary.as_deref(),
         Some("two")
     );
-    let (rows, _) = session.render_view(target, 60, 10);
-    assert!(
-        rows.iter()
-            .flat_map(|row| &row.spans)
-            .any(|span| span.text.contains("two") && span.style.starts_with("selection."))
+    let view = view_snapshot(&mut session, target);
+    assert_eq!(
+        view.selection,
+        zess_protocol::ViewSelection::Items {
+            ids: vec!["two".into()],
+            primary: Some("two".into()),
+        }
     );
 }
 
@@ -245,28 +247,27 @@ fn history_shows_commit_information_and_file_line_counts_in_fixed_vertical_panes
             .unwrap();
         assert_eq!((ax, aw), (bx, bw));
         assert_eq!(ay + ah, by);
-        let (rows, _) = session.render_view(info, aw, ah);
-        assert_eq!(rows[1].spans[0].text, oid);
-        assert_eq!(rows[1].spans[0].style, "constant");
-        let (rows, _) = session.render_view(summary, bw, 12);
-        let first = rows[1]
-            .spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>();
-        assert!(first.starts_with("4 files, 1 binary file"));
-        assert_eq!(rows[3].spans[0].text.trim_end(), "added.txt");
+        let info = view_snapshot(&mut session, info);
+        let info_rows = item_rows(&info.content);
+        assert_eq!(info_rows[0].text, oid);
+        assert_eq!(info_rows[0].style, "constant");
+        let summary = view_snapshot(&mut session, summary);
+        let rows = item_rows(&summary.content);
+        assert_eq!(rows[0].text, "4 files, 1 binary file");
+        assert_eq!(rows[2].text.trim(), "added.txt");
         assert!(
-            rows[1]
-                .spans
+            rows[0]
+                .cells
                 .iter()
-                .any(|span| span.text.trim() == "+4" && span.style == "git.added")
+                .flatten()
+                .any(|span| span.text == "+4" && span.style == "git.added")
         );
         assert!(
-            rows[1]
-                .spans
+            rows[0]
+                .cells
                 .iter()
-                .any(|span| span.text.trim() == "-1" && span.style == "git.deleted")
+                .flatten()
+                .any(|span| span.text == "-1" && span.style == "git.deleted")
         );
     }
 }
@@ -353,6 +354,188 @@ fn historical_diff_source_opens_the_complete_readonly_blob_from_that_commit() {
     assert!(session.command("write note.txt").is_err());
     assert_eq!(fs::read_to_string(path).unwrap(), "working\n");
     assert!(preview_groups(&session).next().is_none());
+}
+
+#[test]
+fn an_unjournaled_historical_open_keeps_its_document_when_the_page_detaches() {
+    use zess_protocol::{
+        CommandAction, CommandOutcome, CommandTarget,
+        resource::{PageCommandInput, PageId, PageInput, PageSource, ResourceRequest},
+    };
+
+    let (fixture, _) = repository();
+    let commit = git(&fixture, &["rev-parse", "HEAD"]);
+    let mut session = fixture.session(&[]);
+    let page_id = PageId {
+        context_epoch: 0,
+        sequence: 1,
+    };
+    let selection = ItemSelection {
+        primary: Some("file:note.txt".into()),
+        selected: vec!["file:note.txt".into()],
+        anchor: Some("file:note.txt".into()),
+    };
+    session.handle_resource(ResourceRequest::Subscribe {
+        subscription_id: 1,
+        page_id,
+        clone_from: None,
+        source: PageSource {
+            kind: "git-commit-files".into(),
+            argument: json!({ "commit": commit }),
+        },
+        input: PageInput {
+            generation: 0,
+            selection: selection.clone(),
+            register: None,
+            mode: "normal".into(),
+            filter: None,
+            source_buffer: None,
+            width: 40,
+            active: true,
+            preview_width: 39,
+            preview_height: 22,
+        },
+    });
+    wait_until(&mut session, |session| {
+        session.take_resource_updates().iter().any(|update| {
+            update.output.display.as_ref().is_some_and(|display| {
+                !display.loading && display.rows.iter().any(|row| row.id == "file:note.txt")
+            })
+        })
+    });
+
+    let operation = "client:1";
+    if let Some(outcome) = session.begin_operation(
+        operation,
+        &CommandAction::Invoke {
+            target: CommandTarget::Page {
+                subscription_id: 1,
+                input: PageCommandInput {
+                    generation: 0,
+                    selection,
+                    register: None,
+                },
+            },
+            name: "git-commit-files.edit-layer".into(),
+            argument: json!({}),
+        },
+    ) {
+        session.finish_operation(operation.into(), outcome);
+    }
+    wait_until(&mut session, |session| {
+        session
+            .operation_completions
+            .iter()
+            .any(|(id, _)| id == operation)
+    });
+    session.detach_resources(None, |_| false);
+
+    let completions = session.take_operation_completions();
+    let [
+        (
+            id,
+            CommandOutcome::PageApplied {
+                page_id: origin,
+                document: Some(document),
+                ..
+            },
+        ),
+    ] = completions.as_slice()
+    else {
+        panic!("the historical open must complete with its document");
+    };
+    assert_eq!(id, operation);
+    assert_eq!(*origin, page_id);
+    assert!(document.fullscreen);
+    assert_eq!(
+        session.document_snapshot(document.buffer_id).unwrap().text,
+        "historical\n"
+    );
+}
+
+#[test]
+fn resizing_a_resource_page_preserves_the_pending_historical_source_request() {
+    use zess_protocol::resource::{
+        PageInput, PageSource, ResourceEvent, ResourceRequest, ResourceUpdateKind,
+    };
+
+    let (fixture, _) = repository();
+    let commit = git(&fixture, &["rev-parse", "HEAD"]);
+    let mut session = fixture.session(&[]);
+    let mut input = PageInput {
+        generation: 0,
+        selection: ItemSelection {
+            primary: Some("file:note.txt".into()),
+            selected: vec!["file:note.txt".into()],
+            anchor: Some("file:note.txt".into()),
+        },
+        register: None,
+        mode: "normal".into(),
+        filter: None,
+        source_buffer: None,
+        width: 40,
+        active: false,
+        preview_width: 39,
+        preview_height: 22,
+    };
+    session.handle_resource(ResourceRequest::Subscribe {
+        subscription_id: 7,
+        page_id: zess_protocol::resource::PageId {
+            context_epoch: 0,
+            sequence: 7,
+        },
+        clone_from: None,
+        source: PageSource {
+            kind: "git".into(),
+            argument: Value::Null,
+        },
+        input: input.clone(),
+    });
+    wait_until(&mut session, |session| {
+        session
+            .take_resource_updates()
+            .iter()
+            .any(|update| update.patch_revision.is_some())
+    });
+
+    input.generation = 1;
+    session.handle_resource(ResourceRequest::Update {
+        subscription_id: 7,
+        input: input.clone(),
+        event: ResourceEvent::CommitSource {
+            commit: commit.clone(),
+            path: "note.txt".into(),
+            line: 1,
+            fullscreen: true,
+        },
+    });
+    input.generation = 2;
+    input.preview_height = 29;
+    session.handle_resource(ResourceRequest::Update {
+        subscription_id: 7,
+        input,
+        event: ResourceEvent::Resize,
+    });
+    wait_until(&mut session, |session| {
+        let update = session
+            .take_resource_updates()
+            .into_iter()
+            .find(|update| matches!(update.kind, ResourceUpdateKind::SourceNavigation));
+        let Some(update) = update else {
+            return false;
+        };
+        assert_eq!(update.subscription_id, 7);
+        assert_eq!(update.generation, 1);
+        let document = update.document.unwrap();
+        assert_eq!(document.line, 1);
+        assert!(document.fullscreen);
+        let Buffer::Snapshot { id, text } = &session.buffers[&document.buffer_id] else {
+            panic!("expected a historical file");
+        };
+        assert_eq!(id.commit, commit);
+        assert_eq!(text.text(), "historical\n");
+        true
+    });
 }
 
 #[test]

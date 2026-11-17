@@ -29,17 +29,26 @@ fn plain_text_sessions_remain_editable_when_the_syntax_runtime_is_invalid() {
     }
     session.command("w").unwrap();
     assert_eq!(fs::read_to_string(&path).unwrap(), "!plain text");
-    assert!(session.frame().rows.iter().any(|row| {
-        row.spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>()
-            .contains("!plain text")
-    }));
+    let state = session.snapshot();
+    let focused = state
+        .views
+        .iter()
+        .find(|view| Some(view.view_id) == state.focused_view)
+        .unwrap();
+    let zess_protocol::ViewContent::Text { lines } = &focused.content else {
+        panic!("expected a text view");
+    };
+    assert_eq!(lines[0].text, "!plain text");
     session.command("lang rust").unwrap();
-    session.frame();
+    session.snapshot();
     let buffer = session.views[&session.focus].location.buffer;
-    let text = session.buffers.get_mut(&buffer).unwrap().text().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.document(buffer).unwrap().syntax_error().is_none() {
+        assert!(Instant::now() < deadline);
+        session.tick();
+        std::thread::yield_now();
+    }
+    let text = session.document(buffer).unwrap();
     assert_eq!(
         text.syntax_error(),
         Some("ZESS_RUNTIME must name a directory")
@@ -103,6 +112,82 @@ fn script_actions_use_the_language_command() {
     session.command("choose-language rust").unwrap();
     session.command("lang").unwrap();
     assert_eq!(session.message, "rust");
+}
+
+#[test]
+fn a_script_command_uses_its_target_after_focus_moves() {
+    use zess_protocol::{CommandAction, CommandOutcome, CommandTarget};
+
+    let fixture = Fixture::new();
+    let config = fixture.write(
+        "config.w",
+        r#"require "zess/ui"
+register-command "choose-language" "Choose language"
+  lambda : argument
+    request-action "set-language" argument
+register-command-alias "choose" "choose-language"
+"#,
+    );
+    let mut session = Session::new(fixture.0.clone(), &[], Some(config)).unwrap();
+    let view_id = session.focus;
+    let buffer_id = session.views[&view_id].location.buffer;
+    session.command("vsplit").unwrap();
+    session.command("new").unwrap();
+    let focused = session.focus;
+    let invoke = |argument| CommandAction::Invoke {
+        target: CommandTarget::View { view_id, buffer_id },
+        name: "choose".into(),
+        argument: json!({"argument": argument}),
+    };
+
+    let Some(CommandOutcome::ClientRequest { request }) =
+        session.begin_operation("resolve", &invoke("rust"))
+    else {
+        panic!("script should return its requested native action to the client");
+    };
+    assert_eq!(
+        request,
+        HostRequest::Action {
+            name: "set-language".into(),
+            argument: json!({"argument":"rust"})
+        }
+    );
+    let target = CommandTarget::View { view_id, buffer_id };
+    assert_eq!(
+        session.begin_operation(
+            "set",
+            &CommandAction::Request {
+                target: target.clone(),
+                request,
+            },
+        ),
+        Some(CommandOutcome::Applied)
+    );
+    assert_eq!(
+        session.begin_operation(
+            "read",
+            &CommandAction::Invoke {
+                target,
+                name: "lang".into(),
+                argument: json!({})
+            }
+        ),
+        Some(CommandOutcome::Message {
+            message: "rust".into()
+        })
+    );
+    assert_eq!(session.focus, focused);
+    session.command("lang").unwrap();
+    assert_eq!(session.message, "text");
+
+    session.focus_view(view_id).unwrap();
+    session.command("new").unwrap();
+    assert!(matches!(
+        session.begin_operation("stale", &invoke("rust")),
+        Some(CommandOutcome::Failed { .. })
+    ));
+    session.command("lang").unwrap();
+    assert_eq!(session.message, "text");
 }
 
 #[test]

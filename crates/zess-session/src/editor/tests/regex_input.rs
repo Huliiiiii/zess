@@ -9,7 +9,7 @@ fn selection_patterns_preview_edits_and_cancel_back_to_the_original_selection() 
     let mut session = fixture.session(&[path]);
     let mut input = Input::new(&mut session);
     input.keys(&["%", "v", "s"]);
-    assert_eq!(input.session.frame().prompt, "select: ");
+    assert_eq!(prompt_text(input.session), "select: ");
     input.keys(&["a"]);
     input.assert_state(TextState {
         source: "ab ax ab\n".into(),

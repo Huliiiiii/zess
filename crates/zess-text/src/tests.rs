@@ -1,7 +1,7 @@
 use super::*;
 use std::fs;
 
-fn rendered_text(result: &RenderResult) -> String {
+pub(super) fn rendered_text(result: &RenderResult) -> String {
     result
         .rows
         .iter()
@@ -15,7 +15,7 @@ fn rendered_text(result: &RenderResult) -> String {
         .join("\n")
 }
 
-fn styled_text(result: &RenderResult, style: &str) -> String {
+pub(super) fn styled_text(result: &RenderResult, style: &str) -> String {
     result
         .rows
         .iter()
@@ -23,6 +23,34 @@ fn styled_text(result: &RenderResult, style: &str) -> String {
         .filter(|span| span.style == style)
         .map(|span| span.text.as_str())
         .collect()
+}
+
+pub(super) fn wait_for_highlight_refresh(buffer: &mut TextBuffer) {
+    buffer.language.as_mut().unwrap().request();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !buffer.poll_syntax() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn preview_source_maps_remain_attached_to_each_viewport() {
+    let mut text = TextBuffer::new("abcdefg");
+    let mut narrow = PreviewViewport::default();
+    let mut wide = PreviewViewport::default();
+    text.render_preview(&mut narrow, 3, 1, true);
+    text.render_preview(&mut wide, 5, 1, true);
+    assert_eq!(narrow.hit_positions, vec![vec![0, 1, 2]]);
+    assert_eq!(wide.hit_positions, vec![vec![0, 1, 2, 3, 4]]);
+    assert_eq!(
+        text.surface_source_lines(&mut narrow, 3, 1, true)[0].text,
+        "abc"
+    );
+    assert_eq!(
+        text.surface_source_lines(&mut wide, 5, 1, true)[0].text,
+        "abcde"
+    );
 }
 
 #[test]
@@ -74,13 +102,20 @@ fn preview_painting_uses_only_the_viewport_and_leaves_editing_views_unallocated(
     assert!(replacement.views.is_empty());
 }
 
+fn source_text(lines: Vec<SourceLine>) -> Vec<(usize, usize, String)> {
+    lines
+        .into_iter()
+        .map(|line| (line.line, line.first_char, line.text))
+        .collect()
+}
+
 #[test]
 fn visible_source_fragments_preserve_character_offsets_after_horizontal_scrolling() {
     let mut buffer = TextBuffer::new("\t界a\u{301}🙂Z0123456789\nsecond");
-    buffer.render(1, 4, 1, true);
+    buffer.view_source_lines(1, 4, 1);
     buffer.scroll_view(1, 5, 0);
     assert_eq!(
-        buffer.visible_source_lines(1),
+        source_text(buffer.view_source_lines(1, 4, 1)),
         vec![(0, 1, "界a\u{301}🙂".into())]
     );
 
@@ -88,9 +123,8 @@ fn visible_source_fragments_preserve_character_offsets_after_horizontal_scrollin
         horizontal_scroll: 5,
         ..PreviewViewport::default()
     };
-    buffer.render_preview(&mut viewport, 4, 1, false);
     assert_eq!(
-        buffer.preview_visible_source_lines(&viewport, false),
+        source_text(buffer.surface_source_lines(&mut viewport, 4, 1, false)),
         vec![(0, 1, "界a\u{301}🙂".into())]
     );
 }
@@ -98,12 +132,13 @@ fn visible_source_fragments_preserve_character_offsets_after_horizontal_scrollin
 #[test]
 fn visible_source_fragments_bound_large_lines_to_the_viewport() {
     let mut buffer = TextBuffer::new(&"a".repeat(20 * 1024 * 1024));
-    buffer.render(1, 80, 2, true);
-    assert_eq!(buffer.visible_source_lines(1), vec![(0, 0, "a".repeat(80))]);
-    let mut viewport = PreviewViewport::default();
-    buffer.render_preview(&mut viewport, 80, 2, true);
     assert_eq!(
-        buffer.preview_visible_source_lines(&viewport, true),
+        source_text(buffer.view_source_lines(1, 80, 2)),
+        vec![(0, 0, "a".repeat(80))]
+    );
+    let mut viewport = PreviewViewport::default();
+    assert_eq!(
+        source_text(buffer.surface_source_lines(&mut viewport, 80, 2, true)),
         vec![(0, 0, "a".repeat(160))]
     );
 }
@@ -131,7 +166,7 @@ fn wrapped_previews_scroll_through_visual_lines_and_reflow_after_resize() {
     assert_eq!(layout.rows.len(), 3);
     assert!(!layout.complete);
     assert_eq!(
-        buffer.preview_visible_source_lines(&viewport, true),
+        source_text(buffer.surface_source_lines(&mut viewport, 8, 2, true)),
         vec![(0, 0, "abcdefghijklmnop".into())]
     );
     viewport.scroll = 99;
@@ -143,7 +178,7 @@ fn wrapped_previews_scroll_through_visual_lines_and_reflow_after_resize() {
     assert_eq!(viewport.scroll, 2);
     assert_eq!(viewport.horizontal_scroll, 0);
     assert_eq!(
-        buffer.preview_visible_source_lines(&viewport, true),
+        source_text(buffer.surface_source_lines(&mut viewport, 8, 2, true)),
         vec![(0, 16, "qrstuvwx\n".into()), (1, 25, "tail".into())]
     );
     assert_eq!(
@@ -339,6 +374,7 @@ fn wisp_files_highlight_special_forms_strings_and_comments() {
         "\ndefine : greet name\n  string-append \"hello\" name ; comment\n",
         Path::new("plugin.w"),
     );
+    wait_for_highlight_refresh(&mut buffer);
     let frame = buffer.render(1, 80, 4, false);
     for (fragment, style) in [
         ("define", "keyword"),
@@ -354,21 +390,14 @@ fn preview_highlights_follow_the_latest_contents_after_background_parsing() {
     let mut buffer = TextBuffer::new_preview_with_path("// old comment\n", Path::new("test.rs"));
     buffer.set_readonly(true);
     buffer.replace_readonly("fn latest() {}\n").unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !buffer.poll_syntax() {
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::yield_now();
-    }
+    wait_for_highlight_refresh(&mut buffer);
     let rendered = buffer.render(1, 80, 1, false);
     assert_eq!(styled_text(&rendered, "keyword.function"), "fn");
     assert_eq!(styled_text(&rendered, "comment.line"), "");
     assert!(buffer.syntax_error().is_none());
 
     buffer.replace_readonly("// new comment\n").unwrap();
-    while !buffer.poll_syntax() {
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::yield_now();
-    }
+    wait_for_highlight_refresh(&mut buffer);
     let rendered = buffer.render(1, 80, 1, false);
     assert_eq!(styled_text(&rendered, "comment.line"), "// new comment");
     assert_eq!(styled_text(&rendered, "keyword.function"), "");
@@ -436,6 +465,17 @@ fn widening_the_viewport_or_shortening_content_clamps_horizontal_scroll() {
     buffer.replace_readonly("abc").unwrap();
 
     assert_eq!(rendered_text(&buffer.render(1, 9, 1, false)), "abc");
+}
+
+#[test]
+fn backspace_at_the_start_of_a_document_preserves_its_version() {
+    let mut buffer = TextBuffer::new("text");
+    buffer.execute_command(1, "text.insert").unwrap();
+    let version = buffer.version();
+    let effect = buffer.execute_command(1, "text.delete-backward").unwrap();
+    assert!(!effect.changed);
+    assert_eq!(buffer.version(), version);
+    assert_eq!(buffer.text(), "text");
 }
 
 #[test]
@@ -1556,6 +1596,8 @@ fn rust_indentation_works_before_the_first_render() {
 fn rust_buffers_keep_their_highlights_and_outlines_independent() {
     let mut first = TextBuffer::new_with_path("\nfn alpha() {}\n", Path::new("first.rs"));
     let mut second = TextBuffer::new_with_path("\nstruct Beta;\n", Path::new("second.rs"));
+    wait_for_highlight_refresh(&mut first);
+    wait_for_highlight_refresh(&mut second);
     assert_eq!(
         styled_text(&first.render(1, 40, 3, false), "keyword.function"),
         "fn"
@@ -1587,6 +1629,8 @@ fn wisp_buffers_keep_their_highlights_independent_after_updates() {
         TextBuffer::new_with_path("\ndefine : alpha\n  \"one\"\n", Path::new("first.w"));
     let mut second =
         TextBuffer::new_with_path("\ndefine : beta\n  #t ; keep\n", Path::new("second.w"));
+    wait_for_highlight_refresh(&mut first);
+    wait_for_highlight_refresh(&mut second);
     assert_eq!(
         styled_text(&first.render(1, 40, 4, false), "string"),
         "\"one\""
@@ -1600,6 +1644,7 @@ fn wisp_buffers_keep_their_highlights_independent_after_updates() {
     first
         .replace_readonly("\nlambda : x\n  \"changed\"\n")
         .unwrap();
+    wait_for_highlight_refresh(&mut first);
     assert_eq!(
         styled_text(&first.render(1, 40, 4, false), "string"),
         "\"changed\""
@@ -1616,6 +1661,7 @@ fn explicit_languages_override_file_name_detection() {
     assert_eq!(buffer.language_id(), Some("rust"));
     buffer.set_language(Some("wisp")).unwrap();
     assert_eq!(buffer.language_id(), Some("wisp"));
+    wait_for_highlight_refresh(&mut buffer);
     assert_eq!(
         styled_text(&buffer.render(1, 40, 4, false), "keyword"),
         "define"
@@ -1679,6 +1725,7 @@ fn wisp_highlights_follow_edits_undo_and_redo() {
     let mut buffer =
         TextBuffer::new_with_path("\ndefine : alpha\n  \"one\"\n", Path::new("history.wisp"));
     assert_eq!(buffer.language_id(), Some("wisp"));
+    wait_for_highlight_refresh(&mut buffer);
     assert_eq!(
         styled_text(&buffer.render(1, 40, 4, false), "string"),
         "\"one\""
@@ -1693,18 +1740,21 @@ fn wisp_highlights_follow_edits_undo_and_redo() {
         }
     }
     buffer.execute(1, TextCommand::Escape).unwrap();
+    wait_for_highlight_refresh(&mut buffer);
     assert_eq!(
         styled_text(&buffer.render(1, 40, 4, false), "comment"),
         "; changed"
     );
     buffer.execute(1, TextCommand::Undo).unwrap();
     buffer.execute(1, TextCommand::GotoFileStart).unwrap();
+    wait_for_highlight_refresh(&mut buffer);
     assert_eq!(
         styled_text(&buffer.render(1, 40, 4, false), "string"),
         "\"one\""
     );
     assert_eq!(styled_text(&buffer.render(1, 40, 4, false), "comment"), "");
     buffer.execute(1, TextCommand::Redo).unwrap();
+    wait_for_highlight_refresh(&mut buffer);
     assert_eq!(
         styled_text(&buffer.render(1, 40, 4, false), "comment"),
         "; changed"
@@ -1831,6 +1881,7 @@ fn reloading_updates_the_outline_and_highlights() {
 fn scrolling_into_a_multiline_comment_preserves_its_highlight() {
     let mut buffer =
         TextBuffer::new_with_path("/*\none\ntwo\nthree\n*/\n", Path::new("comment.rs"));
+    wait_for_highlight_refresh(&mut buffer);
     buffer.render(1, 40, 2, false);
     buffer.scroll_view(1, 0, 2);
     let frame = buffer.render(1, 40, 2, false);
@@ -1842,6 +1893,7 @@ fn scrolling_into_a_multiline_comment_preserves_its_highlight() {
 fn missing_runtime_keeps_text_editable() {
     if std::env::var_os("ZESS_TEST_MISSING_RUNTIME").is_some() {
         let mut buffer = TextBuffer::new_with_path("\nfn original() {}\n", Path::new("missing.rs"));
+        wait_for_highlight_refresh(&mut buffer);
         let frame = buffer.render(1, 40, 3, false);
         assert_eq!(rendered_text(&frame), "\nfn original() {}\n");
         assert!(
@@ -2172,6 +2224,7 @@ fn selections_crossing_the_viewport_keep_their_styles_and_secondary_cursor() {
 #[test]
 fn selection_and_cursor_styles_override_syntax_only_within_their_ranges() {
     let mut buffer = TextBuffer::new_with_path("define x", Path::new("plugin.w"));
+    wait_for_highlight_refresh(&mut buffer);
     buffer.ensure_view(1);
     buffer.views.get_mut(&1).unwrap().selection = Selection::new(
         SmallVec::from_vec(vec![Range::new(0, 2), Range::new(3, 5)]),

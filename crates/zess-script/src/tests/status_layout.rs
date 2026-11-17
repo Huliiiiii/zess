@@ -2,6 +2,135 @@ use super::*;
 use zess_plugin::{StatusContent, StatusContext};
 
 #[test]
+fn mode_labels_fit_whole_graphemes_and_reserve_the_same_columns_when_inactive() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    runtime
+        .load(&directory.write(
+            "config.w",
+            "require \"zess/status\"\nset-mode-labels! 'normal \"👩‍💻界\"\n",
+        ))
+        .unwrap();
+    let config = runtime.binding_catalog().status;
+    for (width, active, expected) in [
+        (6, true, " 👩‍💻界 "),
+        (6, false, "      "),
+        (4, true, "👩‍💻界"),
+        (4, false, "    "),
+        (3, true, "👩‍💻"),
+        (3, false, "  "),
+        (1, true, ""),
+    ] {
+        let context = StatusContext {
+            width,
+            active,
+            ..Default::default()
+        };
+        let local = config.format_local("default", &context).unwrap();
+        let script = runtime.format_statusline("default", &context).unwrap();
+        assert_eq!(local.left[0].text, expected);
+        assert_eq!(script.left[0].text, expected);
+    }
+}
+
+#[test]
+fn a_grapheme_split_across_status_spans_leaves_room_for_the_right_region() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    runtime
+        .load(&directory.write(
+            "config.w",
+            r#"require "zess/status"
+register-statusline "custom"
+  lambda : context
+    statusline (list (status-span "👩‍" "left") (status-span "💻" "right")) "" "OK"
+"#,
+        ))
+        .unwrap();
+    let line = runtime
+        .format_statusline("custom", &StatusContext::default())
+        .unwrap();
+    let row = line.render(4, 0, true);
+    assert_eq!(
+        row.iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>(),
+        "👩‍💻OK"
+    );
+}
+
+#[test]
+fn binding_catalog_exports_status_configuration_for_client_rendering() {
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    runtime
+        .load(&directory.write(
+            "config.w",
+            r#"require "zess/status"
+set-mode-labels! : obj 'normal "N"
+set-status-formats! : obj 'pending "Waiting {count}"
+set-view-options! 'preview : obj 'statusline "preview" 'gutter #f
+statusline-layout files
+  left mode " " title
+  right
+    join " · " pending (join "/" items custom)
+register-statusline-component 'custom
+  lambda : context
+    . "custom"
+"#,
+        ))
+        .unwrap();
+    let catalog = runtime.binding_catalog();
+    let status = serde_json::to_value(catalog.status).unwrap();
+    assert_eq!(status["mode_labels"]["normal"], "N");
+    assert_eq!(status["status_formats"]["pending"], "Waiting {count}");
+    assert_eq!(status["view_options"]["preview"]["gutter"], false);
+    assert_eq!(
+        status["layouts"]["files"]["left"],
+        serde_json::json!([
+            {"Component": "mode"}, {"Literal": " "}, {"Component": "title"}
+        ])
+    );
+    assert_eq!(
+        status["layouts"]["files"]["right"],
+        serde_json::json!([
+            {"Join": {"separator": " · ", "elements": [
+                {"Component": "pending"},
+                {"Join": {"separator": "/", "elements": [{"Component": "items"}, {"Component": "custom"}]}}
+            ]}}
+        ])
+    );
+    assert!(
+        status["builtin_statuslines"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("default".into()))
+    );
+    assert!(
+        status["builtin_components"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("title".into()))
+    );
+    assert!(
+        !status["builtin_components"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("custom".into()))
+    );
+    let revision = runtime.binding_revision();
+    runtime
+        .engine
+        .run("(set-mode-labels! (hash 'normal \"NORMAL\"))")
+        .unwrap();
+    assert!(runtime.binding_revision() > revision);
+    assert_eq!(
+        runtime.binding_catalog().status.mode_labels["normal"],
+        "NORMAL"
+    );
+}
+
+#[test]
 fn plugins_can_register_components_and_declare_layouts_from_their_own_module() {
     let directory = SourceDirectory::new();
     directory.write(

@@ -4,7 +4,7 @@ use zess_ui::DisplayRow;
 
 use crate::BufferId;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostRequest {
     PreviewGroup {
@@ -76,6 +76,8 @@ pub enum HostRequest {
         text: String,
         #[serde(default)]
         key_scope: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmation: Option<String>,
     },
     Preview {
         path: String,
@@ -108,7 +110,7 @@ pub fn validate_register_write(register: char) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "presentation", rename_all = "snake_case")]
 pub enum PreviewPane {
     Surface {
@@ -177,7 +179,7 @@ impl PreviewArea {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PreviewLayout {
     Rows,
@@ -222,7 +224,7 @@ impl PreviewLayout {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PreviewContent {
     Text {
@@ -257,7 +259,13 @@ pub enum PreviewContent {
     },
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PageNavigationSource {
+    pub kind: String,
+    pub tab_kind: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Navigation {
     Push {
@@ -271,10 +279,12 @@ pub enum Navigation {
         page: String,
         kind: String,
         argument: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<PageNavigationSource>,
     },
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotPresentation {
     Editor,
@@ -289,7 +299,7 @@ pub struct SnapshotId {
     pub blob: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FileSnapshot {
     pub id: SnapshotId,
     pub text: String,

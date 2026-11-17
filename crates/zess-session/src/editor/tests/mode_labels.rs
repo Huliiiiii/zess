@@ -5,7 +5,6 @@ use zess_plugin::StatusContext;
 fn modes_have_short_default_labels() {
     let fixture = Fixture::new();
     let mut session = fixture.session(&[]);
-    let id = session.focus;
     for (mode, label) in [
         ("normal", " NOR "),
         ("insert", " INS "),
@@ -18,19 +17,18 @@ fn modes_have_short_default_labels() {
         ("custom", " CUS "),
         ("go", " GO "),
     ] {
-        let spans = session.statusline(
-            id,
-            "default",
-            StatusContext {
-                mode: Some(mode.into()),
-                width: 40,
-                active: true,
-                ..StatusContext::default()
-            },
-            40,
-            true,
-        );
-        assert_eq!(spans[0].text, label, "mode {mode}");
+        let line = session
+            .format_client_statusline(
+                "default",
+                &StatusContext {
+                    mode: Some(mode.into()),
+                    width: 40,
+                    active: true,
+                    ..StatusContext::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(line.left[0].text, label, "mode {mode}");
     }
 }
 
@@ -45,25 +43,23 @@ fn configured_labels_override_defaults_and_keep_their_full_length() {
     .unwrap();
     let mut session = Session::new(fixture.0.clone(), &[], Some(config)).unwrap();
     assert!(session.generation > 0, "{}", session.message);
-    let id = session.focus;
     for (mode, label) in [
         ("normal", " Editing "),
         ("custom", " Custom "),
         ("insert", " INS "),
     ] {
-        let spans = session.statusline(
-            id,
-            "default",
-            StatusContext {
-                mode: Some(mode.into()),
-                width: 40,
-                active: true,
-                ..StatusContext::default()
-            },
-            40,
-            true,
-        );
-        assert_eq!(spans[0].text, label, "mode {mode}");
+        let line = session
+            .format_client_statusline(
+                "default",
+                &StatusContext {
+                    mode: Some(mode.into()),
+                    width: 40,
+                    active: true,
+                    ..StatusContext::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(line.left[0].text, label, "mode {mode}");
     }
 }
 

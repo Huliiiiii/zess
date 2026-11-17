@@ -5,7 +5,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
@@ -31,9 +34,13 @@ use zess_platform::{FileSystem, NativeFileSystem};
 use zess_plugin::{CommandCount, OutlineSymbol};
 use zess_ui::{FrameRow, ScrollMode, Span};
 
-mod cursor;
-pub use cursor::Cursor;
+pub mod diff;
+mod source;
+pub use source::SourceLine;
+pub use zess_protocol::editor_events::Cursor;
 
+mod document;
+pub use document::DocumentStep;
 mod language;
 pub mod runtime;
 
@@ -324,6 +331,7 @@ pub struct TextView {
     viewport_version: u64,
     count: CommandCount,
     pending: PendingInput,
+    clipboard_read: Option<u64>,
     register: Option<char>,
     prompt_register: char,
     insert_recording: InsertRecording,
@@ -343,6 +351,7 @@ impl Default for TextView {
             viewport_version: 0,
             count: CommandCount::default(),
             pending: PendingInput::None,
+            clipboard_read: None,
             register: None,
             prompt_register: '/',
             insert_recording: InsertRecording::Idle,
@@ -378,6 +387,7 @@ impl TextView {
     }
 
     fn cancel_pending_input(&mut self) {
+        self.clipboard_read = None;
         if let PendingInput::Regex {
             selection,
             scroll,
@@ -408,9 +418,16 @@ pub struct TextEffect {
 
 #[derive(Debug)]
 pub struct ClipboardRead {
+    pub id: u64,
     pub register: char,
     pub command: TextCommand,
     pub count: usize,
+}
+
+impl ClipboardRead {
+    pub fn is_pending_in(&self, buffer: &TextBuffer, view: u64) -> bool {
+        buffer.views.get(&view).and_then(|v| v.clipboard_read) == Some(self.id)
+    }
 }
 
 pub struct RenderResult {
@@ -517,10 +534,32 @@ enum InsertPlayback {
     Replaying,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum EditOwner {
+    View(u64),
+    Replica(Option<u64>),
+}
+
+impl EditOwner {
+    fn local(self) -> Option<u64> {
+        if let Self::View(id) = self {
+            Some(id)
+        } else {
+            None
+        }
+    }
+    fn view(self) -> Option<u64> {
+        match self {
+            Self::View(id) => Some(id),
+            Self::Replica(id) => id,
+        }
+    }
+}
+
 struct EditGroup {
     original: State,
     transaction: Transaction,
-    view_id: u64,
+    owner: EditOwner,
 }
 
 #[derive(Default)]
@@ -549,6 +588,8 @@ pub struct TextBuffer {
     preview_wrap: Option<PreviewWrap>,
     path: Option<PathBuf>,
     version: u64,
+    document_version: u64,
+    recorded_changes: Option<Vec<document::RecordedStep>>,
     history: History,
     saved_revision: usize,
     saved_file: Option<SavedFile>,
@@ -588,6 +629,8 @@ impl TextBuffer {
             preview_wrap: None,
             path: None,
             version: 0,
+            document_version: 0,
+            recorded_changes: None,
             history: History::default(),
             saved_revision: 0,
             saved_file: None,
@@ -627,6 +670,21 @@ impl TextBuffer {
         buffer
     }
 
+    /// Matches a remote filename against the local syntax catalog without resolving the workspace path.
+    pub fn new_remote_preview(text: &str, path: &Path) -> Self {
+        let provider = language::default_provider();
+        let language = provider.language_for_filename(path);
+        let mut buffer =
+            Self::with_capabilities(text, Arc::new(NativeFileSystem), provider.clone());
+        if let Some(language) = language {
+            let mut attachment = LanguageAttachment::new(language, provider);
+            attachment.request();
+            buffer.language = Some(attachment);
+        }
+        buffer.readonly = true;
+        buffer
+    }
+
     /// Builds a preview whose initial syntax parsing runs outside the UI thread.
     pub fn new_preview_with_path(text: &str, path: &Path) -> Self {
         Self::new_preview_with_capabilities(
@@ -646,7 +704,7 @@ impl TextBuffer {
         let mut buffer =
             Self::new_with_path_and_capabilities(text, path, filesystem, syntax_provider);
         if let Some(language) = &mut buffer.language {
-            language.start_background(&buffer.rope);
+            language.request();
         }
         buffer
     }
@@ -721,7 +779,7 @@ impl TextBuffer {
             }
         }
         self.path = Some(path);
-        self.saved_revision = self.history.current_revision();
+        self.mark_history_saved(self.history_revision());
         self.saved_file = Some(SavedFile {
             target,
             contents: self.rope.clone(),
@@ -752,23 +810,8 @@ impl TextBuffer {
     }
 
     fn reload_with_selection(&mut self, target: PathBuf, contents: &str, selection: Selection) {
-        self.commit_group();
-        if self.rope != contents {
-            let original = State {
-                doc: self.rope.clone(),
-                selection,
-            };
-            let transaction =
-                helix_core::diff::compare_ropes(&self.rope, &Rope::from_str(contents));
-            let selection = original.selection.clone().map(transaction.changes());
-            self.apply_without_history(None, &transaction, None);
-            self.history
-                .commit_revision(&transaction.with_selection(selection), &original);
-        }
-        if let Some(line_ending) = auto_detect_line_ending(&self.rope) {
-            self.line_ending = line_ending;
-        }
-        self.saved_revision = self.history.current_revision();
+        self.replace_contents(contents, selection);
+        self.mark_history_saved(self.history_revision());
         self.saved_file = Some(SavedFile {
             target,
             contents: self.rope.clone(),
@@ -779,8 +822,7 @@ impl TextBuffer {
         self.rope.to_string()
     }
     pub fn modified(&self) -> bool {
-        self.history.current_revision() != self.saved_revision
-            || matches!(&self.group, EditTransaction::Active(group) if !group.transaction.changes().is_empty())
+        self.history_revision() != self.saved_revision || self.has_pending_history()
     }
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
@@ -945,10 +987,11 @@ impl TextBuffer {
                 &self.rope,
                 std::iter::once((0, self.rope.len_chars(), Some(contents.into()))),
             );
-            language.update(&self.rope, &new_rope, transaction.changes());
+            language.update(&self.rope, transaction.changes());
         }
         self.rope = new_rope;
         self.version += 1;
+        self.document_version += 1;
         self.refresh_cursors();
 
         Ok(())
@@ -965,6 +1008,12 @@ impl TextBuffer {
         text: String,
     ) -> Result<TextEffect> {
         anyhow::ensure!(
+            read.is_pending_in(self, id),
+            "clipboard input context changed"
+        );
+        let view = self.views.get_mut(&id).unwrap();
+        view.clipboard_read = None;
+        anyhow::ensure!(
             !self.readonly
                 || !matches!(
                     read.command,
@@ -979,10 +1028,6 @@ impl TextBuffer {
             .lock()
             .unwrap()
             .insert(read.register, vec![text]);
-        let view = self
-            .views
-            .get_mut(&id)
-            .context("clipboard view no longer exists")?;
         view.register = Some(read.register);
         view.count = read.count.into();
         self.reading_clipboard = true;
@@ -1121,7 +1166,8 @@ impl TextBuffer {
     }
 
     pub fn remove_view(&mut self, id: u64) {
-        if matches!(&self.group, EditTransaction::Active(group) if group.view_id == id) {
+        if matches!(&self.group, EditTransaction::Active(group) if group.owner == EditOwner::View(id))
+        {
             self.commit_group();
         }
 
@@ -1138,6 +1184,7 @@ impl TextBuffer {
             TextView {
                 mode: TextMode::Normal,
                 pending: PendingInput::None,
+                clipboard_read: None,
                 insert_recording: InsertRecording::Idle,
                 selection: view
                     .selection
@@ -1241,7 +1288,8 @@ impl TextBuffer {
     }
 
     fn begin_group(&mut self, id: u64) {
-        if matches!(&self.group, EditTransaction::Active(group) if group.view_id != id) {
+        if matches!(&self.group, EditTransaction::Active(group) if group.owner != EditOwner::View(id))
+        {
             self.commit_group();
         }
 
@@ -1252,7 +1300,7 @@ impl TextBuffer {
                     selection: self.views[&id].selection.clone(),
                 },
                 transaction: Transaction::new(&self.rope),
-                view_id: id,
+                owner: EditOwner::View(id),
             });
         }
     }
@@ -1261,16 +1309,32 @@ impl TextBuffer {
         if let EditTransaction::Active(group) = std::mem::take(&mut self.group)
             && !group.transaction.changes().is_empty()
         {
-            let selection = self
-                .views
-                .get(&group.view_id)
+            let selection = group
+                .owner
+                .local()
+                .and_then(|id| self.views.get(&id))
                 .map(|view| view.selection.clone())
-                .unwrap_or_else(|| group.original.selection.clone());
+                .unwrap_or_else(|| {
+                    group
+                        .original
+                        .selection
+                        .clone()
+                        .map(group.transaction.changes())
+                });
 
+            if let Some(steps) = &mut self.recorded_changes {
+                steps.push(document::RecordedStep::History(
+                    zess_protocol::document::DocumentHistoryAction::Commit {
+                        before: document::selection_state(&group.original.selection),
+                        after: document::selection_state(&selection),
+                    },
+                ));
+            }
             self.history.commit_revision(
                 &group.transaction.with_selection(selection),
                 &group.original,
             );
+            self.document_version += 1;
         }
     }
 
@@ -1280,6 +1344,20 @@ impl TextBuffer {
         }
 
         self.begin_group(id);
+        if let Some(steps) = &mut self.recorded_changes
+            && !transaction.changes().is_empty()
+        {
+            let EditTransaction::Active(group) = &self.group else {
+                unreachable!()
+            };
+            let origin = group.transaction.changes().is_empty().then(|| {
+                zess_protocol::document::DocumentOrigin {
+                    view_id: id,
+                    selection: document::selection_state(&group.original.selection),
+                }
+            });
+            document::record_edit(steps, &transaction, origin);
+        }
         self.apply_without_history(Some(id), &transaction, selection);
 
         let EditTransaction::Active(group) = &mut self.group else {
@@ -1304,15 +1382,18 @@ impl TextBuffer {
             return;
         }
 
-        if let (Some(language), Some(old_rope)) = (&mut self.language, old_rope) {
-            language.update(&old_rope, &self.rope, transaction.changes());
-        }
-
-        for view in self.views.values_mut() {
-            if !transaction.changes().is_empty() {
-                view.cancel_pending_input();
+        let changes = transaction.changes();
+        if !changes.is_empty() {
+            self.version += 1;
+            self.document_version += 1;
+            if let (Some(language), Some(old_rope)) = (&mut self.language, old_rope) {
+                language.update(&old_rope, changes);
             }
-            view.selection = view.selection.clone().map(transaction.changes());
+
+            for view in self.views.values_mut() {
+                view.cancel_pending_input();
+                view.selection = view.selection.clone().map(changes);
+            }
         }
 
         if let Some(id) = id
@@ -1329,7 +1410,6 @@ impl TextBuffer {
             }
         }
 
-        self.version += 1;
         self.refresh_cursors();
     }
 
@@ -1578,7 +1658,11 @@ impl TextBuffer {
                     | TextCommand::SearchPrevious
             )
         {
+            static NEXT_CLIPBOARD_READ: AtomicU64 = AtomicU64::new(1);
+            let request_id = NEXT_CLIPBOARD_READ.fetch_add(1, Ordering::Relaxed);
+            self.views.get_mut(&id).unwrap().clipboard_read = Some(request_id);
             effect.clipboard_read = Some(ClipboardRead {
+                id: request_id,
                 register: read_register,
                 command,
                 count,
@@ -2000,6 +2084,14 @@ impl TextBuffer {
                     .cloned();
 
                     if let Some(transaction) = transaction {
+                        if let Some(steps) = &mut self.recorded_changes {
+                            let action = if command == TextCommand::Undo {
+                                zess_protocol::document::DocumentHistoryAction::Undo
+                            } else {
+                                zess_protocol::document::DocumentHistoryAction::Redo
+                            };
+                            steps.push(document::RecordedStep::History(action));
+                        }
                         self.apply_without_history(Some(id), &transaction, None);
                     } else {
                         break;
@@ -3034,20 +3126,16 @@ impl TextBuffer {
         let indent_style = self.indentation().0;
 
         if self.is_rust() {
-            let text = self.text();
-
-            let syntax = self
-                .language
-                .as_mut()
-                .and_then(|language| language.syntax(&self.rope));
-
-            let byte = self.rope.char_to_byte(pos);
             let line = self.rope.char_to_line(pos);
-            let start = self.rope.line_to_byte(line);
-            let prefix = text[start..byte].trim_end();
-
+            let start = self.rope.line_to_char(line);
+            let prefix = self.rope.slice(start..pos).to_string();
+            let prefix = prefix.trim_end();
             if prefix.ends_with('{') {
-                let byte = start + prefix.len() - 1;
+                let byte = self.rope.line_to_byte(line) + prefix.len() - 1;
+                let syntax = self
+                    .language
+                    .as_mut()
+                    .and_then(|language| language.syntax_for_command(&self.rope));
                 let opener = syntax.and_then(|syntax| {
                     syntax.descendant_for_byte_range(byte as u32, (byte + 1) as u32)
                 });
@@ -3064,19 +3152,34 @@ impl TextBuffer {
     fn insert_closing_brace(&mut self, id: u64) {
         self.begin_group(id);
 
-        let text = self.text();
-
-        let syntax = self
-            .language
-            .as_mut()
-            .and_then(|language| language.syntax(&self.rope));
-
         let slice = self.rope.slice(..);
+        let language = &mut self.language;
         let selection = self.views[&id].selection.clone().transform(|range| {
-            let byte = slice.char_to_byte(range.head);
-            let byte = text[..byte].trim_end().len().saturating_sub(1);
+            let start = slice.line_to_char(slice.char_to_line(range.head));
+            let prefix = slice.slice(start..range.head).to_string();
+            let indentation_may_change_selection = !prefix.is_empty() || !range.is_empty();
+            if !indentation_may_change_selection
+                || !prefix.chars().all(|ch| ch == ' ' || ch == '\t')
+            {
+                return range;
+            }
+
+            let trailing_whitespace = slice
+                .chars_at(range.head)
+                .reversed()
+                .take_while(|ch| ch.is_whitespace())
+                .count();
+            let byte = slice
+                .char_to_byte(range.head - trailing_whitespace)
+                .saturating_sub(1);
+            let syntax = language
+                .as_mut()
+                .and_then(|language| language.syntax_for_command(&self.rope));
             let mut node = syntax.and_then(|syntax| {
-                syntax.descendant_for_byte_range(byte as u32, (byte + 1).min(text.len()) as u32)
+                syntax.descendant_for_byte_range(
+                    byte as u32,
+                    (byte + 1).min(slice.len_bytes()) as u32,
+                )
             });
             let code_boundary = node
                 .as_ref()
@@ -3101,25 +3204,18 @@ impl TextBuffer {
                 node = current.parent();
             }
 
-            let start = slice.line_to_char(slice.char_to_line(range.head));
-            let prefix = slice.slice(start..range.head).to_string();
-
-            if prefix.chars().all(|ch| ch == ' ' || ch == '\t') {
-                let removed = if prefix.ends_with('\t') {
-                    1
-                } else {
-                    prefix
-                        .chars()
-                        .rev()
-                        .take_while(|ch| *ch == ' ')
-                        .take(4)
-                        .count()
-                };
-
-                Range::new(range.head - removed, range.head)
+            let removed = if prefix.ends_with('\t') {
+                1
             } else {
-                range
-            }
+                prefix
+                    .chars()
+                    .rev()
+                    .take_while(|ch| *ch == ' ')
+                    .take(4)
+                    .count()
+            };
+
+            Range::new(range.head - removed, range.head)
         });
 
         self.views.get_mut(&id).unwrap().selection = selection;
@@ -3253,6 +3349,14 @@ impl TextBuffer {
             .map_or_else(Vec::new, |language| language.outline(&self.rope))
     }
 
+    /// Requests syntax for a background outline refresh and reports whether it can proceed.
+    pub fn poll_outline_syntax(&mut self) -> bool {
+        self.language.as_mut().is_none_or(|language| {
+            language.request();
+            language.finished()
+        })
+    }
+
     /// Move or extend the primary Helix selection to a rendered character position.
     pub fn select_at(&mut self, id: u64, position: usize, extend: bool) {
         self.ensure_view(id);
@@ -3316,103 +3420,22 @@ impl TextBuffer {
         width
     }
 
-    pub fn visible_source_lines(&self, id: u64) -> Vec<(usize, usize, String)> {
-        let view = self.view(id);
-        self.unwrapped_visible_source_lines(
-            view.scroll,
-            view.horizontal_scroll,
-            view.viewport_width,
-            view.viewport_height,
-        )
-    }
-
-    /// Returns source fragments covered by a preview after its latest render.
-    pub fn preview_visible_source_lines(
-        &self,
-        viewport: &PreviewViewport,
-        soft_wrap: bool,
-    ) -> Vec<(usize, usize, String)> {
-        if viewport.height == 0 || viewport.width == 0 {
-            return Vec::new();
-        }
-        if !soft_wrap {
-            return self.unwrapped_visible_source_lines(
-                viewport.scroll,
-                viewport.horizontal_scroll,
-                viewport.width,
-                viewport.height,
-            );
-        }
-        let Some(&start) = viewport.hit_positions.first().and_then(|row| row.first()) else {
-            return Vec::new();
-        };
-        let last = viewport
-            .hit_positions
-            .last()
-            .and_then(|row| row.last())
-            .copied()
-            .unwrap_or(start);
-        let end = if last < self.rope.len_chars() {
-            next_grapheme_boundary(self.rope.slice(..), last)
-        } else {
-            self.rope.len_chars()
-        };
-        let mut position = start;
-        let mut fragments = Vec::new();
-        for line in self.rope.slice(start..end).lines() {
-            if position == end && position != start {
-                break;
-            }
-            let source_line = self.rope.char_to_line(position);
-            fragments.push((source_line, position, line.to_string()));
-            position += line.len_chars();
-        }
-        fragments
-    }
-
-    fn unwrapped_visible_source_lines(
-        &self,
-        scroll: usize,
-        horizontal_scroll: usize,
+    fn layout_unwrapped_preview(
+        &mut self,
+        viewport: &mut PreviewViewport,
         width: usize,
         height: usize,
-    ) -> Vec<(usize, usize, String)> {
-        if width == 0 || height == 0 {
-            return Vec::new();
+    ) {
+        if viewport.horizontal_scroll > 0 {
+            viewport.horizontal_scroll = viewport
+                .horizontal_scroll
+                .min(self.maximum_line_width().saturating_sub(width));
         }
-        let tab_width = self.indentation().1;
-        let mut fragments = Vec::new();
-        for index in scroll..scroll.saturating_add(height).min(self.rope.len_lines()) {
-            let line = self.rope.line(index);
-            let mut position = self.rope.line_to_char(index);
-            let mut first = None;
-            let mut text = String::new();
-            let mut column = 0;
-            let right = horizontal_scroll.saturating_add(width);
-            for grapheme in line.graphemes() {
-                if grapheme == "\n" || grapheme == "\r\n" || grapheme == "\r" {
-                    break;
-                }
-                let value = grapheme.to_string();
-                let cells = if value == "\t" {
-                    tab_width - column % tab_width
-                } else {
-                    UnicodeWidthStr::width(value.as_str()).max(1)
-                };
-                let end = column.saturating_add(cells);
-                if end > horizontal_scroll && column < right {
-                    first.get_or_insert(position);
-                    text.push_str(&value);
-                }
-                position += grapheme.len_chars();
-                column = end;
-                if column >= right {
-                    break;
-                }
-            }
-            fragments.push((index, first.unwrap_or(position), text));
-        }
-        fragments
+        viewport.width = width;
+        viewport.height = height;
+        viewport.scroll = viewport
+            .scroll
+            .min(self.line_count().saturating_sub(height.max(1)));
     }
 
     /// Renders text without allocating editing state.
@@ -3427,16 +3450,7 @@ impl TextBuffer {
         if soft_wrap && width > 0 {
             return self.render_wrapped_preview(viewport, width, height);
         }
-        if viewport.horizontal_scroll > 0 {
-            viewport.horizontal_scroll = viewport
-                .horizontal_scroll
-                .min(self.maximum_line_width().saturating_sub(width));
-        }
-        viewport.width = width;
-        viewport.height = height;
-        viewport.scroll = viewport
-            .scroll
-            .min(self.line_count().saturating_sub(height.max(1)));
+        self.layout_unwrapped_preview(viewport, width, height);
         let tab_width = self.indentation().1;
         let (rows, hit_positions) = paint_text(
             &self.rope,
@@ -3460,12 +3474,12 @@ impl TextBuffer {
         rows
     }
 
-    fn render_wrapped_preview(
+    fn layout_wrapped_preview(
         &mut self,
         viewport: &mut PreviewViewport,
         width: usize,
         height: usize,
-    ) -> Vec<FrameRow> {
+    ) -> Option<std::ops::Range<usize>> {
         let tab_width = self.indentation().1;
         let format = TextFormat {
             tab_width: tab_width as u16,
@@ -3527,14 +3541,46 @@ impl TextBuffer {
                 .scroll
                 .min(layout.rows.len().saturating_sub(height.max(1)));
         }
-        let Some(&start_char) = layout.rows.get(viewport.scroll) else {
-            return Vec::new();
-        };
+        let &start_char = layout.rows.get(viewport.scroll)?;
         let end_char = layout
             .rows
             .get(viewport.scroll.saturating_add(height))
             .copied()
             .unwrap_or(slice.len_chars());
+        Some(start_char..end_char)
+    }
+
+    pub fn layout_preview(
+        &mut self,
+        viewport: &mut PreviewViewport,
+        width: usize,
+        height: usize,
+        soft_wrap: bool,
+    ) {
+        if soft_wrap && width > 0 {
+            self.layout_wrapped_preview(viewport, width, height);
+        } else {
+            self.layout_unwrapped_preview(viewport, width, height);
+        }
+    }
+
+    fn render_wrapped_preview(
+        &mut self,
+        viewport: &mut PreviewViewport,
+        width: usize,
+        height: usize,
+    ) -> Vec<FrameRow> {
+        let Some(range) = self.layout_wrapped_preview(viewport, width, height) else {
+            return Vec::new();
+        };
+        let start_char = range.start;
+        let end_char = range.end;
+        let slice = self.rope.slice(..);
+        let format = TextFormat {
+            tab_width: self.tab_width() as u16,
+            ..TextFormat::default()
+        };
+        let annotations = TextAnnotations::default();
         let start_byte = slice.char_to_byte(start_char);
         let end_byte = slice.char_to_byte(end_char);
         let highlights = self.language.as_mut().map_or_else(Vec::new, |language| {
@@ -3626,7 +3672,7 @@ impl TextBuffer {
         rows
     }
 
-    pub fn render(&mut self, id: u64, width: usize, height: usize, focused: bool) -> RenderResult {
+    pub fn layout_text_view(&mut self, id: u64, width: usize, height: usize) -> (usize, usize) {
         self.ensure_view(id);
         self.refresh_cursors();
         let tab_width = self.indentation().1;
@@ -3682,6 +3728,14 @@ impl TextBuffer {
             view.horizontal_scroll = cursor_column + 1 - width.max(1);
         }
 
+        (row, cursor_column)
+    }
+
+    pub fn render(&mut self, id: u64, width: usize, height: usize, focused: bool) -> RenderResult {
+        let (row, cursor_column) = self.layout_text_view(id, width, height);
+        let tab_width = self.tab_width();
+        let slice = self.rope.slice(..);
+        let view = &self.views[&id];
         let words = match &view.pending {
             PendingInput::GotoWord { words, .. } => words.as_slice(),
             _ => &[],

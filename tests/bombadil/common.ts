@@ -35,9 +35,14 @@ export const fileStatus = (state: State, expected: string): boolean =>
 
 export type Step = {
   name: string;
-  action: StepAction | StepAction[];
-  reached: (state: State) => boolean;
+  action: StepAction | StepAction[] | ((screen: string[]) => StepAction[]);
+  reached: (state: State, action: StepAction) => boolean;
 };
+
+function alternatives({ action }: Step, screen: string[]): StepAction[] {
+  if (typeof action === "function") return action(screen);
+  return Array.isArray(action) ? action : [action];
+}
 
 function matches(state: State, template: StepAction): boolean {
   if ("TypeText" in template) {
@@ -60,30 +65,29 @@ function matches(state: State, template: StepAction): boolean {
 
 export function explore(steps: Step[]) {
   let index = 0;
-  let inFlight = false;
+  let inFlight: StepAction | undefined;
   const checkpoints: string[] = [];
   const journey = extract((state) => {
     const step = steps[index];
+    const screen = rows(state);
     if (step !== undefined) {
-      const alternatives = Array.isArray(step.action)
-        ? step.action
-        : [step.action];
-      if (alternatives.some((action) => matches(state, action)))
-        inFlight = true;
-      if (inFlight && step.reached(state)) {
+      inFlight ??= alternatives(step, screen).find((action) =>
+        matches(state, action),
+      );
+      if (inFlight && step.reached(state, inFlight)) {
         checkpoints.push(step.name);
         index += 1;
-        inFlight = false;
+        inFlight = undefined;
       }
     }
     return {
       step: steps[index]?.name ?? "completed",
       completed: index === steps.length,
       checkpoints: [...checkpoints],
-      inFlight,
+      inFlight: inFlight !== undefined,
       columns: state.grid.size.columns,
       rows: state.grid.size.rows,
-      screen: rows(state),
+      screen,
       exited: state.exitStatus !== null,
       exitCode: state.exitStatus?.code ?? null,
     };
@@ -94,10 +98,10 @@ export function explore(steps: Step[]) {
     const step = steps.find((candidate) => candidate.name === snapshot.step)!;
     const pulse = resize(snapshot.columns, snapshot.rows);
     if (snapshot.inFlight) return [pulse];
-    const alternatives = Array.isArray(step.action)
-      ? step.action
-      : [step.action];
-    const branches: [number, Tree<StepAction>][] = alternatives.map(
+    const branches: [number, Tree<StepAction>][] = alternatives(
+      step,
+      snapshot.screen,
+    ).map(
       (action) => [1, { value: action }],
     );
     // Replays may finish rendering before the original run's harmless wait pulses.

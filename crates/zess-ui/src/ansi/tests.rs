@@ -99,6 +99,25 @@ fn terminal_actions_and_hyperlink_metadata_never_reach_printable_rows() {
 }
 
 #[test]
+fn tabs_align_after_graphemes_split_by_ansi_styles() {
+    let text = AnsiText::parse("\x1b[31m👩\x1b[32m\u{200d}💻\tA\x1b[34m\tB\n\x1b[31m界\tC");
+    let styled_spans = text.rows[0]
+        .spans
+        .iter()
+        .map(|span| (span.text.as_str(), text.styles[&span.style].foreground))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        styled_spans,
+        [
+            ("👩", Some(StyleColor::Indexed(1))),
+            ("\u{200d}💻      A", Some(StyleColor::Indexed(2))),
+            ("       B", Some(StyleColor::Indexed(4))),
+        ]
+    );
+    assert_eq!(text.rows[1].spans[0].text, "界      C");
+}
+
+#[test]
 fn colon_color_parameters_preserve_truecolor_and_attribute_removal() {
     let text = AnsiText::parse("\x1b[38:2::20:40:60;4:3mcolor\x1b[4:0mplain");
     let spans = &text.rows[0].spans;

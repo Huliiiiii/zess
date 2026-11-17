@@ -7,6 +7,12 @@ pub use style::{StyleAttribute, StyleColor, TextStyle};
 mod ansi;
 pub use ansi::{AnsiText, DiffLineKind, DiffLineMetadata};
 
+mod item_jump;
+pub use item_jump::{ItemJump, JumpInput};
+
+mod rows;
+pub use rows::{align_row, clip_spans, fit, fitting_prefix, item_label, skip_columns, spans_width};
+
 mod columns;
 pub use columns::{ColumnAlignment, RowColumns, RowLayout};
 
@@ -15,12 +21,7 @@ pub use viewport::{
     HalfPageScroll, ScrollDirection, ScrollMode, scroll_limit_with_margin, scroll_with_margin,
 };
 
-mod presentation;
-pub use presentation::{
-    ContentSource, RenderContent, RenderError, RenderPlan, RenderRow, RenderSpan, render_plan,
-};
-
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DisplayRow {
     pub id: String,
     pub text: String,
@@ -32,7 +33,7 @@ pub struct DisplayRow {
     pub depth: usize,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayCell {
     pub spans: Vec<Span>,
 }
@@ -76,13 +77,17 @@ pub enum CursorShape {
     Underline,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct MouseContext {
-    pub content_revision: u64,
-    pub layout_revision: u64,
+impl CursorShape {
+    pub fn for_mode(mode: &str) -> Self {
+        match mode {
+            "insert" => Self::Bar,
+            "select" => Self::Underline,
+            _ => Self::Block,
+        }
+    }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MouseKind {
     Press,
@@ -104,8 +109,6 @@ pub struct MouseEvent {
 pub struct Frame {
     #[serde(default)]
     pub styles: std::collections::HashMap<String, TextStyle>,
-    #[serde(default)]
-    pub mouse_context: MouseContext,
     #[serde(default)]
     pub mouse_enabled: bool,
     pub width: u16,

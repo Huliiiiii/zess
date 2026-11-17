@@ -15,9 +15,9 @@ use zess_git::{
     FileStatus, GitEntry, LineStats, PagerCommand, StagingStatus,
 };
 use zess_plugin::{
-    BufferId, HostRequest, Navigation, OperationCompletion, OperationResult, PluginInput,
-    PluginOutput, PreviewContent, PreviewLayout, PreviewPane, QueryWatch, SnapshotPresentation,
-    ViewId,
+    BufferId, HostRequest, Navigation, OperationCompletion, OperationResult, PageNavigationSource,
+    PluginInput, PluginOutput, PreviewContent, PreviewLayout, PreviewPane, QueryWatch,
+    SnapshotPresentation, ViewId,
 };
 use zess_services::{QueryRequest, QueryResult};
 use zess_ui::{ColumnAlignment, Display, DisplayRow};
@@ -44,6 +44,58 @@ pub(super) enum Page {
     Changes,
     History,
     CommitFiles,
+}
+
+impl Page {
+    pub(super) fn kind(self) -> &'static str {
+        match self {
+            Self::Changes => "git",
+            Self::History => "git-history",
+            Self::CommitFiles => "git-commit-files",
+        }
+    }
+
+    fn tab(self) -> Self {
+        match self {
+            Self::Changes => Self::Changes,
+            Self::History | Self::CommitFiles => Self::History,
+        }
+    }
+
+    fn tab_name(self) -> &'static str {
+        match self.tab() {
+            Self::Changes => "changes",
+            _ => "history",
+        }
+    }
+
+    pub(super) fn tab_command(self, target: Self) -> String {
+        format!("{}.page-{}", self.kind(), target.tab_name())
+    }
+
+    pub(super) fn other_tab(self) -> Self {
+        if self == Self::Changes {
+            Self::History
+        } else {
+            Self::Changes
+        }
+    }
+
+    pub(super) fn tab_request(self, target: Self) -> HostRequest {
+        HostRequest::Navigate {
+            navigation: Navigation::Page {
+                group: "git".into(),
+                current: self.tab_name().into(),
+                page: target.tab_name().into(),
+                kind: target.kind().into(),
+                argument: json!({}),
+                source: Some(PageNavigationSource {
+                    kind: self.kind().into(),
+                    tab_kind: self.tab().kind().into(),
+                }),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -255,28 +307,10 @@ struct GitTree {
     collapsed: BTreeSet<String>,
 }
 
-impl GitTree {
-    fn selected_paths(&self, selection: &zess_plugin::ItemSelection) -> Vec<SelectedPath> {
-        let ids = if selection.selected.is_empty() {
-            selection.primary.as_slice()
-        } else {
-            selection.selected.as_slice()
-        };
-        ids.iter()
-            .filter_map(|id| self.nodes.get(id))
-            .map(|node| match &node.kind {
-                TreeNodeKind::Directory { path, .. } => SelectedPath {
-                    path: path.clone(),
-                    directory: true,
-                },
-                TreeNodeKind::File(file) => SelectedPath {
-                    path: file.path().into(),
-                    directory: false,
-                },
-            })
-            .collect()
-    }
+const FILE_ID_PREFIX: &str = "file:";
+const DIRECTORY_ID_PREFIX: &str = "directory:";
 
+impl GitTree {
     fn rebuild(
         &mut self,
         files: Vec<TreeFile>,
@@ -324,40 +358,42 @@ impl GitTree {
                 Some(original) => format!("{original} → {name}"),
                 None => name.to_owned(),
             };
-            let id = format!("file:{path}");
+            let id = format!("{FILE_ID_PREFIX}{path}");
             let depth = if mode == GitTreeMode::Tree {
                 path.matches('/').count()
             } else {
                 0
             };
             let mut cells = vec![file.status_cell()];
-            cells.extend(file.line_stats().map(line_stats_cells).unwrap_or_else(|| {
-                match counts {
-                    LineCountState::Loading => ["+…", "-…"]
-                        .into_iter()
-                        .map(|text| zess_ui::DisplayCell {
-                            spans: vec![zess_ui::Span {
-                                base_style: None,
-                                text: text.into(),
-                                style: "comment".into(),
-                            }],
-                        })
-                        .collect(),
-                    LineCountState::Ready | LineCountState::Failed => {
-                        vec![zess_ui::DisplayCell {
-                            spans: vec![zess_ui::Span {
-                                base_style: None,
-                                text: match counts {
-                                    LineCountState::Failed => "count failed",
-                                    _ => "uncounted",
-                                }
-                                .into(),
-                                style: "comment".into(),
-                            }],
-                        }]
-                    }
-                }
-            }));
+            cells.extend(
+                file.line_stats()
+                    .map(line_stats_cells)
+                    .unwrap_or_else(|| match counts {
+                        LineCountState::Loading => vec![
+                            zess_ui::DisplayCell {
+                                spans: vec![zess_ui::Span {
+                                    base_style: None,
+                                    text: "  ".into(),
+                                    style: "comment".into(),
+                                }],
+                            };
+                            2
+                        ],
+                        LineCountState::Ready | LineCountState::Failed => {
+                            vec![zess_ui::DisplayCell {
+                                spans: vec![zess_ui::Span {
+                                    base_style: None,
+                                    text: match counts {
+                                        LineCountState::Failed => "count failed",
+                                        _ => "uncounted",
+                                    }
+                                    .into(),
+                                    style: "comment".into(),
+                                }],
+                            }]
+                        }
+                    }),
+            );
             let row = DisplayRow {
                 id: id.clone(),
                 text: label,
@@ -403,7 +439,7 @@ impl GitTree {
     }
 
     fn directory(&mut self, path: &str) -> String {
-        let id = format!("directory:{path}");
+        let id = format!("{DIRECTORY_ID_PREFIX}{path}");
         if self.nodes.contains_key(&id) {
             return id;
         }
@@ -576,7 +612,6 @@ impl HistoryPreview {
             .is_some_and(|display| display.loading);
         let mut changed = self.state.query().map(String::as_str) != selected;
         if changed || event == Event::Refresh {
-            self.totals.start_loading();
             self.state = if let Some(commit) = selected {
                 QueryState::Waiting {
                     query: commit.to_owned(),
@@ -780,7 +815,7 @@ impl HistoryPreview {
                         path: path.clone(),
                         header: "Commit".into(),
                         key_scope: Some("git-history-preview".into()),
-                        loading,
+                        loading: false,
                         content: PreviewContent::Rows {
                             rows: self
                                 .published
@@ -795,7 +830,7 @@ impl HistoryPreview {
                         path,
                         header: "Files changed".into(),
                         key_scope: Some("git-history-preview".into()),
-                        loading: !matches!(self.state, QueryState::Idle { .. }) || loading,
+                        loading: !matches!(self.state, QueryState::Idle { .. }),
                         content: PreviewContent::Items {
                             rows: self
                                 .published
@@ -818,7 +853,6 @@ impl HistoryPreview {
             QueryState::Idle { .. } => None,
         };
         if let Some(after_ms) = after_ms {
-            output.display.as_mut().unwrap().loading = true;
             output.requests.push(HostRequest::Schedule { after_ms });
         }
         Ok(())
@@ -828,7 +862,7 @@ impl HistoryPreview {
 struct PendingSnapshot {
     operation_id: Option<String>,
     commit: String,
-    path: String,
+    view_primary: Option<String>,
     presentation: SnapshotPresentation,
     task: Task,
 }
@@ -836,8 +870,7 @@ struct PendingSnapshot {
 #[derive(Default)]
 enum ChangeTotals {
     #[default]
-    Loading,
-    Refreshing(Counts),
+    Unknown,
     Ready(Counts),
     Failed(String),
     Unavailable,
@@ -850,13 +883,6 @@ struct Counts {
 }
 
 impl ChangeTotals {
-    fn start_loading(&mut self) {
-        *self = match std::mem::take(self) {
-            Self::Ready(counts) | Self::Refreshing(counts) => Self::Refreshing(counts),
-            _ => Self::Loading,
-        };
-    }
-
     fn from_files<'a>(files: impl Iterator<Item = (&'a str, Option<LineStats>)>) -> Self {
         let mut paths = BTreeSet::new();
         let mut additions = 0;
@@ -891,20 +917,16 @@ impl ChangeTotals {
         }
     }
 
-    fn status(&self) -> serde_json::Value {
+    fn status(&self, loading: bool) -> serde_json::Value {
         match self {
-            Self::Loading => json!({"git": {"state": "loading"}}),
+            Self::Unknown if loading => json!({"git": {"state": "loading"}}),
+            Self::Unknown => Value::Null,
             Self::Ready(Counts {
                 additions,
                 deletions,
                 unknown_files,
-            })
-            | Self::Refreshing(Counts {
-                additions,
-                deletions,
-                unknown_files,
             }) => json!({"git": {
-                "state": if matches!(self, Self::Ready(_)) { "ready" } else { "refreshing" },
+                "state": if loading { "refreshing" } else { "ready" },
                 "additions": additions,
                 "deletions": deletions,
                 "unknown_files": unknown_files,
@@ -1165,6 +1187,40 @@ enum PendingMutation {
     Ignore(IgnoreRequest),
 }
 
+fn selected_paths(selection: &zess_plugin::ItemSelection) -> Result<Vec<SelectedPath>> {
+    let ids = if selection.selected.is_empty() {
+        selection.primary.as_slice()
+    } else {
+        selection.selected.as_slice()
+    };
+    ids.iter()
+        .map(|id| {
+            let (path, directory) = if let Some(path) = id.strip_prefix(FILE_ID_PREFIX) {
+                (path, false)
+            } else if let Some(path) = id.strip_prefix(DIRECTORY_ID_PREFIX) {
+                (path, true)
+            } else {
+                bail!("Selected path is unavailable: {id}");
+            };
+            Ok(SelectedPath {
+                path: path.into(),
+                directory,
+            })
+        })
+        .collect()
+}
+
+fn entry_matches_path(entry: &GitEntry, path: &SelectedPath) -> bool {
+    if path.directory {
+        entry
+            .path
+            .strip_prefix(&path.path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    } else {
+        entry.path == path.path
+    }
+}
+
 struct DiscardConfirmation {
     operation_id: Option<String>,
     purpose: String,
@@ -1241,6 +1297,30 @@ impl BufferPlugin for Git {
 
     fn update(&mut self, input: &PluginInput) -> Result<PluginOutput> {
         let event = Event::parse(&input.event);
+        let pending_mutation = if self.page == Page::Changes {
+            match event {
+                Event::Ignore | Event::Exclude => Some(PendingMutation::Ignore(IgnoreRequest {
+                    destination: if event == Event::Ignore {
+                        IgnoreDestination::Repository
+                    } else {
+                        IgnoreDestination::Local
+                    },
+                    paths: selected_paths(&input.selection)?,
+                })),
+                Event::Stage | Event::Unstage | Event::Discard => Some(PendingMutation::Files {
+                    operation: match event {
+                        Event::Stage => FileMutation::Stage,
+                        Event::Unstage => FileMutation::Unstage,
+                        Event::Discard => FileMutation::Discard,
+                        _ => unreachable!(),
+                    },
+                    paths: selected_paths(&input.selection)?,
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let key = (input.buffer_id, input.view_id);
         if event == Event::ViewCloned
             && let Some(source) = input.argument["source_view"].as_u64()
@@ -1276,10 +1356,16 @@ impl BufferPlugin for Git {
         if view.diff_refresh.epoch() != epoch {
             view.diff_refresh = DiffRefresh::WaitingForStatus { epoch, focus: None };
         }
-        if event == Event::LayerResult && self.page == Page::Changes {
+        let confirmation = input.argument["confirmation"].as_str();
+        if event == Event::LayerResult
+            && self.page == Page::Changes
+            && (confirmation.is_some()
+                || matches!(view.mutation, MutationIntent::ConfirmingDiscard(_)))
+        {
             anyhow::ensure!(
                 matches!(&view.mutation, MutationIntent::ConfirmingDiscard(pending)
-                    if input.argument["purpose"] == pending.purpose),
+                    if input.argument["purpose"] == pending.purpose
+                        && pending.operation_id.as_deref() == confirmation),
                 "Git discard confirmation expired; run discard again"
             );
             let MutationIntent::ConfirmingDiscard(pending) = std::mem::take(&mut view.mutation)
@@ -1397,9 +1483,6 @@ impl BufferPlugin for Git {
                             generation: model.load_generation,
                             published_revision: model.revision,
                         });
-                        if !received_files {
-                            model.totals.start_loading();
-                        }
                     }
                     Err(error) => {
                         view.load = None;
@@ -1562,30 +1645,21 @@ impl BufferPlugin for Git {
                 header.push_str(diagnostic);
             }
         }
-        let mut status = model.totals.status();
+        let loading = view.load.is_some();
+        let mut status = model.totals.status(loading && !received_files);
         if let Some(error) = error {
             status["error"] = error.clone().into();
         }
         output.display = Some(Display {
             title: "Git".into(),
-            tabs: [
-                ("Changes", "changes", self.page == Page::Changes),
-                ("History", "history", self.page != Page::Changes),
-            ]
-            .into_iter()
-            .map(|(label, page, active)| zess_ui::DisplayTab {
-                label: label.into(),
-                command: format!(
-                    "{}.page-{page}",
-                    match self.page {
-                        Page::Changes => "git",
-                        Page::History => "git-history",
-                        Page::CommitFiles => "git-commit-files",
-                    }
-                ),
-                active,
-            })
-            .collect(),
+            tabs: [("Changes", Page::Changes), ("History", Page::History)]
+                .into_iter()
+                .map(|(label, page)| zess_ui::DisplayTab {
+                    label: label.into(),
+                    command: self.page.tab_command(page),
+                    active: self.page.tab() == page,
+                })
+                .collect(),
             header,
             rows,
             rows_revision: (self.page != Page::History).then_some(view.tree.rows_revision),
@@ -1595,7 +1669,7 @@ impl BufferPlugin for Git {
                 options.column_alignment
             },
             status,
-            loading: view.load.is_some() && !matches!(model.result, LoadResult::Partial),
+            loading,
             ..Display::default()
         });
         output.watches = Some(if event == Event::ViewLeaving {
@@ -1610,7 +1684,7 @@ impl BufferPlugin for Git {
         if self.page != Page::History {
             let rows = &output.display.as_ref().unwrap().rows;
             let missing = input
-                .selection
+                .view_selection()
                 .primary
                 .as_ref()
                 .is_none_or(|id| !rows.iter().any(|row| &row.id == id));
@@ -1623,56 +1697,29 @@ impl BufferPlugin for Git {
                 }
             }
         }
-        if self.page == Page::Changes {
-            let pending = match event {
-                Event::Ignore | Event::Exclude => Some(PendingMutation::Ignore(IgnoreRequest {
-                    destination: match event {
-                        Event::Ignore => IgnoreDestination::Repository,
-                        Event::Exclude => IgnoreDestination::Local,
-                        _ => unreachable!(),
-                    },
-                    paths: view.tree.selected_paths(&input.selection),
-                })),
-                Event::Stage | Event::Unstage | Event::Discard => Some(PendingMutation::Files {
-                    operation: match event {
-                        Event::Stage => FileMutation::Stage,
-                        Event::Unstage => FileMutation::Unstage,
-                        Event::Discard => FileMutation::Discard,
-                        _ => unreachable!(),
-                    },
-                    paths: view.tree.selected_paths(&input.selection),
-                }),
-                _ => None,
-            };
-            if let Some(pending) = pending {
-                match (&model.mutation, &view.mutation) {
-                    (MutationState::Writing { .. }, _)
-                    | (
-                        _,
-                        MutationIntent::WaitingForStatus { .. }
-                        | MutationIntent::ConfirmingDiscard(_),
-                    ) => {
-                        let text = match &pending {
-                            PendingMutation::Ignore(_) => {
-                                "Wait for the current Git file operation to finish"
-                            }
-                            PendingMutation::Files { .. } => "Git file operation is running",
-                        };
-                        operation_failed(
-                            input.context.operation_id.clone(),
-                            text.into(),
-                            &mut output,
-                        );
-                    }
-                    _ => {
-                        if let Some(operation_id) = &input.context.operation_id {
-                            output.pending_operations.push(operation_id.clone());
+        if let Some(pending) = pending_mutation {
+            match (&model.mutation, &view.mutation) {
+                (MutationState::Writing { .. }, _)
+                | (
+                    _,
+                    MutationIntent::WaitingForStatus { .. } | MutationIntent::ConfirmingDiscard(_),
+                ) => {
+                    let text = match &pending {
+                        PendingMutation::Ignore(_) => {
+                            "Wait for the current Git file operation to finish"
                         }
-                        view.mutation = MutationIntent::WaitingForStatus {
-                            pending,
-                            operation_id: input.context.operation_id.clone(),
-                        };
+                        PendingMutation::Files { .. } => "Git file operation is running",
+                    };
+                    operation_failed(input.context.operation_id.clone(), text.into(), &mut output);
+                }
+                _ => {
+                    if let Some(operation_id) = &input.context.operation_id {
+                        output.pending_operations.push(operation_id.clone());
                     }
+                    view.mutation = MutationIntent::WaitingForStatus {
+                        pending,
+                        operation_id: input.context.operation_id.clone(),
+                    };
                 }
             }
         }
@@ -1687,8 +1734,24 @@ impl BufferPlugin for Git {
             else {
                 unreachable!();
             };
-            match (&model.result, pending) {
-                (LoadResult::Ready, PendingMutation::Ignore(request)) => {
+            let paths = match &pending {
+                PendingMutation::Files { paths, .. }
+                | PendingMutation::Ignore(IgnoreRequest { paths, .. }) => paths,
+            };
+            let missing = paths
+                .iter()
+                .find(|path| {
+                    !model
+                        .entries
+                        .iter()
+                        .any(|entry| entry_matches_path(entry, path))
+                })
+                .map(|path| format!("Selected path is unavailable: {}", path.path));
+            match (&model.result, missing, pending) {
+                (LoadResult::Ready, Some(message), _) => {
+                    operation_failed(operation_id, message, &mut output)
+                }
+                (LoadResult::Ready, None, PendingMutation::Ignore(request)) => {
                     let operation = MutationOperation::Ignore(request.destination);
                     model.mutation.start(
                         self.services.borrow().start_ignore(request),
@@ -1697,22 +1760,11 @@ impl BufferPlugin for Git {
                         &mut output,
                     );
                 }
-                (LoadResult::Ready, PendingMutation::Files { operation, paths }) => {
+                (LoadResult::Ready, None, PendingMutation::Files { operation, paths }) => {
                     let entries = model
                         .entries
                         .iter()
-                        .filter(|entry| {
-                            paths.iter().any(|path| {
-                                if path.directory {
-                                    entry
-                                        .path
-                                        .strip_prefix(&path.path)
-                                        .is_some_and(|suffix| suffix.starts_with('/'))
-                                } else {
-                                    entry.path == path.path
-                                }
-                            })
-                        })
+                        .filter(|entry| paths.iter().any(|path| entry_matches_path(entry, path)))
                         .collect::<Vec<_>>();
                     if entries
                         .iter()
@@ -1774,6 +1826,7 @@ impl BufferPlugin for Git {
                                     purpose: purpose.clone(),
                                     text: String::new(),
                                     key_scope: None,
+                                    confirmation: operation_id.clone(),
                                 });
                                 view.mutation =
                                     MutationIntent::ConfirmingDiscard(DiscardConfirmation {
@@ -1793,7 +1846,7 @@ impl BufferPlugin for Git {
                         }
                     }
                 }
-                (_, _) => operation_failed(
+                _ => operation_failed(
                     operation_id,
                     "Cannot change files while Git status is unavailable".into(),
                     &mut output,
@@ -1851,14 +1904,42 @@ impl BufferPlugin for Git {
             view.yanks
                 .queue(&self.services, event, input, targets, &mut output)?;
         }
-        let primary = primary_id.as_deref();
+        let view_primary = primary_id.as_deref();
+        let mut command_primary = input.selection.primary.as_deref();
+        if matches!(
+            event,
+            Event::Open | Event::Preview | Event::Edit | Event::EditLayer
+        ) && let Some(id) = command_primary
+        {
+            let available = match self.page {
+                Page::History => model.commits.iter().any(|commit| commit.oid == id),
+                Page::Changes | Page::CommitFiles => view.tree.nodes.contains_key(id),
+            };
+            if !available {
+                command_primary = None;
+                operation_failed(
+                    input.context.operation_id.clone(),
+                    format!("Selected item is unavailable: {id}"),
+                    &mut output,
+                );
+            }
+        }
+        let primary = match event {
+            Event::Open | Event::Preview => command_primary.or(view_primary),
+            _ => view_primary,
+        };
+        let preview_event = match event {
+            Event::Open | Event::Preview if command_primary.is_none() => Event::Unknown,
+            Event::Open if self.page != Page::History => Event::Preview,
+            _ => event,
+        };
         let selected = primary
             .and_then(|id| view.tree.nodes.get(id))
             .map(|node| &node.kind);
         match &mut view.diff_refresh {
             DiffRefresh::WaitingForStatus { focus, .. }
             | DiffRefresh::LoadingDiffs { focus, .. } => {
-                if matches!(event, Event::Open | Event::Preview) {
+                if preview_event == Event::Preview {
                     *focus = primary.map(str::to_owned);
                 }
                 if focus.as_deref() != primary || event == Event::ViewLeaving {
@@ -1880,11 +1961,6 @@ impl BufferPlugin for Git {
             };
             view.diff_refresh = DiffRefresh::LoadingDiffs { epoch, focus };
         }
-        let preview_event = if event == Event::Open && selected.is_some() {
-            Event::Preview
-        } else {
-            event
-        };
         match (self.page, selected) {
             (Page::History, _) => {
                 let commit = model
@@ -1893,12 +1969,13 @@ impl BufferPlugin for Git {
                     .find(|commit| Some(commit.oid.as_str()) == primary);
                 view.history.column_alignment = options.column_alignment;
                 view.history
-                    .update(&self.services, event, input, commit, &mut output)?;
+                    .update(&self.services, preview_event, input, commit, &mut output)?;
                 if !matches!(model.result, LoadResult::Failed(_)) {
-                    output.display.as_mut().unwrap().status = view.history.totals.status();
+                    let display = output.display.as_mut().unwrap();
+                    display.status = view.history.totals.status(display.loading);
                 }
                 if matches!(event, Event::Open | Event::Edit)
-                    && let Some(oid) = primary
+                    && let Some(oid) = command_primary
                 {
                     let files = view
                         .history
@@ -2015,19 +2092,6 @@ impl BufferPlugin for Git {
                 } else {
                     output.requests.push(HostRequest::PreviewPending);
                 }
-                if matches!(event, Event::Edit | Event::EditLayer)
-                    && matches!(node, TreeNodeKind::File(_))
-                {
-                    output.requests.push(HostRequest::OpenWorktreeSource {
-                        path: path.into(),
-                        line: 0,
-                        presentation: if event == Event::EditLayer {
-                            SnapshotPresentation::Fullscreen
-                        } else {
-                            SnapshotPresentation::Editor
-                        },
-                    });
-                }
             }
             (Page::CommitFiles, Some(node)) => {
                 let path = match node {
@@ -2090,19 +2154,35 @@ impl BufferPlugin for Git {
                 }
             }
         }
+        let edit = matches!(event, Event::Edit | Event::EditLayer);
+        let target = command_primary
+            .and_then(|id| view.tree.nodes.get(id))
+            .and_then(|node| match &node.kind {
+                TreeNodeKind::File(file) => Some(file.path()),
+                TreeNodeKind::Directory { .. } => None,
+            });
+        if edit
+            && self.page == Page::Changes
+            && let Some(path) = target
+        {
+            output.requests.push(HostRequest::OpenWorktreeSource {
+                path: path.into(),
+                line: 0,
+                presentation: if event == Event::EditLayer {
+                    SnapshotPresentation::Fullscreen
+                } else {
+                    SnapshotPresentation::Editor
+                },
+            });
+        }
         if self.page == Page::CommitFiles {
             if event == Event::Back {
                 output.requests.push(HostRequest::Navigate {
                     navigation: Navigation::Back,
                 });
             }
-            let file = match selected {
-                Some(TreeNodeKind::File(TreeFile::Committed(file))) => Some(file),
-                _ => None,
-            };
-            let path = file.map(|file| file.path.as_str());
             let stale = view.snapshot.as_ref().is_some_and(|pending| {
-                Some(pending.path.as_str()) != path || pending.commit != model.commit
+                pending.view_primary.as_deref() != view_primary || pending.commit != model.commit
             });
             if (stale || event == Event::ViewLeaving)
                 && let Some(pending) = view.snapshot.take()
@@ -2110,9 +2190,7 @@ impl BufferPlugin for Git {
                 self.operation_completions
                     .extend(cancelled_operation(pending.operation_id));
             }
-            if matches!(event, Event::Edit | Event::EditLayer)
-                && let Some(path) = path
-            {
+            if edit && let Some(path) = target {
                 if let Some(pending) = view.snapshot.take() {
                     self.operation_completions
                         .extend(cancelled_operation(pending.operation_id));
@@ -2142,7 +2220,7 @@ impl BufferPlugin for Git {
                     view.snapshot = Some(PendingSnapshot {
                         operation_id: input.context.operation_id.clone(),
                         commit: model.commit.clone(),
-                        path: path.into(),
+                        view_primary: view_primary.map(str::to_owned),
                         task,
                         presentation: if event == Event::EditLayer {
                             SnapshotPresentation::Fullscreen
@@ -2157,7 +2235,7 @@ impl BufferPlugin for Git {
                     Ok(Some(QueryResult::Snapshot { snapshot })) => {
                         complete_operation(
                             pending.operation_id.take(),
-                            OperationResult::Completed,
+                            OperationResult::DocumentOpened,
                             &mut output,
                         );
                         output.requests.push(HostRequest::OpenSnapshot {
@@ -2197,35 +2275,13 @@ impl BufferPlugin for Git {
         let target_page = match event {
             Event::PageChanges => Some(Page::Changes),
             Event::PageHistory => Some(Page::History),
-            Event::Page => Some(if self.page == Page::Changes {
-                Page::History
-            } else {
-                Page::Changes
-            }),
+            Event::Page => Some(self.page.other_tab()),
             _ => None,
         };
-        if let Some(target) = target_page {
-            let current = if self.page == Page::Changes {
-                Page::Changes
-            } else {
-                Page::History
-            };
-            if current != target {
-                let (current, page, kind) = match target {
-                    Page::Changes => ("history", "changes", "git"),
-                    Page::History => ("changes", "history", "git-history"),
-                    Page::CommitFiles => unreachable!(),
-                };
-                output.requests.push(HostRequest::Navigate {
-                    navigation: Navigation::Page {
-                        group: "git".into(),
-                        current: current.into(),
-                        page: page.into(),
-                        kind: kind.into(),
-                        argument: json!({}),
-                    },
-                });
-            }
+        if let Some(target) = target_page
+            && self.page.tab() != target
+        {
+            output.requests.push(self.page.tab_request(target));
         }
         if self.page == Page::CommitFiles {
             output.requests.push(HostRequest::ConfigurePreview {
@@ -2234,10 +2290,13 @@ impl BufferPlugin for Git {
             });
         }
         view.yanks.advance(&self.services, event, &mut output);
-        if matches!(model.mutation, MutationState::Writing { .. }) {
-            let display = output.display.as_mut().unwrap();
+        let display = output.display.as_mut().unwrap();
+        if let Some(load) = &view.load {
+            display.status["git"]["query_id"] = load.generation.into();
+        }
+        if let MutationState::Writing { epoch, .. } = &model.mutation {
             display.loading = true;
-            display.header = "Git file operation is running…".into();
+            display.status["git"]["write_epoch"] = (*epoch).into();
         }
         if view.load.is_some() || matches!(model.mutation, MutationState::Writing { .. }) {
             output.requests.push(HostRequest::Schedule { after_ms: 50 });

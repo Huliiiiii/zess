@@ -1,3 +1,5 @@
+use anyhow::ensure;
+
 use super::*;
 
 #[derive(Default)]
@@ -126,6 +128,27 @@ impl Session {
     }
 
     pub(super) fn navigate(&mut self, id: ViewId, navigation: Navigation) -> Result<()> {
+        let id = if let Navigation::Page {
+            current,
+            page,
+            source: Some(source),
+            ..
+        } = &navigation
+        {
+            let id = self.preview_source(id).unwrap_or(id);
+            let buffer = self.views[&id].location.buffer;
+            ensure!(
+                matches!(&self.buffers[&buffer], Buffer::Data { kind, .. } if kind == &source.kind),
+                "command requires a {} buffer",
+                source.kind
+            );
+            if current == page {
+                return Ok(());
+            }
+            id
+        } else {
+            id
+        };
         self.ensure_focus_allowed(id)?;
         if !matches!(self.views.layer_content(id), Some(LayerContent::File)) {
             self.ensure_buffer_switch_allowed(id)?;
@@ -141,7 +164,7 @@ impl Session {
         let text_source = match &navigation {
             Navigation::Push { kind, .. } | Navigation::Page { kind, .. } => {
                 self.require_buffer_kind(kind)?;
-                self.plugin_text_source(kind, source)?
+                self.plugin_text_source(kind, Some(source))?
             }
             Navigation::Back => {
                 if self.views.page(id).navigation.stack.is_empty() {
@@ -174,6 +197,7 @@ impl Session {
                 page,
                 kind,
                 argument,
+                ..
             } => {
                 let mut incoming = history
                     .pages
@@ -227,6 +251,38 @@ impl Session {
         Ok(())
     }
 
+    pub(super) fn snapshot_buffer(
+        &mut self,
+        snapshot: FileSnapshot,
+        presentation: SnapshotPresentation,
+    ) -> BufferId {
+        let buffer = if matches!(presentation, SnapshotPresentation::Editor) {
+            self.buffers.iter().find_map(|(&id, buffer)| match buffer {
+                Buffer::Snapshot { id: saved, .. }
+                    if saved == &snapshot.id && self.is_switchable_buffer(id) =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+        } else {
+            None
+        };
+        buffer.unwrap_or_else(|| {
+            let mut text = TextBuffer::new_with_path_and_capabilities(
+                &snapshot.text,
+                &self.absolute(Path::new(&snapshot.id.path)),
+                self.services.borrow().file_system(),
+                self.syntax_provider.clone(),
+            );
+            text.set_readonly(true);
+            self.add_buffer(Buffer::Snapshot {
+                id: snapshot.id,
+                text,
+            })
+        })
+    }
+
     pub(super) fn open_snapshot(
         &mut self,
         source: ViewId,
@@ -252,27 +308,7 @@ impl Session {
         } else {
             self.ensure_buffer_switch_allowed(source)?;
         }
-        let buffer = if matches!(presentation, SnapshotPresentation::Editor) {
-            self.buffers.iter().find_map(|(&id, buffer)| match buffer {
-                Buffer::Snapshot { id: saved, .. } if saved == &snapshot.id => Some(id),
-                _ => None,
-            })
-        } else {
-            None
-        };
-        let buffer = buffer.unwrap_or_else(|| {
-            let mut text = TextBuffer::new_with_path_and_capabilities(
-                &snapshot.text,
-                &self.absolute(Path::new(&snapshot.id.path)),
-                self.services.borrow().file_system(),
-                self.syntax_provider.clone(),
-            );
-            text.set_readonly(true);
-            self.add_buffer(Buffer::Snapshot {
-                id: snapshot.id,
-                text,
-            })
-        });
+        let buffer = self.snapshot_buffer(snapshot, presentation);
         match presentation {
             SnapshotPresentation::Editor => self.switch_buffer(buffer)?,
             SnapshotPresentation::Fullscreen => {

@@ -57,7 +57,7 @@ pub enum DiffSource {
     Commit { commit: String },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FileDiff {
     pub target: DiffTarget,
     pub raw: String,
@@ -73,7 +73,7 @@ pub struct RenderedDiff {
     pub repository_root: PathBuf,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GitDiff {
     pub source: DiffSource,
     pub files: Vec<FileDiff>,

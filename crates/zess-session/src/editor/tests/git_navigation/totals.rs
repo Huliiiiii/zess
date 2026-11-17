@@ -68,8 +68,14 @@ fn totals_keep_known_counts_and_identify_files_without_line_statistics() {
         session.views[&session.focus].location.display.status,
         json!({"git": {"state": "ready", "additions": 3, "deletions": 1, "unknown_files": 1}}),
     );
-    let (rows, _) = session.render_view(session.focus, 90, 12);
-    let statusline = &rows.last().unwrap().spans;
+    let view = session.focus;
+    let statusline = view_snapshot(&mut session, view).statusline.unwrap();
+    let statusline = statusline
+        .left
+        .iter()
+        .chain(&statusline.center)
+        .chain(&statusline.right)
+        .collect::<Vec<_>>();
     assert_eq!(
         statusline
             .iter()
@@ -105,23 +111,23 @@ fn history_totals_follow_the_selected_commit_after_returning_from_a_preview() {
         session.views[&source].location.display.status,
         json!({"git": {"state": "ready", "additions": 2, "deletions": 1, "unknown_files": 0}}),
     );
-    let (rows, _) = session.render_view(source, 60, 12);
-    let statusline = &rows.last().unwrap().spans;
+    let statusline = view_snapshot(&mut session, source).statusline.unwrap();
     assert_eq!(
         statusline
+            .right
             .iter()
-            .filter(|span| span.style == "git.added" || span.style == "git.deleted")
-            .map(|span| (span.text.as_str(), span.style.as_str()))
-            .collect::<Vec<_>>(),
-        [("+2", "git.added"), ("-1", "git.deleted")]
+            .map(|span| span.text.as_str())
+            .collect::<String>(),
+        "1 selected / 2 items"
     );
     assert_eq!(
         statusline
+            .left
             .iter()
             .map(|span| span.text.as_str())
             .collect::<String>()
             .trim_end(),
-        format!("{:<54}+2  -1", " NOR  Git")
+        " NOR  Git"
     );
 
     let summary = session

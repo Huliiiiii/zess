@@ -2,7 +2,7 @@ use super::input::{Input, TextState};
 use super::*;
 
 #[test]
-fn text_counts_are_visible_and_accept_helixs_limit() {
+fn text_counts_accept_helixs_limit() {
     let fixture = Fixture::new();
     let mut session = fixture.session(&[]);
     let mut input = Input::new(&mut session);
@@ -10,12 +10,6 @@ fn text_counts_are_visible_and_accept_helixs_limit() {
     assert_eq!(
         input.session.command_count().value(),
         Some(100_000_000),
-        "{}",
-        input.trace()
-    );
-    assert_eq!(
-        input.session.frame().prompt,
-        "100000000",
         "{}",
         input.trace()
     );
@@ -68,7 +62,7 @@ fn a_digit_binding_starts_a_command_unless_a_count_is_in_progress() {
 }
 
 #[test]
-fn item_counts_use_the_same_numeric_limit_and_display() {
+fn item_counts_use_helixs_numeric_limit() {
     let fixture = Fixture::new();
     let mut session = fixture.session(&[]);
     session.command("files").unwrap();
@@ -77,12 +71,6 @@ fn item_counts_use_the_same_numeric_limit_and_display() {
     assert_eq!(
         input.session.command_count().value(),
         Some(100_000_000),
-        "{}",
-        input.trace()
-    );
-    assert_eq!(
-        input.session.frame().prompt,
-        "100000000",
         "{}",
         input.trace()
     );

@@ -9,6 +9,10 @@ use crate::{
 };
 
 enum Action {
+    ReadForEditor {
+        id: u64,
+        primary: bool,
+    },
     Copy {
         primary: bool,
         text: String,
@@ -22,6 +26,8 @@ enum Action {
 
 pub(super) struct ClipboardActions<R, W> {
     read: ClipboardRead<R>,
+    local_read: Option<(u64, R)>,
+    local_result: Option<(u64, Result<String>)>,
     writes: ClipboardWrites<W>,
     queue: VecDeque<Action>,
 }
@@ -30,6 +36,8 @@ impl<R: ClipboardReadJob, W: ClipboardWriteJob> ClipboardActions<R, W> {
     pub(super) fn new() -> Self {
         Self {
             read: ClipboardRead::Idle,
+            local_read: None,
+            local_result: None,
             writes: ClipboardWrites::new(),
             queue: VecDeque::new(),
         }
@@ -54,6 +62,21 @@ impl<R: ClipboardReadJob, W: ClipboardWriteJob> ClipboardActions<R, W> {
         });
     }
 
+    pub(super) fn read_for_editor(&mut self, id: u64, primary: bool) {
+        self.queue.push_back(Action::ReadForEditor { id, primary });
+    }
+
+    pub(super) fn take_local_result(&mut self) -> Option<(u64, Result<String>)> {
+        self.local_result.take()
+    }
+
+    pub(super) fn is_idle(&self) -> bool {
+        self.queue.is_empty()
+            && self.writes.is_idle()
+            && self.local_read.is_none()
+            && !matches!(self.read, ClipboardRead::Reading { .. })
+    }
+
     pub(super) fn poll(
         &mut self,
         provider: &mut impl Clipboard<ReadJob = R, WriteJob = W>,
@@ -62,6 +85,13 @@ impl<R: ClipboardReadJob, W: ClipboardWriteJob> ClipboardActions<R, W> {
     ) -> Result<Option<String>> {
         let mut notice = None;
         loop {
+            if let Some((id, job)) = &mut self.local_read {
+                if let Some(result) = job.poll() {
+                    self.local_result = Some((*id, result));
+                    self.local_read = None;
+                }
+                return Ok(notice);
+            }
             self.read.poll(connection)?;
             if let Some(message) = self.writes.poll(provider, writer) {
                 notice = Some(format!("Clipboard: {message}"));
@@ -73,6 +103,13 @@ impl<R: ClipboardReadJob, W: ClipboardWriteJob> ClipboardActions<R, W> {
                 return Ok(notice);
             };
             match action {
+                Action::ReadForEditor { id, primary } => match provider.read(primary) {
+                    Ok(job) => self.local_read = Some((id, job)),
+                    Err(error) => {
+                        self.local_result = Some((id, Err(error)));
+                        return Ok(notice);
+                    }
+                },
                 Action::Copy { primary, text } => self.writes.copy(primary, text),
                 Action::Read {
                     instance,

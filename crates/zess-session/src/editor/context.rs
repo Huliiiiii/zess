@@ -4,7 +4,7 @@ impl Session {
     pub(super) fn plugin_text_source(
         &self,
         kind: &str,
-        source: BufferId,
+        source: Option<BufferId>,
     ) -> Result<Option<BufferId>> {
         let fields = self
             .scripts
@@ -14,6 +14,7 @@ impl Session {
         if !fields.iter().any(|field| field.starts_with("text.")) {
             return Ok(None);
         }
+        let source = source.context("buffer requires a source text buffer")?;
         let text = match self.buffers.get(&source) {
             Some(Buffer::Text(text) | Buffer::Snapshot { text, .. }) => text,
             _ => bail!("buffer requires a source text buffer"),
@@ -25,11 +26,19 @@ impl Session {
     }
 
     pub(super) fn context(&mut self, id: ViewId, fields: &[String]) -> PluginContext {
-        let text = match &self.buffers[&self.views[&id].location.buffer] {
+        let source = match &self.buffers[&self.views[&id].location.buffer] {
             Buffer::Data { text_source, .. } => *text_source,
             _ => None,
-        }
-        .and_then(|source| match self.buffers.get_mut(&source) {
+        };
+        self.plugin_context(source, fields)
+    }
+
+    pub(super) fn plugin_context(
+        &mut self,
+        source: Option<BufferId>,
+        fields: &[String],
+    ) -> PluginContext {
+        let text = source.and_then(|source| match self.buffers.get_mut(&source) {
             Some(Buffer::Text(text) | Buffer::Snapshot { text, .. }) => Some(TextContext {
                 buffer_id: source,
                 path: text.path().map(|path| path.to_string_lossy().into_owned()),

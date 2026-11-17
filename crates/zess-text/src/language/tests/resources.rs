@@ -10,7 +10,7 @@ use zess_platform::{
     DirectoryEntry, FileSystem, HostInfo, NativeFileSystem, Platform, UserDirs, WalkOptions,
 };
 
-use crate::{HelixSyntaxProvider, TextBuffer};
+use crate::{HelixSyntaxProvider, TextBuffer, tests::wait_for_highlight_refresh};
 
 struct ResourceHost;
 
@@ -143,7 +143,7 @@ fn syntax_loading_uses_the_supplied_host_and_reports_its_resource_failure() {
     );
     assert_eq!(buffer.language_id(), Some("rust"));
     assert!(filesystem.canonicalized.lock().unwrap().is_empty());
-    buffer.render(1, 40, 4, false);
+    wait_for_highlight_refresh(&mut buffer);
     assert_eq!(buffer.syntax_error(), Some("resolve Zess executable"));
     assert!(!buffer.has_outline());
     assert_eq!(buffer.syntax_error(), Some("resolve Zess executable"));

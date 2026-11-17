@@ -1,9 +1,9 @@
 #![cfg(target_os = "linux")]
 
 use std::{
-    io::{self, Read},
+    io::{self, BufReader, Read},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use zess_platform::SystemProcessRunner;
+use zess_protocol::{ClientMessage, ServerMessage, SessionId};
 use zess_remote::{
     Connector, ProxyOperation, ProxyRequest, SshConnection, SshConnector, SshTarget,
 };
@@ -121,6 +122,44 @@ fn conflicting_ssh_addresses_are_rejected_before_connecting() -> Result<()> {
 }
 
 #[test]
+fn stop_and_restart_reject_ambiguous_targets_before_connecting() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    for (command, args, expected) in [
+        ("restart", vec!["first", "second"], "select a session once"),
+        (
+            "stop",
+            vec!["first", "--session", "second"],
+            "select a session once",
+        ),
+        (
+            "restart",
+            vec!["--session", "first", "--session", "second"],
+            "select a session once",
+        ),
+        (
+            "stop",
+            vec!["first", "--remote-workspace", "/other"],
+            "usage: zess session stop",
+        ),
+        (
+            "stop",
+            vec!["--workspace", "/one", "--remote-workspace", "/two"],
+            "conflicts",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_zess"))
+            .args(["session", command, "--ssh", "test.invalid", "--force"])
+            .args(args)
+            .env("PATH", directory.path())
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+    Ok(())
+}
+
+#[test]
 fn an_ssh_address_after_double_dash_remains_a_positional_argument() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let output = Command::new(env!("CARGO_BIN_EXE_zess"))
@@ -130,6 +169,141 @@ fn an_ssh_address_after_double_dash_remains_a_positional_argument() -> Result<()
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown session: ssh://pca:/path"));
     Ok(())
+}
+
+#[test]
+fn a_disconnected_proxy_leaves_the_workspace_available_for_a_fresh_attach() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let runtime = root.path().join("runtime");
+    let workspace = root.path().join("workspace");
+    let config = root.path().join("config");
+    for path in [&runtime, &workspace, &config] {
+        std::fs::create_dir(path)?;
+    }
+    let binary = Path::new(env!("CARGO_BIN_EXE_zess"));
+    let command = || {
+        let mut command = Command::new(binary);
+        command
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_CONFIG_HOME", &config);
+        command
+    };
+    let listed = || -> Result<Vec<Value>> {
+        let output = command().args(["session", "list", "--json"]).output()?;
+        ensure!(
+            output.status.success(),
+            "session list: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+
+    let open = || -> Result<_> {
+        let mut proxy = command()
+            .arg("remote-proxy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let mut input = proxy.stdin.take().unwrap();
+        let mut output = BufReader::new(proxy.stdout.take().unwrap());
+        zess_remote::write_request(
+            &mut input,
+            &ClientMessage::Hello {
+                build_id: zess_build::BUILD_ID.into(),
+            },
+        )?;
+        let hello: ServerMessage = zess_remote::read_request(&mut output)?;
+        ensure!(
+            matches!(hello, ServerMessage::Hello { build_id } if build_id == zess_build::BUILD_ID)
+        );
+        let operation = ProxyOperation::Attach {
+            workspace: workspace.to_str().unwrap().to_owned(),
+            files: Vec::new(),
+            config: None,
+        };
+        zess_remote::write_request(&mut input, &ProxyRequest::new(operation))?;
+        let zess_remote::ProxyHandshake::Ready {
+            session_id: Some(id),
+        } = zess_remote::read_request(&mut output)?
+        else {
+            anyhow::bail!("proxy did not open the workspace");
+        };
+        Ok((proxy, input, output, id))
+    };
+
+    let (mut proxy, input, _output, abandoned_id) = open()?;
+    assert!(listed()?.is_empty());
+    // SSH closes the proxy input when the client disconnects before editor Hello/Attach.
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = proxy.try_wait()? {
+            assert!(status.success());
+            break;
+        }
+        if Instant::now() >= deadline {
+            proxy.kill()?;
+            proxy.wait()?;
+            anyhow::bail!("proxy did not exit after disconnection");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(listed()?.is_empty());
+    assert!(std::fs::read_dir(runtime.join("zess/run"))?.all(|entry| {
+        entry.is_ok_and(|entry| entry.path().extension().is_none_or(|ext| ext != "sock"))
+    }));
+
+    let (mut proxy, mut input, mut output, id) = open()?;
+    let attached = (|| -> Result<()> {
+        ensure!(id != abandoned_id);
+        zess_remote::write_request(
+            &mut input,
+            &ClientMessage::Hello {
+                build_id: zess_build::BUILD_ID.into(),
+            },
+        )?;
+        let hello: ServerMessage = zess_remote::read_request(&mut output)?;
+        ensure!(
+            matches!(hello, ServerMessage::Hello { build_id } if build_id == zess_build::BUILD_ID)
+        );
+        zess_remote::write_request(
+            &mut input,
+            &ClientMessage::Attach {
+                expected_session: Some(SessionId(id.clone())),
+                client_id: "retry".into(),
+                width: 80,
+                height: 24,
+                files: Vec::new(),
+            },
+        )?;
+        for message in ["pending", "attached", "snapshot"] {
+            let reply: ServerMessage = zess_remote::read_request(&mut output)?;
+            ensure!(matches!(
+                (message, reply),
+                ("pending", ServerMessage::AttachPending)
+                    | ("attached", ServerMessage::Attached { .. })
+                    | ("snapshot", ServerMessage::Snapshot { .. })
+            ));
+        }
+        zess_remote::write_request(&mut input, &ClientMessage::ConfirmAttach)?;
+        let reply: ServerMessage = zess_remote::read_request(&mut output)?;
+        ensure!(matches!(reply, ServerMessage::AttachConfirmed));
+        let entries = listed()?;
+        ensure!(entries.len() == 1 && entries[0]["session_id"] == id);
+        Ok(())
+    })();
+    drop(input);
+    drop(output);
+    if attached.is_ok() || !listed()?.is_empty() {
+        let stopped = command().args(["session", "stop", &id]).output()?;
+        ensure!(
+            stopped.status.success(),
+            "fixture stop: {}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+    }
+    proxy.wait()?;
+    attached
 }
 
 struct RemoteSession {
@@ -421,13 +595,6 @@ impl RemoteWire {
             );
         }
     }
-
-    fn input(&mut self, epoch: &Value, sequence: u64, key: &str) -> Result<()> {
-        self.send(json!({"type":"input", "sequence":sequence, "key":key, "context_epoch":epoch}))?;
-        let ack = self.receive("ack")?;
-        assert_eq!(ack["acknowledged"], sequence);
-        Ok(())
-    }
 }
 
 impl Drop for RemoteSession {
@@ -476,6 +643,7 @@ fn remote_sessions_keep_edits_and_undo_across_terminal_detachment() -> Result<()
     )?;
     let info = fixture.json(&[
         "new",
+        "remote-undo",
         "--remote-workspace",
         workspace.to_str().unwrap(),
         "--config",
@@ -522,7 +690,10 @@ fn remote_sessions_keep_edits_and_undo_across_terminal_detachment() -> Result<()
     ])?;
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("unsaved"));
-    fixture.connect(&original, None)?;
+    let endpoint_id = info["id"].as_str().context("endpoint ID missing")?;
+    let uppercase_endpoint_id = endpoint_id.to_ascii_uppercase();
+    assert_ne!(uppercase_endpoint_id, endpoint_id);
+    fixture.connect(&uppercase_endpoint_id, None)?;
     let resumed =
         fixture.wait_screen(|screen| screen.contains("UNSAVED") && screen.contains(" NOR "))?;
     assert_eq!(resumed.matches("UNSAVED").count(), 1);
@@ -551,9 +722,8 @@ fn remote_sessions_keep_edits_and_undo_across_terminal_detachment() -> Result<()
     assert_ne!(replacement, original);
     assert_ne!(restarted["server_instance"], info["server_instance"]);
     assert_eq!(restarted["workspace"], info["workspace"]);
-    let stale = fixture.run(&["attach", &original])?;
-    assert!(!stale.status.success());
-    assert!(String::from_utf8_lossy(&stale.stderr).contains("was not found"));
+    fixture.connect(&original, None)?;
+    fixture.wait_screen(|screen| screen.contains(&format!("unknown session: {original}")))?;
     let entries = fixture.entries()?;
     let matching: Vec<_> = entries
         .iter()
@@ -578,7 +748,7 @@ fn remote_sessions_keep_edits_and_undo_across_terminal_detachment() -> Result<()
 
 #[test]
 #[ignore = "requires an isolated localhost SSH fixture through ZESS_TEST_SSH_CONFIG"]
-fn replaying_acknowledged_input_after_an_ssh_disconnect_does_not_repeat_the_edit() -> Result<()> {
+fn replaying_a_document_edit_after_an_ssh_disconnect_saves_it_once() -> Result<()> {
     let mut fixture = RemoteSession::new()?;
     let workspace = fixture.directory.path().join("replay workspace");
     std::fs::create_dir(&workspace)?;
@@ -598,32 +768,36 @@ fn replaying_acknowledged_input_after_an_ssh_disconnect_does_not_repeat_the_edit
     let mut first = fixture.protocol(&session)?;
     first.send(json!({"type":"attach", "client_id":"ssh-replay", "expected_session":session, "files":[file.to_str().unwrap()], "width":80, "height":24}))?;
     let attached = first.receive("attached")?;
-    let epoch = &attached["context_epoch"];
-    first.input(epoch, 1, "i")?;
-    first.input(epoch, 2, "X")?;
+    let snapshot = first.receive("snapshot")?;
+    let state = &snapshot["state"];
+    let view = state["views"]
+        .as_array()
+        .context("missing views")?
+        .iter()
+        .find(|view| view["view_id"] == state["focused_view"])
+        .context("missing focused view")?;
+    first.send(json!({"type":"document","kind":"read","buffer_id":view["buffer_id"]}))?;
+    let document = first.receive("document")?;
+    assert_eq!(document["kind"], "snapshot");
+    assert_eq!(document["text"], "base\n");
+    let edit = json!({"type":"document","kind":"edit","buffer_id":document["buffer_id"],
+        "sequence":1,"base_version":document["version"],"changes":[{"start":0,"end":0,"insert":"X"}]});
+    first.send(edit.clone())?;
+    let applied = first.receive("document")?;
+    assert_eq!(applied["kind"], "applied");
+    assert_eq!(applied["sequence"], 1);
     drop(first);
     let mut second = fixture.protocol(&session)?;
-    second.send(json!({"type":"attach", "client_id":"ssh-replay", "expected_session":session, "context_epoch":epoch, "width":80, "height":24}))?;
+    second.send(json!({"type":"attach", "client_id":"ssh-replay", "expected_session":session, "width":80, "height":24}))?;
     let resumed = second.receive("attached")?;
     assert_eq!(resumed["server_instance"], attached["server_instance"]);
-    assert_eq!(resumed["acknowledged"], 2);
-    assert_eq!(resumed["replay_allowed"], true);
-    second.input(epoch, 2, "X")?;
-    for (sequence, key) in [(3, "Esc"), (4, ":"), (5, "w"), (6, "Enter")] {
-        second.input(epoch, sequence, key)?;
-    }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let actual = std::fs::read_to_string(&file)?;
-        if actual == "Xbase\n" {
-            break;
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "acknowledged input was replayed incorrectly: {actual:?}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    second.send(edit)?;
+    assert_eq!(second.receive("document")?, applied);
+    second.send(json!({"type":"document","kind":"save","sequence":2,"buffer_id":document["buffer_id"],"version":applied["version"]}))?;
+    let saved = second.receive("document")?;
+    assert_eq!(saved["kind"], "saved");
+    assert_eq!(saved["sequence"], 2);
+    assert_eq!(std::fs::read_to_string(&file)?, "Xbase\n");
     drop(second);
     let stopped = fixture.json(&["stop", "--session", &session, "--json"])?;
     assert_eq!(stopped["status"], "stopped");

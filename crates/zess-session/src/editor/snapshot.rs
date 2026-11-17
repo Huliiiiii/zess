@@ -1,8 +1,13 @@
 use super::*;
 use zess_protocol::{
-    CommandAction, CommandOutcome, PromptSnapshot, SemanticRow, SessionSnapshot, SurfaceSnapshot,
-    TextRange, ViewArea, ViewContent, ViewSelection, ViewSnapshot, VisibleTextLine,
+    CommandAction, CommandOutcome,
+    editor_events::{EditorEvent, EventSource},
 };
+
+enum TargetedCommand<'a> {
+    Registered(&'a str, &'a Value),
+    Request(&'a HostRequest),
+}
 
 impl Session {
     pub fn cancel_clipboard_operations(&mut self, reason: &str) {
@@ -15,7 +20,11 @@ impl Session {
     ) {
         for completion in completions {
             let outcome = match completion.result {
-                zess_plugin::OperationResult::Completed => CommandOutcome::Applied,
+                zess_plugin::OperationResult::Completed
+                | zess_plugin::OperationResult::DocumentOpened => CommandOutcome::Applied,
+                zess_plugin::OperationResult::Yanked { values, register } => {
+                    CommandOutcome::Yanked { values, register }
+                }
                 zess_plugin::OperationResult::Failed { message } => {
                     CommandOutcome::Failed { message }
                 }
@@ -43,37 +52,29 @@ impl Session {
     ) -> Option<CommandOutcome> {
         self.current_operation = Some(operation_id.to_owned());
         self.operation_outcome = None;
-        self.cancel_clipboard_read("clipboard read cancelled by a later command");
+        if !matches!(
+            action,
+            CommandAction::Invoke { .. }
+                | CommandAction::Request { .. }
+                | CommandAction::Observe { .. }
+        ) {
+            self.cancel_clipboard_read("clipboard read cancelled by a later command");
+        }
         let outcome = self.operation(action);
         self.current_operation = None;
         if self.pending_operations.contains(operation_id) {
             None
         } else {
-            Some(if outcome == CommandOutcome::Applied {
-                self.operation_outcome.take().unwrap_or(outcome)
-            } else {
-                outcome
-            })
-        }
-    }
-
-    pub fn tracked_input(&mut self, operation_id: &str, key: &str) -> Option<CommandOutcome> {
-        self.current_operation = Some(operation_id.to_owned());
-        self.operation_outcome = None;
-        let result = self.input_result(key);
-        self.current_operation = None;
-        if self.pending_operations.contains(operation_id) {
-            None
-        } else {
-            Some(match result {
-                Ok(()) => self
-                    .operation_outcome
-                    .take()
-                    .unwrap_or(CommandOutcome::Applied),
-                Err(error) => CommandOutcome::Failed {
-                    message: format!("{error:#}"),
+            Some(
+                if matches!(
+                    outcome,
+                    CommandOutcome::Applied | CommandOutcome::Message { .. }
+                ) {
+                    self.operation_outcome.take().unwrap_or(outcome)
+                } else {
+                    outcome
                 },
-            })
+            )
         }
     }
 
@@ -81,323 +82,252 @@ impl Session {
         std::mem::take(&mut self.operation_completions)
     }
 
-    pub fn snapshot(&mut self) -> SessionSnapshot {
-        let frame = self.frame();
-        self.snapshot_with_frame(&frame)
+    fn target_command(
+        &mut self,
+        target: &zess_protocol::CommandTarget,
+        invocation: TargetedCommand<'_>,
+    ) -> Result<CommandOutcome> {
+        use zess_protocol::CommandTarget;
+        match target {
+            CommandTarget::View { view_id, buffer_id } => anyhow::ensure!(
+                self.views
+                    .get(view_id)
+                    .is_some_and(|view| view.location.buffer == *buffer_id),
+                "command target no longer displays buffer {buffer_id}"
+            ),
+            CommandTarget::Page {
+                subscription_id, ..
+            } => anyhow::ensure!(
+                self.has_page_subscription(*subscription_id),
+                "page subscription no longer exists"
+            ),
+            CommandTarget::Document { buffer_id } => anyhow::ensure!(
+                self.document(*buffer_id).is_some(),
+                "document {buffer_id} no longer exists"
+            ),
+        }
+        let request = match invocation {
+            TargetedCommand::Request(request) => request.clone(),
+            TargetedCommand::Registered(name, argument) => match self
+                .resolve_command(name, argument)?
+            {
+                CommandOutput::Native { name, argument } => HostRequest::Action { name, argument },
+                CommandOutput::Request(
+                    request @ (HostRequest::BufferEvent { .. } | HostRequest::Message { .. }),
+                ) => request,
+                CommandOutput::Request(request) => {
+                    return Ok(CommandOutcome::ClientRequest { request });
+                }
+                CommandOutput::Value(value) if value.is_null() => {
+                    return Ok(CommandOutcome::Applied);
+                }
+                CommandOutput::Value(value) => {
+                    return Ok(CommandOutcome::Message {
+                        message: value.to_string(),
+                    });
+                }
+            },
+        };
+        if let HostRequest::Message { text } = request {
+            return Ok(CommandOutcome::Message { message: text });
+        }
+        if !matches!(target, CommandTarget::View { .. })
+            && let HostRequest::Action { name, argument } = &request
+            && let action @ NativeAction::Editor(
+                commands::EditorCommand::Open
+                | commands::EditorCommand::New
+                | commands::EditorCommand::Exit
+                | commands::EditorCommand::ConfigReload
+                | commands::EditorCommand::Buffers,
+            ) = NativeAction::resolve(name)?
+        {
+            let previous = std::mem::take(&mut self.message);
+            let result = self.native_command(self.first_layout_view(), action, argument.clone());
+            let message = std::mem::replace(&mut self.message, previous);
+            result?;
+            return Ok(if message.is_empty() {
+                CommandOutcome::Applied
+            } else {
+                CommandOutcome::Message { message }
+            });
+        }
+        match target {
+            CommandTarget::View { view_id, .. } => {
+                let view_id = *view_id;
+                if self
+                    .clipboard_read
+                    .as_ref()
+                    .is_some_and(|read| read.view == view_id)
+                {
+                    self.cancel_clipboard_read("clipboard read cancelled by a later command");
+                }
+                let previous = std::mem::take(&mut self.message);
+                let result =
+                    self.execute_view_command(view_id, Ok(CommandOutput::Request(request)));
+                let message = std::mem::replace(&mut self.message, previous);
+                result?;
+                Ok(if message.is_empty() {
+                    CommandOutcome::Applied
+                } else {
+                    CommandOutcome::Message { message }
+                })
+            }
+            CommandTarget::Page {
+                subscription_id,
+                input,
+            } => {
+                if let HostRequest::Action { name, .. } = &request
+                    && !matches!(
+                        NativeAction::resolve(name)?,
+                        NativeAction::Editor(
+                            commands::EditorCommand::Write | commands::EditorCommand::WriteQuit
+                        )
+                    )
+                {
+                    bail!("command {name} requires an editor view");
+                }
+                self.page_request(*subscription_id, input, request)?;
+                Ok(CommandOutcome::Applied)
+            }
+            CommandTarget::Document { buffer_id } => {
+                let buffer_id = *buffer_id;
+                let HostRequest::Action { name, argument } = &request else {
+                    return match request {
+                        request @ (HostRequest::OpenFile { .. }
+                        | HostRequest::OpenWorktreeSource { .. }
+                        | HostRequest::OpenSnapshot { .. }
+                        | HostRequest::FileLayer { .. }) => {
+                            self.request(self.first_layout_view(), request)?;
+                            Ok(CommandOutcome::Applied)
+                        }
+                        _ => bail!("request needs a workspace view"),
+                    };
+                };
+                let native = NativeAction::resolve(name)?;
+                let argument = argument
+                    .get("argument")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                match native {
+                    NativeAction::Editor(commands::EditorCommand::SetLanguage)
+                        if argument.is_empty() =>
+                    {
+                        Ok(CommandOutcome::Message {
+                            message: self
+                                .document(buffer_id)
+                                .unwrap()
+                                .language_id()
+                                .unwrap_or("text")
+                                .into(),
+                        })
+                    }
+                    NativeAction::Editor(commands::EditorCommand::SetLanguage) => {
+                        self.set_document_language(buffer_id, argument)?;
+                        Ok(CommandOutcome::Applied)
+                    }
+                    NativeAction::Editor(commands::EditorCommand::Reload) => {
+                        self.reload_document(buffer_id)?;
+                        Ok(CommandOutcome::Applied)
+                    }
+                    NativeAction::Editor(commands::EditorCommand::Write) => {
+                        let version = self.document(buffer_id).unwrap().document_version();
+                        let version = self.save_document(
+                            buffer_id,
+                            version,
+                            (!argument.is_empty()).then_some(argument),
+                        )?;
+                        Ok(CommandOutcome::Saved { buffer_id, version })
+                    }
+                    NativeAction::Editor(
+                        commands::EditorCommand::Quit | commands::EditorCommand::QuitForce,
+                    ) => {
+                        self.request_workspace_close(
+                            buffer_id,
+                            matches!(
+                                native,
+                                NativeAction::Editor(commands::EditorCommand::QuitForce)
+                            ),
+                        )?;
+                        Ok(CommandOutcome::Applied)
+                    }
+                    _ => bail!("command {name} requires a view"),
+                }
+            }
+        }
     }
 
-    pub fn snapshot_with_frame(&mut self, frame: &Frame) -> SessionSnapshot {
-        let mut views = self
-            .views
-            .iter()
-            .map(|(&id, view)| {
-                let buffer = &self.buffers[&view.location.buffer];
-                let (kind, title, version, mode, content, selection, scroll, horizontal_scroll) =
-                    match buffer {
-                        Buffer::Text(text)
-                        | Buffer::Snapshot { text, .. }
-                        | Buffer::PreviewText { text, .. } => {
-                            let state = text.view(id);
-                            let title = text
-                                .path()
-                                .map(|path| path.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "[scratch]".into());
-                            let kind = match buffer {
-                                Buffer::Text(_) => "text",
-                                Buffer::Snapshot { .. } => "snapshot",
-                                _ => "preview",
-                            };
-                            (
-                                kind.to_owned(),
-                                title,
-                                Some(text.version()),
-                                state.mode().to_owned(),
-                                text_content(text.visible_source_lines(id)),
-                                ViewSelection::Text {
-                                    ranges: state
-                                        .selection()
-                                        .iter()
-                                        .map(|range| TextRange {
-                                            anchor: range.anchor,
-                                            head: range.head,
-                                        })
-                                        .collect(),
-                                    primary: state.selection().primary_index(),
-                                },
-                                state.scroll(),
-                                state.horizontal_scroll(),
-                            )
-                        }
-                        Buffer::PreviewDiff { path, diff } => {
-                            let presentation = view.location.diff_presentation;
-                            let index = diff.index(presentation);
-                            let rows = if presentation == diff::Presentation::Rendered {
-                                diff.rendered.as_ref().map(|rendered| {
-                                    rendered
-                                        .rows
-                                        .iter()
-                                        .enumerate()
-                                        .skip(view.location.scroll)
-                                        .take(view.viewport_height)
-                                        .map(|(row, line)| {
-                                            diff_row(
-                                                row,
-                                                line.spans.clone(),
-                                                view.location.horizontal_scroll,
-                                                view.viewport_width,
-                                            )
-                                        })
-                                        .collect()
-                                })
-                            } else {
-                                None
-                            }
-                            .unwrap_or_else(|| {
-                                index
-                                    .rows
-                                    .iter()
-                                    .enumerate()
-                                    .skip(view.location.scroll)
-                                    .take(view.viewport_height)
-                                    .map(|(row, _)| {
-                                        diff_row(
-                                            row,
-                                            vec![Span {
-                                                base_style: None,
-                                                text: diff.display_line(row),
-                                                style: String::new(),
-                                            }],
-                                            view.location.horizontal_scroll,
-                                            view.viewport_width,
-                                        )
-                                    })
-                                    .collect()
-                            });
-                            let ids = view
-                                .location
-                                .diff_selection
-                                .rows(index)
-                                .into_iter()
-                                .flatten()
-                                .map(|row| row.to_string())
-                                .collect();
-                            (
-                                "diff".into(),
-                                path.clone(),
-                                None,
-                                view.location.mode.as_str().to_owned(),
-                                ViewContent::Items { rows },
-                                ViewSelection::Items {
-                                    ids,
-                                    primary: view
-                                        .location
-                                        .diff_selection
-                                        .row()
-                                        .map(|row| row.to_string()),
-                                },
-                                view.location.scroll,
-                                view.location.horizontal_scroll,
-                            )
-                        }
-                        Buffer::Data { kind, .. } | Buffer::Items { kind, .. } => (
-                            kind.clone(),
-                            view.location.display.title.clone(),
-                            view.location.display.rows_revision,
-                            view.location.mode.as_str().to_owned(),
-                            rows_content(
-                                &view.location.display,
-                                view.location.scroll
-                                    + usize::from(
-                                        kind == "help"
-                                            && view
-                                                .location
-                                                .display
-                                                .rows
-                                                .get(view.location.scroll)
-                                                .is_some_and(|row| row.id.is_empty()),
-                                    ),
-                                view.viewport_height,
-                            ),
-                            ViewSelection::Items {
-                                ids: view.location.selection.selected.clone(),
-                                primary: view.location.selection.primary.clone(),
-                            },
-                            view.location.scroll,
-                            view.location.horizontal_scroll,
-                        ),
-                        Buffer::PreviewRows {
-                            kind,
-                            path,
-                            display,
-                        } => (
-                            kind.scope().into(),
-                            path.clone(),
-                            display.rows_revision,
-                            view.location.mode.as_str().to_owned(),
-                            rows_content(display, view.location.scroll, view.viewport_height),
-                            ViewSelection::Items {
-                                ids: view.location.selection.selected.clone(),
-                                primary: view.location.selection.primary.clone(),
-                            },
-                            view.location.scroll,
-                            view.location.horizontal_scroll,
-                        ),
-                    };
-                ViewSnapshot {
-                    view_id: id,
-                    buffer_id: view.location.buffer,
-                    kind,
-                    title,
-                    version,
-                    mode,
-                    content,
-                    selection,
-                    scroll,
-                    horizontal_scroll,
-                    status: view.location.statusline.clone(),
-                    header: view.location.display.header.clone(),
-                    tabs: view.location.display.tabs.clone(),
-                    loading: view.location.display.loading,
-                    column_alignment: view.location.display.column_alignment,
-                }
-            })
-            .collect::<Vec<_>>();
-        views.sort_by_key(|view| view.view_id);
-        let mut surfaces = Vec::new();
-        let layout = self
-            .visible_rectangles()
-            .into_iter()
-            .filter_map(|(target, area)| {
-                let (view_id, buffer_id, page_id, slot_id) = match target {
-                    RenderTarget::View(id) => {
-                        (Some(id), self.views[&id].location.buffer, None, None)
-                    }
-                    RenderTarget::Surface { page, slot } => {
-                        let surface = self.views.surface(page, &slot)?;
-                        let buffer = surface.buffer;
-                        let scroll = surface.viewport.scroll;
-                        let count = surface.viewport.height;
-                        let content = match &self.buffers[&buffer] {
-                            Buffer::PreviewText { text, .. } => {
-                                let source = self.views.main(page);
-                                let soft_wrap = matches!(
-                                    &self.buffers[&self.views[&source].location.buffer],
-                                    Buffer::Data { kind, .. } if kind == "files"
-                                ) && self
-                                    .effective_view_options(source, "files")
-                                    .get("preview-wrap")
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(true);
-                                text_content(
-                                    text.preview_visible_source_lines(&surface.viewport, soft_wrap),
-                                )
-                            }
-                            Buffer::PreviewRows { display, .. } => {
-                                rows_content(display, scroll, count)
-                            }
-                            Buffer::PreviewDiff { diff, .. } => ViewContent::Items {
-                                rows: (scroll..diff.index.rows.len())
-                                    .take(count)
-                                    .map(|row| {
-                                        diff_row(
-                                            row,
-                                            vec![Span {
-                                                base_style: None,
-                                                text: diff.display_line(row),
-                                                style: String::new(),
-                                            }],
-                                            surface.viewport.horizontal_scroll,
-                                            surface.viewport.width,
-                                        )
-                                    })
-                                    .collect(),
-                            },
-                            _ => unreachable!("surface content must be a preview buffer"),
-                        };
-                        let page_id = self.views.main(page);
-                        surfaces.push(SurfaceSnapshot {
-                            page_id,
-                            slot_id: slot.clone(),
-                            buffer_id: buffer,
-                            header: surface.header.clone(),
-                            loading: surface.loading,
-                            content,
-                            scroll,
-                            horizontal_scroll: surface.viewport.horizontal_scroll,
-                        });
-                        (None, buffer, Some(page_id), Some(slot))
-                    }
-                };
-                Some(ViewArea {
-                    view_id,
-                    page_id,
-                    slot_id,
-                    buffer_id,
-                    x: area.x,
-                    y: area.y,
-                    width: area.width,
-                    height: area.height,
-                })
-            })
-            .collect();
-        let prompt = self.active_prompt().map(|prompt| PromptSnapshot {
-            kind: match &prompt.kind {
-                PromptKind::Command => "command".into(),
-                PromptKind::Text(kind) => kind.label().into(),
-                PromptKind::DiffSearch(_) => "diff_search".into(),
-                PromptKind::Filter(_) => "filter".into(),
-                PromptKind::MiniBuffer { purpose, .. } => purpose.clone(),
-            },
-            text: prompt.text.clone(),
-            cursor: prompt.cursor,
-            error: prompt.error.clone(),
-            owner_view: prompt.target.view,
-        });
-        let mut state = SessionSnapshot {
-            views,
-            surfaces,
-            layout,
-            focused_view: self.views.contains_key(&self.focus).then_some(self.focus),
-            prompt,
-            status: self.message.clone(),
-            modified: self.modified(),
-            buffers: self
-                .buffers
-                .iter()
-                .map(|(&id, buffer)| {
-                    let (kind, modified) = match buffer {
-                        Buffer::Text(text) => (
-                            zess_protocol::BufferKind::Text {
-                                path: text.path().map(|path| path.to_string_lossy().into_owned()),
-                            },
-                            text.modified(),
-                        ),
-                        Buffer::Data { kind, modified, .. } => (
-                            zess_protocol::BufferKind::Data { name: kind.clone() },
-                            *modified,
-                        ),
-                        Buffer::Snapshot { .. } => (zess_protocol::BufferKind::Snapshot, false),
-                        Buffer::PreviewText { .. }
-                        | Buffer::PreviewDiff { .. }
-                        | Buffer::PreviewRows { .. } => (zess_protocol::BufferKind::Preview, false),
-                        Buffer::Items { kind, .. } => (
-                            zess_protocol::BufferKind::Items { name: kind.clone() },
-                            false,
-                        ),
-                    };
-                    zess_protocol::BufferSummary { id, kind, modified }
-                })
-                .collect(),
-            workspace: self.client_workspace.clone(),
-            client_actions: self.client_actions.clone(),
-            render_plan: Default::default(),
+    fn observe(&mut self, source: &EventSource, event: &EditorEvent) -> Result<CommandOutcome> {
+        let name = match event {
+            EditorEvent::Input { .. } => "input",
+            EditorEvent::SelectionChanged { .. } => "selection-changed",
         };
-        state.render_plan = self.presentation_plan(frame, &state);
-        state
+        let Some(runtime) = &self.scripts else {
+            return Ok(CommandOutcome::Applied);
+        };
+        if !runtime.has_event(name) {
+            return Ok(CommandOutcome::Applied);
+        }
+        let (view, buffer, slot) = match source {
+            EventSource::View { view_id, buffer_id } => (*view_id, *buffer_id, None),
+            EventSource::Page {
+                subscription_id,
+                slot_id,
+            } => {
+                let Some((view, buffer)) = self.page_event_source(*subscription_id) else {
+                    return Ok(CommandOutcome::Applied);
+                };
+                (view, buffer, slot_id.as_ref())
+            }
+        };
+        let mut argument = match event {
+            EditorEvent::Input { key } => json!({"key": key}),
+            EditorEvent::SelectionChanged { selection } => serde_json::to_value(selection)?,
+        };
+        argument["view_id"] = view.into();
+        argument["buffer_id"] = buffer.into();
+        if let Some(slot) = slot {
+            argument["slot_id"] = json!(slot);
+        }
+        let value = self.scripts.as_mut().unwrap().event(name, &argument)?;
+        Ok(match serde_json::from_value(value) {
+            Ok(HostRequest::Message { text }) => CommandOutcome::Message { message: text },
+            Ok(request) => CommandOutcome::ClientRequest { request },
+            Err(_) => CommandOutcome::Applied,
+        })
     }
 
     fn operation(&mut self, action: &CommandAction) -> CommandOutcome {
         let result = match action {
+            CommandAction::Observe { source, event } => self.observe(source, event),
+            CommandAction::ClosePageDocument { buffer_id, force } => self
+                .close_page_document(*buffer_id, *force)
+                .map(|()| CommandOutcome::PageDocumentClosed {
+                    buffer_id: *buffer_id,
+                }),
+            CommandAction::ApplyPagePatch {
+                subscription_id,
+                request,
+            } => self
+                .apply_page_patch(*subscription_id, request)
+                .map(|()| CommandOutcome::Applied),
+            CommandAction::PagePrompt {
+                subscription_id,
+                input,
+                purpose,
+                confirmation,
+                text,
+                cancelled,
+            } => self
+                .submit_page_prompt(
+                    *subscription_id,
+                    input,
+                    purpose,
+                    confirmation.as_deref(),
+                    text,
+                    *cancelled,
+                )
+                .map(|()| CommandOutcome::Applied),
             CommandAction::AcknowledgeClientAction { action_id } => (|| {
                 let index = self
                     .client_actions
@@ -434,22 +364,31 @@ impl Session {
             CommandAction::Command { name, argument } => self
                 .execute_command(name, argument.clone())
                 .map(|()| CommandOutcome::Applied),
-            CommandAction::Save { buffer_id, version } => (|| {
-                let Some(Buffer::Text(text)) = self.buffers.get_mut(buffer_id) else {
-                    bail!("buffer {buffer_id} is not an editable text buffer");
-                };
-                anyhow::ensure!(
-                    text.version() == *version,
-                    "buffer version changed; refresh before saving"
-                );
-                text.save(None)?;
-                self.services.borrow_mut().invalidate_fs();
-                if let Err(error) = self.rebind_file_watch(*buffer_id) {
-                    self.message = format!("buffer saved; file watch: {error:#}");
+            CommandAction::Invoke {
+                target,
+                name,
+                argument,
+            } => self.target_command(target, TargetedCommand::Registered(name, argument)),
+            CommandAction::Request { target, request } => {
+                self.target_command(target, TargetedCommand::Request(request))
+            }
+            CommandAction::OpenDocument { path } => self
+                .open_workspace_document(path.as_deref().map(Path::new))
+                .map(|buffer_id| CommandOutcome::DocumentOpened { buffer_id }),
+            CommandAction::DiscardScratch {
+                buffer_id,
+                replacement,
+            } => self.discard_scratch(*buffer_id, *replacement).map(|()| {
+                CommandOutcome::ScratchDiscarded {
+                    buffer_id: *buffer_id,
+                    replacement: *replacement,
                 }
+            }),
+            CommandAction::Save { buffer_id, version } => (|| {
+                let version = self.save_document(*buffer_id, *version, None)?;
                 Ok(CommandOutcome::Saved {
                     buffer_id: *buffer_id,
-                    version: *version,
+                    version,
                 })
             })(),
             CommandAction::Paste { text } => {
@@ -469,11 +408,7 @@ impl Session {
         self.cancel_clipboard_read("clipboard read cancelled by paste");
         self.key_sequence.clear();
         if let Some(prompt) = self.prompt.as_mut() {
-            let text = text.replace("\r\n", "\n").replace(['\r', '\n'], " ");
-            prompt.completion = None;
-            prompt.error = None;
-            prompt.text.insert_str(prompt.cursor, &text);
-            prompt.cursor += text.len();
+            prompt.insert_text(text);
             self.update_prompt()
         } else {
             let effect = self
@@ -484,53 +419,5 @@ impl Session {
                 .paste_text(self.focus, text)?;
             self.text_effect(effect)
         }
-    }
-}
-
-fn text_content(lines: Vec<(usize, usize, String)>) -> ViewContent {
-    ViewContent::Text {
-        lines: lines
-            .into_iter()
-            .map(|(line, first_char, text)| VisibleTextLine {
-                line,
-                first_char,
-                text,
-            })
-            .collect(),
-    }
-}
-
-fn rows_content(display: &Display, scroll: usize, count: usize) -> ViewContent {
-    ViewContent::Items {
-        rows: display
-            .rows
-            .iter()
-            .skip(scroll)
-            .take(count)
-            .map(|row| SemanticRow {
-                id: row.id.clone(),
-                text: row.text.clone(),
-                cells: row.cells.iter().map(|cell| cell.spans.clone()).collect(),
-                style: row.style.clone(),
-                depth: row.depth,
-            })
-            .collect(),
-    }
-}
-
-fn diff_row(
-    row: usize,
-    mut spans: Vec<Span>,
-    horizontal_scroll: usize,
-    width: usize,
-) -> SemanticRow {
-    render::skip_columns(&mut spans, horizontal_scroll);
-    let spans = clip_spans(spans, width);
-    SemanticRow {
-        id: row.to_string(),
-        text: spans.into_iter().map(|span| span.text).collect(),
-        cells: Vec::new(),
-        style: String::new(),
-        depth: 0,
     }
 }

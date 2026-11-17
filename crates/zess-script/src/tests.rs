@@ -25,6 +25,7 @@ fn input(view_id: ViewId, event: &str) -> PluginInput {
         options: Value::Null,
         mode: "normal".into(),
         selection: ItemSelection::default(),
+        view_selection: None,
         register: None,
         context: zess_plugin::PluginContext::default(),
     }
@@ -232,53 +233,76 @@ fn hiding_file_status_parts_does_not_leave_separators() {
 #[test]
 fn git_status_formats_keep_the_counts_and_their_semantic_styles() {
     let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
-    for (status, options, expected) in [
+    for (status, loading, options, expected) in [
         (
             serde_json::json!({"state": "loading"}),
+            false,
+            serde_json::json!({}),
+            "",
+        ),
+        (
+            serde_json::json!({"state": "loading"}),
+            true,
             serde_json::json!({}),
             "Loading changes…",
         ),
         (
             serde_json::json!({"state": "failed"}),
+            false,
             serde_json::json!({"status-formats": {"git-failed": "Failed"}}),
             "Failed",
         ),
         (
             serde_json::json!({"state": "ready"}),
+            false,
             serde_json::json!({}),
             "Line counts unavailable",
         ),
         (
             serde_json::json!({"state": "ready", "additions": 12, "deletions": 3}),
+            false,
             serde_json::json!({}),
             "+12  -3",
         ),
         (
             serde_json::json!({"state": "refreshing", "additions": 12, "deletions": 3, "unknown_files": 2}),
+            true,
             serde_json::json!({"status-formats": {"git-refreshing": "Wait ", "git-added": "add:{count}", "git-deleted": "del:{count}", "git-uncounted": " unknown:{count}"}}),
             "Wait add:12  del:3 unknown:2",
         ),
+        (
+            serde_json::json!({"state": "ready", "write_epoch": 0, "additions": 12, "deletions": 3}),
+            true,
+            serde_json::json!({"status-formats": {"git-writing": "Writing "}}),
+            "Writing +12  -3",
+        ),
     ] {
-        let line = runtime
-            .format_statusline(
-                "default",
-                &zess_plugin::StatusContext {
-                    plugin_status: serde_json::json!({"git": status}),
-                    options,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            line.right
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<String>(),
-            expected
-        );
-        if status.get("additions").is_some() {
-            assert_eq!(line.right[1].style, "git.added");
-            assert_eq!(line.right[3].style, "git.deleted");
+        let context = zess_plugin::StatusContext {
+            plugin_status: serde_json::json!({"git": status}),
+            loading,
+            options,
+            ..Default::default()
+        };
+        for line in [
+            runtime.format_statusline("default", &context).unwrap(),
+            runtime
+                .binding_catalog()
+                .status
+                .format_local("default", &context)
+                .unwrap(),
+        ] {
+            assert!(line.left.iter().all(|span| !span.text.contains('…')));
+            assert_eq!(
+                line.right
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>(),
+                expected
+            );
+            if status.get("additions").is_some() {
+                assert_eq!(line.right[1].style, "git.added");
+                assert_eq!(line.right[3].style, "git.deleted");
+            }
         }
     }
 }
@@ -620,6 +644,7 @@ register-command "extra-input-argument" "Reject an extra argument"
             purpose,
             text,
             key_scope,
+            ..
         }) = runtime.command(command, &Value::Null).unwrap()
         else {
             panic!("script did not return a minibuffer request");
@@ -998,7 +1023,7 @@ fn command_implementations_preserve_their_argument_sources() {
     runtime.buffer_command("event", "Buffer event", "browser", "open");
 
     assert!(
-        matches!(runtime.command("action", &Value::from(2)).unwrap(), CommandOutput::Request(HostRequest::Action { name, argument }) if name == "action" && argument == Value::from(2))
+        matches!(runtime.command("action", &Value::from(2)).unwrap(), CommandOutput::Native { name, argument } if name == "action" && argument == Value::from(2))
     );
     assert!(
         matches!(runtime.command("request", &Value::from(2)).unwrap(), CommandOutput::Request(HostRequest::Action { name, argument }) if name == "fixed" && argument == Value::from(1))
@@ -1106,6 +1131,77 @@ register-command "invalid-surface" "Assign a view key scope to a surface"
         format!("{error:#}").contains("only preview views have a key scope"),
         "{error}"
     );
+}
+
+#[test]
+fn transmitted_bindings_resolve_configured_keys_and_command_aliases() {
+    use zess_plugin::{BindingCatalog, BindingCommand};
+
+    let directory = SourceDirectory::new();
+    let mut runtime = ScriptRuntime::new(|_, _| Value::Null).unwrap();
+    PluginRegistrar::command(
+        &mut runtime,
+        "announce",
+        "Show a message",
+        HostRequest::Message {
+            text: "ready".into(),
+        },
+    );
+    runtime
+        .load(&directory.write(
+            "keys.w",
+            r#"
+require "zess/keys"
+register-key-scope "review" "Review changes"
+register-command-alias "say" "announce"
+register-action "inspect" "Inspect the change"
+  lambda : argument
+    . argument
+map-key "global" "normal" "z" "say"
+map-key "global" "normal" "x" "say"
+unmap-key "review" "normal" "x"
+map-key "review" "normal" (list "z" "i") "inspect"
+map-key "review" "accept" "z" "say"
+"#,
+        ))
+        .unwrap();
+    runtime.validate_bindings().unwrap();
+    let bytes = serde_json::to_vec(&runtime.binding_catalog()).unwrap();
+    let catalog: BindingCatalog = serde_json::from_slice(&bytes).unwrap();
+    let keys = catalog.keymap();
+    assert_eq!(keys.scope_label("review"), "Review changes");
+    assert!(matches!(
+        keys.resolve(&["global"], "normal", &["z".into()]),
+        KeyResolution::Command("say")
+    ));
+    let scopes = ["global", "review"];
+    assert!(matches!(
+        keys.resolve(&scopes, "normal", &["x".into()]),
+        KeyResolution::Unbound
+    ));
+    assert!(matches!(
+        keys.resolve(&scopes, "normal", &["z".into()]),
+        KeyResolution::Prefix
+    ));
+    assert!(matches!(
+        keys.resolve(&scopes, "normal", &["z".into(), "i".into()]),
+        KeyResolution::Command("inspect")
+    ));
+    assert!(matches!(
+        keys.resolve(&scopes, "accept", &["z".into()]),
+        KeyResolution::Command("say")
+    ));
+    let command = catalog.commands.resolve_command_line("say").unwrap();
+    assert_eq!(command.id, "announce");
+    assert_eq!(command.description, "Show a message");
+    assert!(
+        matches!(catalog.implementation("say"), Some(BindingCommand::Request(HostRequest::Message { text })) if text == "ready")
+    );
+    assert!(catalog.commands.resolve_command_line("inspect").is_none());
+    assert!(matches!(
+        catalog.implementation("inspect"),
+        Some(BindingCommand::Script)
+    ));
 }
 
 #[test]

@@ -219,19 +219,6 @@ fn commit_file_counts_follow_tree_and_flat_projections() {
         "commit_files_tree",
         session.views[&source].location.display.rows
     );
-    let (rows, _) = session.render_view(source, 40, 12);
-    let line = rows
-        .iter()
-        .map(|row| {
-            row.spans
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<String>()
-        })
-        .nth(3)
-        .unwrap();
-    assert_eq!(line, "    b.rs                      A  +1  -0 ");
-    assert_eq!(UnicodeWidthStr::width(line.as_str()), 40);
     session
         .request(
             source,
@@ -246,61 +233,6 @@ fn commit_file_counts_follow_tree_and_flat_projections() {
         "commit_files_flat",
         session.views[&source].location.display.rows
     );
-    let (rows, _) = session.render_view(source, 40, 12);
-    let line = rows
-        .iter()
-        .map(|row| {
-            row.spans
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<String>()
-        })
-        .nth(3)
-        .unwrap();
-    assert_eq!(line, "src/nested/b.rs               A  +1  -0 ");
-    assert_eq!(UnicodeWidthStr::width(line.as_str()), 40);
-}
-
-#[test]
-fn line_counts_align_right_and_yield_to_file_names_in_narrow_panes() {
-    let (fixture, _) = repository();
-    let mut session = fixture.session(&[]);
-    session.command("git").unwrap();
-    settle(&mut session);
-    let source = session.focus;
-    session.input("v");
-    for (width, expected) in [
-        (1, "n"),
-        (4, "not "),
-        (6, "note. "),
-        (9, "note.txt "),
-        (12, "note.txt    "),
-        (16, "note.txt        "),
-        (24, "note.txt                "),
-        (40, "note.txt                      M  +1  -1 "),
-    ] {
-        let (rows, _) = session.render_view(source, width, 4);
-        let row = &rows[1];
-        let line = row
-            .spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>();
-        assert_eq!(line, expected);
-        assert_eq!(UnicodeWidthStr::width(line.as_str()), width);
-        let styled = if width > 1 {
-            assert_eq!(row.spans.last().unwrap().text, " ");
-            assert!(row.spans.last().unwrap().style.is_empty());
-            &row.spans[..row.spans.len() - 1]
-        } else {
-            row.spans.as_slice()
-        };
-        assert!(styled.iter().all(|span| matches!(
-            span.style.as_str(),
-            "selection.modified" | "selection.git.added" | "selection.git.deleted"
-        )));
-    }
-    assert_eq!(selected_row(&session, source).id, "file:note.txt");
 }
 
 #[test]
@@ -378,9 +310,9 @@ fn configured_git_colors_are_shared_by_counts_and_diff_lines() {
     let mut session = fixture.session(&[]);
     session.command("git").unwrap();
     settle(&mut session);
-    let frame = session.frame();
-    let added = &frame.styles["git.added"];
-    let deleted = &frame.styles["git.deleted"];
+    let snapshot = session.snapshot();
+    let added = &snapshot.styles["git.added"];
+    let deleted = &snapshot.styles["git.deleted"];
     assert_eq!(
         added.foreground,
         Some(StyleColor::Rgb {
@@ -394,48 +326,40 @@ fn configured_git_colors_are_shared_by_counts_and_diff_lines() {
     assert_eq!(deleted.background, Some(StyleColor::Indexed(52)));
     assert_eq!(deleted.attributes, [StyleAttribute::Italic]);
     for role in ["git.added", "git.deleted"] {
-        let selected = &frame.styles[&format!("selection.{role}")];
-        assert_eq!(selected.foreground, frame.styles[role].foreground);
-        assert_eq!(selected.attributes, frame.styles[role].attributes);
+        let selected = &snapshot.styles[&format!("selection.{role}")];
+        assert_eq!(selected.foreground, snapshot.styles[role].foreground);
+        assert_eq!(selected.attributes, snapshot.styles[role].attributes);
         assert_eq!(selected.background, Some(StyleColor::Indexed(8)));
     }
-    let spans = frame
-        .rows
+    let source = session.focus;
+    let view = snapshot
+        .views
         .iter()
-        .flat_map(|row| &row.spans)
+        .find(|view| view.view_id == source)
+        .unwrap();
+    let spans = item_rows(&view.content)
+        .iter()
+        .flat_map(|row| row.cells.iter().flatten())
         .collect::<Vec<_>>();
-    for (text, role) in [
-        ("+1", "selection.git.added"),
-        ("-1", "selection.git.deleted"),
-    ] {
+    for (text, role) in [("+1", "git.added"), ("-1", "git.deleted")] {
         assert!(
             spans
                 .iter()
                 .any(|span| span.text == text && span.style == role),
-            "missing {text:?} with {role:?}: {frame:?}"
+            "{text}, {role}"
         );
     }
-    let source = session.focus;
     let target = session.preview_target(source).unwrap();
     session.focus_preview(session.focus).unwrap();
     session
         .execute_command("diff.select-hunk", serde_json::json!({}))
         .unwrap();
-    let frame = session.frame();
-    let spans = frame
-        .rows
-        .iter()
-        .flat_map(|row| &row.spans)
-        .collect::<Vec<_>>();
-    for (text, role) in [
-        ("+working", "selection.git.added"),
-        ("-historical", "selection.git.deleted"),
-    ] {
+    let view = view_snapshot(&mut session, target);
+    let rows = item_rows(&view.content);
+    for (text, role) in [("+working", "git.added"), ("-historical", "git.deleted")] {
         assert!(
-            spans
-                .iter()
-                .any(|span| span.text == text && span.style == role),
-            "missing {text:?} with {role:?}: {frame:?}"
+            rows.iter().any(|row| row.text == text && row.style == role),
+            "{text}, {role}"
         );
     }
     let Buffer::PreviewDiff { diff, .. } =

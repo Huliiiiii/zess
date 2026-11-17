@@ -22,7 +22,9 @@ define : set-status-formats! . entries
       : keys : hash-keys->list formats
         updated status-formats
       if (null? keys)
-        set! status-formats updated
+        begin
+          set! status-formats updated
+          %set-status-formats status-formats
         let
           : key : car keys
           loop (cdr keys) : hash-insert updated key : hash-ref formats key
@@ -67,6 +69,8 @@ define mode-labels
     . "filter" "FLT" "find" "FND" "block" "BLK"
     . "line" "LIN" "range" "RNG"
 
+%set-status-mode-labels mode-labels
+
 define : set-mode-labels! . entries
   let
     : labels : configuration-map entries
@@ -74,7 +78,9 @@ define : set-mode-labels! . entries
       : keys : hash-keys->list labels
         updated mode-labels
       if (null? keys)
-        set! mode-labels updated
+        begin
+          set! mode-labels updated
+          %set-status-mode-labels mode-labels
         let*
           : key : car keys
             mode : if (symbol? key) (symbol->string key) key
@@ -94,22 +100,11 @@ define : status-mode context
 
 define : status-mode-span context
   let*
-    : label : status-mode context
-      width : status-get context 'width : + (string-length label) 2
-      text
-        cond
-          : >= width : + (string-length label) 2
-            string-append " " label " "
-          : >= width : string-length label
-            . label
-          else
-            substring label 0 : min width 1
-    if (status-get context 'active #t)
-      status-span
-        . text
+    : active : status-get context 'active #t
+      text : %format-mode-label (status-mode context) (status-get context 'width #f) active
+    status-span text
+      if active
         string-append "status." : status-get context 'mode "normal"
-      status-span
-        make-string (string-length text) #\space
         . "status.inactive"
 
 define : status-position context
@@ -146,17 +141,31 @@ define : status-plugin context
       else
         . ""
 
+define : status-git-pending? context
+  let*
+    : plugin-status : status-get context 'plugin_status #f
+      changes : status-get plugin-status 'git #f
+      state : status-get changes 'state ""
+    or (number? (status-get changes 'write_epoch #f))
+      and (not (status-get plugin-status 'error #f))
+        or (equal? state "loading") (equal? state "refreshing")
+
 define : status-git context
   let*
     : plugin-status : status-get context 'plugin_status #f
       changes : status-get plugin-status 'git #f
+      state : status-get changes 'state ""
+      loading : status-get context 'loading #f
+      writing : and loading (number? (status-get changes 'write_epoch #f))
     cond
       : status-get plugin-status 'error #f
-        . ""
-      : and (hash? changes) : equal? (status-get changes 'state "") "loading"
-        status-format context 'git-loading
-      : and (hash? changes) : equal? (status-get changes 'state "") "failed"
-        status-format context 'git-failed
+        if writing (status-format context 'git-writing) ""
+      : equal? state "loading"
+        if loading
+          status-format context : if writing 'git-writing 'git-loading
+          . ""
+      : equal? state "failed"
+        status-format context : if writing 'git-writing 'git-failed
       : hash? changes
         let
           : added : status-get changes 'additions #f
@@ -165,9 +174,12 @@ define : status-git context
           if (and (number? added) (number? removed))
             list->vector
               list
-                if (equal? (status-get changes 'state "") "refreshing")
-                  status-format context 'git-refreshing
-                  . ""
+                cond
+                  . (writing (status-format context 'git-writing))
+                  : and loading (equal? state "refreshing")
+                    status-format context 'git-refreshing
+                  else
+                    . ""
                 status-span
                   status-format context 'git-added : hash 'count added
                   . "git.added"
@@ -178,7 +190,7 @@ define : status-git context
                 if (> uncounted 0)
                   status-format context 'git-uncounted : hash 'count uncounted
                   . ""
-            status-format context 'git-unavailable
+            status-format context : if writing 'git-writing 'git-unavailable
       else
         . ""
 
@@ -226,37 +238,39 @@ define : status-text context
           . " · "
 
 define : default-statusline context
-  statusline
-    list->vector
-      list
-        status-mode-span context
-        . " "
-        status-get context 'title ""
-        status-modified context
-        status-loading context
-    let*
-      : data : status-get context 'plugin_status_data #f
-        files : status-get data 'files #f
+  let*
+    : kind : status-get context 'kind ""
+      history : equal? kind "git-history"
+      data : status-get context 'plugin_status_data #f
+      files : status-get data 'files #f
+    statusline
+      list->vector
+        list
+          status-mode-span context
+          . " "
+          status-get context 'title ""
+          if (and (equal? kind "files") (not (equal? (status-pending context) ""))) "" : status-modified context
+          if (and (not history) (status-git-pending? context)) "" : status-loading context
       if (hash? files)
         . ""
         status-plugin context
-    status-text context
+      if history (status-items context) : status-text context
 
-register-statusline-component 'mode status-mode-span
-register-statusline-component 'title
+%register-builtin-statusline-component 'mode status-mode-span
+%register-builtin-statusline-component 'title
   lambda : context
     status-get context 'title ""
-register-statusline-component 'modified status-modified
-register-statusline-component 'loading status-loading
-register-statusline-component 'pending status-pending
-register-statusline-component 'items
+%register-builtin-statusline-component 'modified status-modified
+%register-builtin-statusline-component 'loading status-loading
+%register-builtin-statusline-component 'pending status-pending
+%register-builtin-statusline-component 'items
   lambda : context
     if (hash-contains? context 'item_count) (status-items context) ""
-register-statusline-component 'text status-text-position
-register-statusline-component 'git status-git
-register-statusline-component 'plugin status-plugin
-register-statusline-component 'position status-position
-register-statusline-component 'encoding
+%register-builtin-statusline-component 'text status-text-position
+%register-builtin-statusline-component 'git status-git
+%register-builtin-statusline-component 'plugin status-plugin
+%register-builtin-statusline-component 'position status-position
+%register-builtin-statusline-component 'encoding
   lambda : context
     status-get context 'encoding ""
-register-statusline-component 'source-position status-source-position
+%register-builtin-statusline-component 'source-position status-source-position

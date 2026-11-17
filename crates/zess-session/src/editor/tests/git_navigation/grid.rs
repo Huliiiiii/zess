@@ -1,53 +1,30 @@
+use zess_ui::{ColumnAlignment, DisplayCell, Span};
+
 use super::*;
 
 #[test]
-fn diff_selection_is_highlighted_only_in_the_focused_view() {
+fn diff_selection_survives_changes_in_focus() {
     let (fixture, _) = repository();
     let mut session = fixture.session(&[]);
     session.command("git").unwrap();
     settle(&mut session);
     let source = session.focus;
     let preview = session.preview_target(source).unwrap();
-    let selected = session.views[&preview].location.diff_selection.row();
-    let selection_mode = std::mem::discriminant(&session.views[&preview].location.diff_selection);
-    assert!(selected.is_some());
-    let (rows, cursor) = session.render_view(preview, 80, 12);
-    assert!(cursor.is_none());
-    assert!(
-        rows.iter()
-            .flat_map(|row| &row.spans)
-            .all(|span| { !span.style.starts_with("selection") && span.style != "linenr.current" })
-    );
-    session.focus_view(preview).unwrap();
-    let (rows, _) = session.render_view(preview, 80, 12);
-    assert!(
-        rows.iter()
-            .flat_map(|row| &row.spans)
-            .any(|span| { span.style.starts_with("selection") })
-    );
-    assert_eq!(
-        session.views[&preview].location.diff_selection.row(),
-        selected
-    );
-    assert_eq!(
-        std::mem::discriminant(&session.views[&preview].location.diff_selection),
-        selection_mode
-    );
-    session.focus_view(source).unwrap();
-    let (rows, _) = session.render_view(preview, 80, 12);
-    assert!(
-        rows.iter()
-            .flat_map(|row| &row.spans)
-            .all(|span| { !span.style.starts_with("selection") && span.style != "linenr.current" })
-    );
-    assert_eq!(
-        session.views[&preview].location.diff_selection.row(),
-        selected
-    );
-    assert_eq!(
-        std::mem::discriminant(&session.views[&preview].location.diff_selection),
-        selection_mode
-    );
+    let selection = session.views[&preview].location.diff_selection.clone();
+    assert!(selection.row().is_some());
+    for focus in [preview, source] {
+        session.focus_view(focus).unwrap();
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.focused_view, Some(focus));
+        assert_eq!(
+            session.views[&preview].location.diff_selection.row(),
+            selection.row()
+        );
+        assert_eq!(
+            std::mem::discriminant(&session.views[&preview].location.diff_selection),
+            std::mem::discriminant(&selection)
+        );
+    }
 }
 
 fn counted_files() -> Fixture {
@@ -76,35 +53,6 @@ fn counted_files() -> Fixture {
     fixture
 }
 
-fn addition_columns(session: &mut Session, view: ViewId) -> Vec<usize> {
-    let (rows, _) = session.render_view(view, 48, 16);
-    let location = &session.views[&view].location;
-    let header =
-        usize::from(!location.display.header.is_empty() || !location.display.tabs.is_empty());
-    [
-        "dir/alpha/a.txt",
-        "dir/alpha/b.txt",
-        "dir/beta/c.txt",
-        "dir/beta/d.txt",
-    ]
-    .map(|path| {
-        let index = location
-            .display
-            .rows
-            .iter()
-            .position(|row| row.id == format!("file:{path}"))
-            .unwrap();
-        rows[header + index - location.scroll]
-            .spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>()
-            .find('+')
-            .unwrap()
-    })
-    .to_vec()
-}
-
 #[test]
 fn reloading_alignment_updates_the_tree_without_rebuilding_rows() {
     let fixture = counted_files();
@@ -123,9 +71,9 @@ fn reloading_alignment_updates_the_tree_without_rebuilding_rows() {
     let revision = session.views[&source].location.display.rows_revision;
 
     for (alignment, expected) in [
-        ("all", [39, 37, 39, 38]),
-        ("none", [39, 39, 40, 40]),
-        ("consecutive", [39, 37, 40, 39]),
+        ("all", ColumnAlignment::All),
+        ("none", ColumnAlignment::None),
+        ("consecutive", ColumnAlignment::Consecutive),
     ] {
         fs::write(
             &config,
@@ -138,7 +86,10 @@ fn reloading_alignment_updates_the_tree_without_rebuilding_rows() {
             revision
         );
         assert_eq!(session.preview_target(source), Some(target));
-        assert_eq!(addition_columns(&mut session, source), expected);
+        assert_eq!(
+            view_snapshot(&mut session, source).column_alignment,
+            expected
+        );
         assert_eq!(session.focus, source);
     }
 }
@@ -160,13 +111,14 @@ fn invalid_alignment_keeps_the_builtin_configuration_at_startup() {
     session.command("git").unwrap();
     settle(&mut session);
     let source = session.focus;
-    assert_eq!(addition_columns(&mut session, source), [39, 37, 39, 38]);
+    assert_eq!(
+        view_snapshot(&mut session, source).column_alignment,
+        ColumnAlignment::All
+    );
 }
 
 #[test]
 fn invalid_reload_preserves_the_open_views_and_their_alignment() {
-    use zess_ui::ColumnAlignment;
-
     let fixture = counted_files();
     let config = fixture.0.join(".git/grid-config.w");
     fs::write(
@@ -204,10 +156,7 @@ fn invalid_reload_preserves_the_open_views_and_their_alignment() {
     assert!(error.contains("stats-alignment must be"));
     assert_eq!(session.focus, split);
     assert_eq!(session.preview_target(split), Some(preview));
-    let actual = &session.views[&split].location.selection;
-    assert_eq!(actual.primary, selection.primary);
-    assert_eq!(actual.selected, selection.selected);
-    assert_eq!(actual.anchor, selection.anchor);
+    assert_eq!(session.views[&split].location.selection, selection);
 
     session.command("git.refresh").unwrap();
     settle(&mut session);
@@ -240,11 +189,14 @@ fn commit_files_use_their_own_alignment() {
         settle(&mut session);
     }
     let source = session.focus;
-    assert_eq!(addition_columns(&mut session, source), [39, 37, 40, 39]);
+    assert_eq!(
+        view_snapshot(&mut session, source).column_alignment,
+        ColumnAlignment::Consecutive
+    );
 }
 
 #[test]
-fn unaligned_counts_use_refreshed_widths() {
+fn unaligned_counts_are_republished_after_file_changes() {
     let fixture = counted_files();
     let config = fixture.0.join(".git/grid-config.w");
     fs::write(
@@ -256,47 +208,51 @@ fn unaligned_counts_use_refreshed_widths() {
     session.command("git").unwrap();
     settle(&mut session);
     let source = session.focus;
-    assert_eq!(addition_columns(&mut session, source), [39, 39, 40, 40]);
-
+    let before = view_snapshot(&mut session, source);
     fs::write(fixture.0.join("dir/beta/d.txt"), "new\n".repeat(1000)).unwrap();
     session.command("git.refresh").unwrap();
     settle(&mut session);
-    assert_eq!(addition_columns(&mut session, source), [39, 39, 40, 38]);
+    let after = view_snapshot(&mut session, source);
+    assert_eq!(after.column_alignment, ColumnAlignment::None);
+    assert_ne!(after.version, before.version);
+    let row = item_rows(&after.content)
+        .iter()
+        .find(|row| row.id == "file:dir/beta/d.txt")
+        .unwrap();
+    assert!(row.cells.iter().flatten().any(|span| span.text == "+1000"));
 }
 
 #[test]
-fn unaligned_counts_yield_to_names_in_narrow_views() {
-    let fixture = counted_files();
-    let config = fixture.0.join(".git/grid-config.w");
-    fs::write(
-        &config,
-        "set-view-options! \"git\" : obj 'stats-alignment \"none\"\n",
-    )
-    .unwrap();
-    let mut session = Session::new(fixture.0.clone(), &[], Some(config)).unwrap();
-    session.command("git").unwrap();
-    settle(&mut session);
-    let source = session.focus;
-    let (rows, _) = session.render_view(source, 12, 16);
-    let location = &session.views[&source].location;
-    for path in [
-        "dir/alpha/a.txt",
-        "dir/alpha/b.txt",
-        "dir/beta/c.txt",
-        "dir/beta/d.txt",
-    ] {
-        let index = location
-            .display
-            .rows
-            .iter()
-            .position(|row| row.id == format!("file:{path}"))
-            .unwrap();
-        let line = rows[index + 1 - location.scroll]
-            .spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>();
-        assert!(!line.contains('+'), "{line:?}");
-        assert_eq!(UnicodeWidthStr::width(line.as_str()), 12);
-    }
+fn changing_alignment_remeasures_unchanged_rows() {
+    let rows = [("first", ["+1", "-100"]), ("second", ["+100", "-1"])]
+        .into_iter()
+        .map(|(text, cells)| DisplayRow {
+            text: text.into(),
+            cells: cells
+                .into_iter()
+                .map(|text| DisplayCell {
+                    spans: vec![Span {
+                        base_style: None,
+                        text: text.into(),
+                        style: String::new(),
+                    }],
+                })
+                .collect(),
+            ..DisplayRow::default()
+        })
+        .collect();
+    let mut display = Display {
+        rows,
+        rows_revision: Some(1),
+        ..Display::default()
+    };
+    let mut location = ViewLocation::new(1);
+    location.set_display(display.clone());
+    assert_eq!(location.columns.layout(0, 30).cell_widths(), [4, 4]);
+    assert_eq!(location.columns.layout(1, 30).cell_widths(), [4, 4]);
+
+    display.column_alignment = ColumnAlignment::None;
+    location.set_display(display);
+    assert_eq!(location.columns.layout(0, 30).cell_widths(), [2, 4]);
+    assert_eq!(location.columns.layout(1, 30).cell_widths(), [4, 2]);
 }

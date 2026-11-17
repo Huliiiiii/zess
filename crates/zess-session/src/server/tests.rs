@@ -8,7 +8,6 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use zess_ipc::Listener;
-use zess_ui::{CursorShape, Frame};
 
 use super::*;
 
@@ -23,6 +22,50 @@ fn stream_pair() -> (Stream, Stream) {
     let client = Stream::connect(&socket).unwrap();
     let server = listener.accept().unwrap();
     (server, client)
+}
+
+#[test]
+fn unacknowledged_results_are_replayed_in_completion_order() {
+    let mut operations = OperationTable::default();
+    let client = operations.clients.entry("client".into()).or_default();
+    for request_id in [RequestId(1), RequestId(2)] {
+        client.unacknowledged.insert(
+            request_id,
+            Operation {
+                action: CommandAction::CommandLine {
+                    text: String::new(),
+                },
+                completed: None,
+            },
+        );
+    }
+    operations
+        .complete("client:2", CommandOutcome::Applied, 1)
+        .unwrap();
+    operations
+        .complete("client:1", CommandOutcome::Applied, 1)
+        .unwrap();
+
+    let (server, peer) = stream_pair();
+    let mut connection = Connection::new(server).unwrap();
+    operations
+        .resend(
+            "client",
+            &ServerInstanceId("instance".into()),
+            &mut connection,
+        )
+        .unwrap();
+    connection.flush().unwrap();
+    let mut reader = BufReader::new(peer);
+    for expected in [RequestId(2), RequestId(1)] {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        assert!(
+            matches!(serde_json::from_str::<ServerMessage>(&line).unwrap(), ServerMessage::CommandResult {
+            request_id, result: OperationResult::Completed { outcome: CommandOutcome::Applied, .. }, ..
+        } if request_id == expected)
+        );
+    }
 }
 
 #[test]
@@ -55,10 +98,9 @@ fn a_limit_sized_input_and_the_next_message_can_share_a_socket_read() {
             .unwrap();
         let mut tail = message[split..].to_vec();
         tail.extend(
-            framing::encode(&ClientMessage::Input {
-                sequence: 2,
-                key: "Esc".into(),
-                context_epoch: 17,
+            framing::encode(&ClientMessage::Resize {
+                width: 100,
+                height: 31,
             })
             .unwrap(),
         );
@@ -72,9 +114,13 @@ fn a_limit_sized_input_and_the_next_message_can_share_a_socket_read() {
         assert!(matches!(&messages[0], ClientMessage::Command {
             request_id, server_instance, action: CommandAction::Paste { text: actual },
         } if *request_id == RequestId(1) && server_instance.0 == "instance" && actual == &text));
-        assert!(matches!(&messages[1], ClientMessage::Input {
-            sequence: 2, key, context_epoch: 17,
-        } if key == "Esc"));
+        assert!(matches!(
+            &messages[1],
+            ClientMessage::Resize {
+                width: 100,
+                height: 31
+            }
+        ));
         assert_eq!(connection.eof, eof);
     }
 }
@@ -104,64 +150,80 @@ fn an_input_message_over_the_limit_is_rejected() {
     assert_eq!(error.to_string(), "input message exceeds limit");
 }
 
-fn update(status: &str) -> ServerMessage {
-    ServerMessage::Update {
-        acknowledged: 0,
-        frame: Frame {
-            styles: Default::default(),
-            mouse_context: zess_ui::MouseContext::default(),
-            mouse_enabled: true,
-            width: 80,
-            height: 24,
-            rows: Vec::new(),
-            cursor: None,
-            cursor_shape: CursorShape::Block,
-            status: status.into(),
-            prompt: String::new(),
-        },
+fn receive_in_bounded_frames(message: &ServerMessage) -> ServerMessage {
+    let (stream, _client) = stream_pair();
+    let mut connection = Connection::new(stream).unwrap();
+    connection.send(message).unwrap();
+    assert!(connection.output.len() > 1);
+    let mut stream = zess_protocol::chunks::MessageStream::default();
+    for frame in connection.output {
+        assert!(frame.len() <= MAX_MESSAGE_BYTES);
+        let ServerMessage::Chunk { json, last } = serde_json::from_slice(&frame).unwrap() else {
+            panic!("expected a message fragment");
+        };
+        let received = stream.server(json, last).unwrap();
+        if last {
+            return received.expect("missing message");
+        }
+        assert!(received.is_none());
     }
+    panic!("missing end of message")
 }
 
 #[test]
-fn coalescing_frames_preserves_clipboard_writes_in_order() {
-    let (server, client) = stream_pair();
-    client
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut connection = Connection::new(server).unwrap();
-    for message in [
-        update("initial"),
-        update("before copy"),
-        ServerMessage::ClipboardWrite {
-            text: "first".into(),
+fn a_large_resource_update_arrives_in_bounded_frames() {
+    let original = "\"界".repeat(MAX_MESSAGE_BYTES / 5);
+    let update = zess_protocol::resource::ResourceUpdate {
+        cache: Default::default(),
+        kind: Default::default(),
+        subscription_id: 8,
+        generation: 12,
+        document_scoped: false,
+        output: zess_plugin::PluginOutput {
+            requests: vec![zess_plugin::HostRequest::Message {
+                text: original.clone(),
+            }],
+            ..Default::default()
         },
-        update("intermediate"),
-        update("after copy"),
-        ServerMessage::ClipboardWrite {
-            text: "second".into(),
+        metadata: None,
+        patch_revision: None,
+        document: None,
+    };
+    let ServerMessage::Resource { update: received } =
+        receive_in_bounded_frames(&ServerMessage::Resource { update })
+    else {
+        panic!("missing resource update");
+    };
+    assert_eq!((received.subscription_id, received.generation), (8, 12));
+    assert!(
+        matches!(&received.output.requests[..], [zess_plugin::HostRequest::Message {text}] if text == &original)
+    );
+}
+
+#[test]
+fn a_large_yank_result_arrives_in_bounded_frames() {
+    let instance = ServerInstanceId("instance".into());
+    let value = "\"界".repeat(MAX_MESSAGE_BYTES / 5);
+    let result = OperationResult::Completed {
+        outcome: CommandOutcome::Yanked {
+            values: vec![value],
+            register: 'a',
         },
-        update("obsolete"),
-        update("latest"),
-    ] {
-        connection.send(&message).unwrap();
-    }
-    connection.flush().unwrap();
-    connection.stream.shutdown(Shutdown::Write).unwrap();
-    let mut copies = Vec::new();
-    let mut last_frame = String::new();
-    for line in BufReader::new(client).lines() {
-        match serde_json::from_str::<ServerMessage>(&line.unwrap()).unwrap() {
-            ServerMessage::ClipboardWrite { text } => copies.push(text),
-            ServerMessage::Update { frame, .. } => {
-                assert_ne!(frame.status, "intermediate");
-                assert_ne!(frame.status, "obsolete");
-                last_frame = frame.status;
-            }
-            message => panic!("unexpected message: {message:?}"),
-        }
-    }
-    assert_eq!(copies, ["first", "second"]);
-    assert_eq!(last_frame, "latest");
+        state_revision: 3,
+    };
+    let received = receive_in_bounded_frames(&ServerMessage::CommandResult {
+        request_id: RequestId(7),
+        server_instance: instance.clone(),
+        result: result.clone(),
+    });
+    assert!(matches!(
+        received,
+        ServerMessage::CommandResult {
+            request_id: RequestId(7),
+            server_instance,
+            result: received,
+        } if server_instance == instance && received == result
+    ));
 }
 
 #[test]
@@ -182,34 +244,43 @@ fn oversized_clipboard_writes_leave_the_connection_usable() {
             format!("selection exceeds the clipboard message limit ({MAX_MESSAGE_BYTES} bytes)")
         );
     }
-    connection.send(&update("still connected")).unwrap();
+    connection.send(&ServerMessage::Exited).unwrap();
     connection.flush().unwrap();
     connection.stream.shutdown(Shutdown::Write).unwrap();
     let mut line = String::new();
     BufReader::new(client).read_line(&mut line).unwrap();
-    assert!(
-        matches!(serde_json::from_str::<ServerMessage>(&line).unwrap(), ServerMessage::Update { frame, .. } if frame.status == "still connected")
-    );
+    assert!(matches!(
+        serde_json::from_str::<ServerMessage>(&line).unwrap(),
+        ServerMessage::Exited
+    ));
 }
 
 #[test]
-fn coalescing_preserves_a_partially_written_message() {
+fn messages_arrive_in_order_after_a_partial_write() {
     let (server, client) = stream_pair();
     client
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let mut connection = Connection::new(server).unwrap();
     let original = "x".repeat(8 * 1024 * 1024);
-    connection.send(&update(&original)).unwrap();
+    connection
+        .send(&ServerMessage::ClipboardWrite {
+            text: original.clone(),
+        })
+        .unwrap();
     connection.flush().unwrap();
     assert!(connection.written > 0, "socket must block before reading");
     connection
-        .send(&ServerMessage::ClipboardWrite {
-            text: "copy".into(),
+        .send(&ServerMessage::ClipboardRead {
+            id: 1,
+            primary: false,
         })
         .unwrap();
-    connection.send(&update("obsolete")).unwrap();
-    connection.send(&update("latest")).unwrap();
+    connection
+        .send(&ServerMessage::ClipboardWrite {
+            text: "next".into(),
+        })
+        .unwrap();
     let reader = thread::spawn(move || {
         BufReader::new(client)
             .lines()
@@ -225,197 +296,15 @@ fn coalescing_preserves_a_partially_written_message() {
     connection.stream.shutdown(Shutdown::Write).unwrap();
     let messages = reader.join().unwrap();
     assert_eq!(messages.len(), 3);
-    assert!(
-        matches!(&messages[0], ServerMessage::Update { frame, .. } if frame.status == original)
-    );
-    assert!(matches!(&messages[1], ServerMessage::ClipboardWrite { text } if text == "copy"));
-    assert!(
-        matches!(&messages[2], ServerMessage::Update { frame, .. } if frame.status == "latest")
-    );
-}
-
-#[test]
-fn mouse_input_is_applied_once_only_in_the_attached_context() {
-    use zess_ui::{MouseEvent, MouseKind};
-
-    struct RunningServer {
-        root: std::path::PathBuf,
-        socket: std::path::PathBuf,
-        thread: Option<thread::JoinHandle<Result<()>>>,
-    }
-    impl Drop for RunningServer {
-        fn drop(&mut self) {
-            if let Ok(mut stream) = UnixStream::connect(&self.socket) {
-                framing::write(
-                    &mut stream,
-                    &ClientMessage::Hello {
-                        build_id: zess_build::BUILD_ID.into(),
-                    },
-                )
-                .unwrap();
-                serde_json::to_writer(&mut stream, &ClientMessage::Stop { force: true }).unwrap();
-                stream.write_all(b"\n").unwrap();
-            }
-            if let Some(thread) = self.thread.take() {
-                thread.join().unwrap().unwrap();
-            }
-            fs::remove_dir_all(&self.root).unwrap();
+    assert!(matches!(&messages[0], ServerMessage::ClipboardWrite { text } if text == &original));
+    assert!(matches!(
+        &messages[1],
+        ServerMessage::ClipboardRead {
+            id: 1,
+            primary: false
         }
-    }
-    fn send(stream: &mut UnixStream, message: &ClientMessage) {
-        if matches!(
-            message,
-            ClientMessage::Attach { .. } | ClientMessage::Status | ClientMessage::Stop { .. }
-        ) {
-            framing::write(
-                stream,
-                &ClientMessage::Hello {
-                    build_id: zess_build::BUILD_ID.into(),
-                },
-            )
-            .unwrap();
-        }
-        serde_json::to_writer(&mut *stream, message).unwrap();
-        stream.write_all(b"\n").unwrap();
-    }
-    fn receive(reader: &mut BufReader<UnixStream>) -> ServerMessage {
-        let mut line = String::new();
-        assert!(reader.read_line(&mut line).unwrap() > 0);
-        let message = serde_json::from_str(&line).unwrap();
-        if let ServerMessage::Hello { build_id } = message {
-            zess_protocol::check_build_id(&build_id).unwrap();
-            receive(reader)
-        } else {
-            message
-        }
-    }
-    fn acknowledged(reader: &mut BufReader<UnixStream>, sequence: u64) {
-        loop {
-            match receive(reader) {
-                ServerMessage::Ack { acknowledged, .. } if acknowledged >= sequence => break,
-                ServerMessage::Update { .. }
-                | ServerMessage::Snapshot { .. }
-                | ServerMessage::Delta { .. }
-                | ServerMessage::Ack { .. } => {}
-                message => panic!("unexpected response: {message:?}"),
-            }
-        }
-    }
-    let root = std::env::temp_dir().join(format!(
-        "zess-mouse-server-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
     ));
-    fs::create_dir(&root).unwrap();
-    let path = root.join("note.txt");
-    fs::write(&path, "abcdef\n").unwrap();
-    let socket = root.join("server.sock");
-    let (workspace, server_socket, file) = (root.clone(), socket.clone(), path.clone());
-    let handle = thread::spawn(move || {
-        serve(
-            &zess_ipc::NativeLocalIpc,
-            &SocketPath::from(server_socket),
-            Session::new(workspace, &[file], None)?,
-        )
-    });
-    let server = RunningServer {
-        root,
-        socket,
-        thread: Some(handle),
-    };
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut stream = loop {
-        if let Ok(stream) = UnixStream::connect(&server.socket) {
-            break stream;
-        }
-        assert!(Instant::now() < deadline);
-        assert!(!server.thread.as_ref().unwrap().is_finished());
-        thread::sleep(Duration::from_millis(10));
-    };
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    send(
-        &mut stream,
-        &ClientMessage::Attach {
-            expected_session: None,
-            client_id: "mouse-test".into(),
-            width: 80,
-            height: 24,
-            files: Vec::new(),
-            context_epoch: None,
-        },
-    );
-    let ServerMessage::Attached {
-        context_epoch,
-        frame,
-        ..
-    } = receive(&mut reader)
-    else {
-        panic!("server did not attach")
-    };
-    for column in [5, 7] {
-        send(
-            &mut stream,
-            &ClientMessage::Mouse {
-                sequence: 1,
-                context_epoch,
-                mouse_context: frame.mouse_context,
-                event: MouseEvent {
-                    kind: MouseKind::Press,
-                    column,
-                    row: 0,
-                },
-            },
-        );
-        acknowledged(&mut reader, 1);
-    }
-    for (index, key) in ["r", "X", ":", "w", "Enter"].into_iter().enumerate() {
-        let sequence = index as u64 + 2;
-        send(
-            &mut stream,
-            &ClientMessage::Input {
-                sequence,
-                key: key.into(),
-                context_epoch,
-            },
-        );
-        acknowledged(&mut reader, sequence);
-    }
-    assert_eq!(fs::read_to_string(&path).unwrap(), "abXdef\n");
-    send(
-        &mut stream,
-        &ClientMessage::Mouse {
-            sequence: 7,
-            context_epoch: context_epoch.wrapping_add(1),
-            mouse_context: frame.mouse_context,
-            event: MouseEvent {
-                kind: MouseKind::Press,
-                column: 6,
-                row: 0,
-            },
-        },
-    );
-    loop {
-        match receive(&mut reader) {
-            ServerMessage::Rejected { reason } => {
-                assert_eq!(
-                    reason,
-                    "input context changed; reconnect before sending mouse input"
-                );
-                break;
-            }
-            ServerMessage::Update { .. }
-            | ServerMessage::Snapshot { .. }
-            | ServerMessage::Delta { .. }
-            | ServerMessage::Ack { .. } => {}
-            message => panic!("unexpected response: {message:?}"),
-        }
-    }
+    assert!(matches!(&messages[2], ServerMessage::ClipboardWrite { text } if text == "next"));
 }
 
 #[test]
@@ -426,7 +315,9 @@ fn shutdown_delivers_exited_after_socket_backpressure_clears() {
         .unwrap();
     let mut connection = Connection::new(server).unwrap();
     connection
-        .send(&update(&"x".repeat(8 * 1024 * 1024)))
+        .send(&ServerMessage::ClipboardWrite {
+            text: "x".repeat(8 * 1024 * 1024),
+        })
         .unwrap();
     connection.flush().unwrap();
     assert!(
@@ -463,7 +354,9 @@ fn shutdown_stops_waiting_for_a_client_that_does_not_drain_output() {
     let (server, _client) = stream_pair();
     let mut connection = Connection::new(server).unwrap();
     connection
-        .send(&update(&"x".repeat(8 * 1024 * 1024)))
+        .send(&ServerMessage::ClipboardWrite {
+            text: "x".repeat(8 * 1024 * 1024),
+        })
         .unwrap();
     connection.send(&ServerMessage::Exited).unwrap();
     let mut connections = vec![connection];
@@ -501,7 +394,7 @@ fn disconnecting_a_rejected_attached_client_releases_the_attachment() {
     fs::create_dir(&root).unwrap();
     let mut session = Session::new(root.clone(), &[], None).unwrap();
     let mut active = Some("rejected".to_owned());
-    connection.disconnect(&mut session, &mut active);
+    connection.disconnect(&mut session, &mut active, None, |_| false);
     assert_eq!(active, None);
     drop(session);
     fs::remove_dir_all(root).unwrap();
@@ -615,7 +508,6 @@ fn reconnecting_recovers_unacknowledged_results_without_repeating_commands() {
                 width: 80,
                 height: 24,
                 files: Vec::new(),
-                context_epoch: None,
             },
         );
         assert!(
@@ -650,6 +542,7 @@ fn reconnecting_recovers_unacknowledged_results_without_repeating_commands() {
             &SocketPath::from(server_socket),
             Session::new(workspace, &[], None)?,
             &IdentityPlatform,
+            SessionLifetime::Retained,
         )
     });
     let server = RunningServer {
@@ -674,10 +567,22 @@ fn reconnecting_recovers_unacknowledged_results_without_repeating_commands() {
     let (mut stream, mut reader, instance, session_id, before) = attach(&server.socket);
     assert_eq!(instance.0, "4242-9000");
     let request_id = RequestId(3);
+    let target = before
+        .views
+        .iter()
+        .find(|view| Some(view.view_id) == before.focused_view)
+        .unwrap();
     let command = ClientMessage::Command {
         request_id,
         server_instance: instance.clone(),
-        action: CommandAction::CommandLine { text: "new".into() },
+        action: CommandAction::Invoke {
+            target: zess_protocol::CommandTarget::View {
+                view_id: target.view_id,
+                buffer_id: target.buffer_id,
+            },
+            name: "new".into(),
+            argument: serde_json::json!({}),
+        },
     };
     send(&mut stream, &command);
     let original_result = receive_result(&mut reader, request_id);

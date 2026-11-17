@@ -123,7 +123,7 @@ fn query_kind_shortcuts_toggle_matching_and_allow_keymap_overrides() {
         assert_eq!(session.prompt.as_ref().unwrap().text, "*.rs");
         assert_eq!(session.prompt.as_ref().unwrap().cursor, cursor);
         assert_eq!(
-            session.frame().prompt,
+            prompt_text(&mut session),
             format!(
                 "{}(glob):*.rs",
                 if entry == "/" { "filter" } else { "find" }
@@ -139,7 +139,7 @@ fn query_kind_shortcuts_toggle_matching_and_allow_keymap_overrides() {
         session.input("A-r");
         assert_eq!(session.prompt.as_ref().unwrap().cursor, cursor);
         assert_eq!(
-            session.frame().prompt,
+            prompt_text(&mut session),
             format!("{}(re):*.rs", if entry == "/" { "filter" } else { "find" })
         );
         assert!(session.prompt.as_ref().unwrap().error.is_some());
@@ -225,7 +225,7 @@ fn create_and_rename_input_preserves_the_source_selection() {
             );
         }
         assert_eq!(
-            session.frame().prompt,
+            prompt_text(&mut session),
             format!(
                 "{}: xyjk",
                 if command == "files.create" {
@@ -270,7 +270,7 @@ map-key "text" "prompt" "y" "text.insert-newline"
     for key in ["x", "y", "Down", "Up", "Left", "Backspace", "z"] {
         session.input(key);
     }
-    assert_eq!(session.frame().prompt, "answer: zy");
+    assert_eq!(prompt_text(&mut session), "answer: zy");
     session.input("Esc");
     assert!(session.prompt.is_none());
     let Buffer::Text(text) = &session.buffers[&session.views[&session.focus].location.buffer]
@@ -557,43 +557,23 @@ fn filtering_shows_the_query_once_and_preserves_git_page_headers() {
         let source = session.focus;
         session.input("/");
         type_text(&mut session, "needle");
-        assert_eq!(session.frame().prompt, "filter:needle");
-        assert_eq!(session.views[&source].location.display.header, "");
+        assert_eq!(prompt_text(&mut session), "filter:needle");
+        let before = view_snapshot(&mut session, source);
+        assert!(before.header.is_empty());
         if kind == "git" {
-            let (rows, _) = session.render_view(source, 80, 24);
             assert_eq!(
-                rows[0]
-                    .spans
+                before
+                    .tabs
                     .iter()
-                    .map(|span| span.text.as_str())
-                    .collect::<String>()
-                    .trim_end(),
-                "[Changes]  History"
+                    .map(|tab| (tab.label.as_str(), tab.active))
+                    .collect::<Vec<_>>(),
+                [("Changes", true), ("History", false)]
             );
         }
         session.input("Enter");
-        assert_eq!(
-            session.views[&source].location.display.header,
-            if kind == "git" {
-                "  /needle"
-            } else {
-                "/needle"
-            }
-        );
-        let (rows, _) = session.render_view(source, 80, 24);
-        assert_eq!(
-            rows[0]
-                .spans
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<String>()
-                .trim_end(),
-            if kind == "git" {
-                "[Changes]  History    /needle"
-            } else {
-                "/needle"
-            }
-        );
+        let filtered = view_snapshot(&mut session, source);
+        assert_eq!(filtered.header.trim(), "/needle");
+        assert_eq!(filtered.tabs, before.tabs);
         assert_eq!(
             session.views[&source].item_ids(),
             [if kind == "git" {
@@ -605,28 +585,9 @@ fn filtering_shows_the_query_once_and_preserves_git_page_headers() {
         session.input("/");
         type_text(&mut session, "missing");
         session.input("Esc");
-        assert_eq!(
-            session.views[&source].location.display.header,
-            if kind == "git" {
-                "  /needlemissing"
-            } else {
-                "/needlemissing"
-            }
-        );
-        let (rows, _) = session.render_view(source, 80, 24);
-        assert_eq!(
-            rows[0]
-                .spans
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<String>()
-                .trim_end(),
-            if kind == "git" {
-                "[Changes]  History    /needlemissing"
-            } else {
-                "/needlemissing"
-            }
-        );
+        let updated = view_snapshot(&mut session, source);
+        assert_eq!(updated.header.trim(), "/needlemissing");
+        assert_eq!(updated.tabs, before.tabs);
         assert!(session.views[&source].item_ids().is_empty());
     }
 }

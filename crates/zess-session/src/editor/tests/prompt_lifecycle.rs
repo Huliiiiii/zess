@@ -55,6 +55,7 @@ fn failed_minibuffer_cancellation_keeps_the_input_and_focus_for_retry() {
                 purpose: "retry".into(),
                 text: "draft".into(),
                 key_scope: None,
+                confirmation: None,
             },
         )
         .unwrap();
@@ -110,6 +111,7 @@ fn buffer_replacement_waits_for_minibuffer_cancellation_to_succeed() {
                 purpose: "retry".into(),
                 text: "draft".into(),
                 key_scope: None,
+                confirmation: None,
             },
         )
         .unwrap();
@@ -139,6 +141,7 @@ fn failed_help_pinning_keeps_suspended_input_available_when_help_is_closed() {
                 purpose: "retry".into(),
                 text: "draft".into(),
                 key_scope: None,
+                confirmation: None,
             },
         )
         .unwrap();
@@ -168,6 +171,7 @@ fn retiring_a_source_waits_for_its_suspended_input_to_cancel() {
                 purpose: "retry".into(),
                 text: "draft".into(),
                 key_scope: None,
+                confirmation: None,
             },
         )
         .unwrap();
@@ -303,6 +307,7 @@ fn failed_input_cancellation_does_not_create_a_split() {
                         purpose: "retry".into(),
                         text: "draft".into(),
                         key_scope: None,
+                        confirmation: None,
                     },
                 )
                 .unwrap();
@@ -341,6 +346,7 @@ fn failed_input_cancellation_does_not_create_a_layer_or_close_help() {
                     purpose: "retry".into(),
                     text: "draft".into(),
                     key_scope: None,
+                    confirmation: None,
                 },
             )
             .unwrap();

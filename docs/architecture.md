@@ -4,46 +4,42 @@
 
 ## 会话和客户端
 
-每个 workspace 的 daemon 持有权威 `Session`。本地终端和 SSH 客户端通过同一会话协议提交输入，服务端执行编辑操作并发布状态。Ctrl-z 或连接中断后，重新连接同一 workspace 时可以继续使用仍在内存中的会话；正常退出则由服务端的会话策略决定是否停止。daemon 停止或崩溃后，内存中未保存的编辑内容不会由此机制恢复。
+本地终端和 SSH 终端运行同一个客户端编辑器。客户端从 Session 取得有效键位、命令目录和当前工作集，持有可编辑的文档副本、页面和选区。workspace daemon 保存已同步的未保存文档，执行文件、Git 和工作区插件操作。
 
 ```text
-终端输入 → 客户端 InputLedger → 连接 → workspace daemon → Session
-终端显示 ← ClientUiState + RemoteStateCache ← snapshot / delta
+终端输入 → 有效键位 → 客户端编辑器 → 本地画面
+                         ↕
+               文档事务、资源订阅、命令与回执
+                         ↕
+                workspace daemon → 文件、Git、任务
 ```
 
-`RemoteStateCache` 保存服务端发布的内容与呈现状态；客户端的 `ClientWorkspace` 持有 Buffer 成员和当前目标，依据动作回执更新，并决定关闭后的后继及是否退出。服务端保留已确认的工作集副本用于附着与重同步恢复。`ClientUiState` 保存通知等界面状态，`InputLedger` 跟踪输入和操作确认。会话保持依赖运行中的 daemon；设计不包括跨 daemon 崩溃的磁盘日志或多副本 CRDT。
+按下前缀键、打开命令行和移动光标直接更新客户端状态。打开 Git 页面后，客户端显示缓存或加载状态，订阅远端仓库。收到资源更新时，只刷新对应订阅。命令面板、键位和插件通过相同的命令目录分派。
+
+客户端维护分屏布局，每个分屏有自己的页面栈和选区。从命令行打开目录和在编辑器中打开 Files 使用同一条订阅路径。分屏复制数据页时，两个 View 共享插件 Buffer，分别接收各自的预览和选区更新。Session 用页面 ID 恢复对应 View，重连时可以按任意顺序重新订阅。
 
 剪贴板属于客户端能力。`*` 寄存器请求 PRIMARY selection；具有相应 provider 的终端环境支持该选择，Windows 返回不支持。普通 `space-y` 使用 `+` 系统剪贴板。远端会话需要剪贴板操作时，由连接的客户端执行相应本地能力。
 
 Unix 使用 Unix domain socket，Windows 使用 named pipe。Unix socket 放在私有运行目录并设置为仅所有者可访问；Windows 管道名包含用户 SID，访问控制授予当前用户。Windows 的 `--socket` 是逻辑端点名，日志位于 `%LOCALAPPDATA%\zess\run`（缺少该变量时使用临时目录）。实现见 [IPC](../crates/zess-ipc/src) 和 [Microsoft named pipes 文档](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipes)。
 
-客户端可以立即响应本地焦点和通知；编辑结果由 daemon 执行并发布，所以远程编辑的权威结果需要经过网络往返。典型断线恢复如下：
-
-```text
-客户端                     SSH 代理                  daemon / Session
-  |-- 输入(seq) -------------->|------------------------>|
-  |<-- Ack(seq) / 状态 --------|-------------------------|
-  |       连接中断             |                         | 继续运行
-  |-- 重新连接 / Attach ------>|------------------------>|
-  |<-- instance、Ack、epoch、快照 -----------------------|
-  |-- 安全时重发未确认输入；否则请求用户选择 ------------->|
-```
-
 ## 输入、确认与恢复
 
-一次编辑从客户端输入开始。客户端给待发送输入分配递增序号并保留在 `InputLedger`，daemon 执行后返回确认位置；客户端只移除已确认输入。显示使用服务端发布的语义快照及增量，本地界面状态负责通知、恢复选择等客户端交互，并不直接修改权威 Buffer。
+编辑首先应用到客户端文档。连接传送带文档身份和顺序号的事务，Session 返回已应用的版本。保存请求排在相应编辑之后，成功回执标明写入的版本。`:reload` 等待该文档先前的编辑得到确认。取得重载后的正文前，该文档显示等待状态，其他文档和数据页仍可操作。文件监听和工作区命令引起的文档变化经同一文档订阅返回。
 
-快照标识 Session、server instance 和 revision；增量指定原 revision 和新 revision。身份不一致或 revision 不连续时，客户端暂停应用增量并请求新快照。Session 标识会话，server instance 区分不同 daemon；context epoch 用于识别输入的交互上下文是否发生变化。
+执行数据页命令时，客户端随命令发送当时的条目选区和寄存器。Session 按这些条目处理命令，整文件 Git 操作在执行前验证所选路径。后续的选区移动只更新页面的显示位置。
 
-恢复选择先于待决退出；失败或未知的操作结果保持可见。寄存器 `+p` 的待处理读取仍可被后续输入取消。连接中断后，客户端只重新附着原会话并等待服务端确认位置和快照；原会话已结束时不会创建替代会话。相同实例且服务端允许重放时，客户端重发尚未确认的输入。上下文不允许重放时，用户选择重放或丢弃；丢弃已发送但未确认的输入时，等待服务端确认；尚未发送的队列直接丢弃。已确认输入不会因重连再发。带副作用的命令另以 request ID 和 server instance 跟踪，重连时查询结果；会话停止后无法查询原实例的结果。相关状态机见 [客户端](../crates/zess-terminal/src/lib.rs) 和 [服务端](../crates/zess-session/src/server.rs)。
+快照标识 Session、server instance 和修订号。增量标明基线修订号，客户端发现缺口会请求新快照。文档与外部工作区命令各自跟踪回执。重连同一实例时，客户端重订阅资源、核实文档事务并查询已提交命令的结果。主动 detach 等待编辑和恢复位置同步完成；意外断线后，新客户端能恢复远端已确认的工作集。
 
 Windows 远端启动 daemon 时检查当前 Job 的限制；需要且允许时显式请求 breakaway，遇到禁止 breakaway 的关闭即终止 Job 则报告错误。Microsoft 的 [OpenSSH Windows 命令进程实现](https://github.com/PowerShell/openssh-portable/blob/274893f8d1fe86c4d128b514c3af4bc10cdc0c99/contrib/win32/win32compat/w32-doexec.c#L440-L457) 使用关闭 Job 时结束进程并允许 breakaway 的设置。当前检查针对当前 Job；自定义嵌套外层 Job 的限制不在该检查保证范围内。
 
-同一会话同时只允许一个活动交互客户端；另一个客户端附着会被拒绝。管理连接仍可查询会话。客户端或 SSH 断线不会结束 daemon；客户端自身退出后，其内存中的待确认输入也不再保留。daemon 崩溃或停止后，未保存内容、布局和撤销历史不能通过重连恢复。
+同一会话同时只允许一个活动交互客户端；另一个客户端附着会被拒绝。管理连接仍可查询会话。客户端或 SSH 断线不会结束 daemon；客户端自身退出后，其内存中尚未同步的编辑也会随之释放。daemon 崩溃或停止后，未保存内容、布局和撤销历史不能通过重连恢复。
 
 ## 连接和资源归属
 
-本地管理器按规范化 workspace 路径选择端点，`ensure` 连接已有 daemon 或启动一个新 daemon。daemon 负责 Session、文件及插件操作；终端客户端持有终端设备、剪贴板和连接。客户端退出后，服务端在连接释放后依据活动连接、未保存状态与会话策略决定是否停止，见 [配置](configuration.md)。会话运行在哪台机器，其 workspace、配置、Git、监听及外部程序就属于哪台机器；远程会话的界面和剪贴板仍属于本地客户端。
+会话管理器按规范化 workspace 路径选择端点。本地和 SSH 普通打开工作区时，首次连接持有临时 daemon。
+客户端应用初始快照并确认 attach 后，daemon 才保留 Session 并允许发现与重连。
+确认前取消或断开连接会回收临时进程和端点。显式 `session new` 创建可稍后 attach 的 Session。
+daemon 负责 Session、文件及插件操作；终端客户端持有终端设备、剪贴板和连接。客户端退出后，服务端在连接释放后依据活动连接、未保存状态与会话策略决定是否停止，见 [配置](configuration.md)。会话运行在哪台机器，其 workspace、配置、Git、监听及外部程序就属于哪台机器；远程会话的界面和剪贴板仍属于本地客户端。
 
 SSH 连接先探测远端平台并校验 Build ID 对应的服务端缓存；缓存不可用时，本机从发布产物下载匹配的服务端，经 SSH 上传、校验后安装，再以缓存路径启动 `remote-proxy`。Linux 发布包包含运行所需的动态链接器与库；安装时修补服务端的解释器路径，并分别校验发布包和安装后的文件。客户端与代理通过 Hello 确认 Build ID 一致；代理处理管理请求或连接对应的会话服务端并转发会话流。会话发现通过握手前的只读 Status 获取包含 Build ID 的状态，业务连接仍要求 Build ID 一致。一个连接的标准输入和输出承载协议，标准错误承载诊断；远端 shell 向标准输出写入 banner 会破坏协议。系统 SSH 按其有效配置负责认证、主机密钥检查和加密。Windows 命名管道忙时的连接尝试最多等待既有的两秒后才检查取消。
 
@@ -59,4 +55,4 @@ SSH 连接先探测远端平台并校验 Build ID 对应的服务端缓存；缓
 - [Emacs server](https://www.gnu.org/software/emacs/manual/html_node/emacs/Invoking-emacsclient.html) 允许客户端连接常驻进程；Zess 以 workspace 选择 daemon，并明确配置断开与停止。
 - [Acme](https://9fans.github.io/plan9port/man/man4/acme.html) 通过文件接口暴露窗口和操作；Zess 使用类型化会话消息，保留客户端与编辑状态的边界。
 - [VS Code Remote SSH](https://code.visualstudio.com/docs/remote/ssh) 说明远端服务器和扩展位置；[Zed Remote Development](https://zed.dev/docs/remote-development) 说明本地编辑器通过 SSH 连接远端。这里引用的是公开行为，不推断 VS Code SSH 扩展的内部实现。
-- Zess 使用锁定的 [Helix core](https://github.com/helix-editor/helix/tree/ba40e547426b0f9896c8bdc699a4ab11f2b37dbc/helix-core) 的选区和编辑能力，Session 在服务端管理编辑状态，不为终端界面引入整个 Helix Editor。
+- Zess 使用锁定的 [Helix core](https://github.com/helix-editor/helix/tree/ba40e547426b0f9896c8bdc699a4ab11f2b37dbc/helix-core) 的选区和编辑能力，客户端与 Session 共用文本事务和选区实现，不为终端界面引入整个 Helix Editor。

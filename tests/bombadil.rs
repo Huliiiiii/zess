@@ -32,20 +32,21 @@ struct Fixture {
     socket: PathBuf,
 }
 
+fn diff_lines(marker: &str) -> String {
+    (0..40)
+        .map(|line| format!("{marker}_{line:02}\n"))
+        .collect()
+}
+
 impl Fixture {
-    fn new() -> Result<Self> {
+    fn new(case: &str) -> Result<Self> {
         let root = tempfile::Builder::new()
             .prefix("zess-bombadil-")
             .tempdir()?;
         let workspace = root.path().join("workspace");
         fs::create_dir(&workspace)?;
         fs::write(workspace.join("origin.txt"), "abcdef\n")?;
-        fs::write(
-            workspace.join("diff.txt"),
-            (0..40)
-                .map(|line| format!("BASELINE_ALPHA_{line:02}\n"))
-                .collect::<String>(),
-        )?;
+        fs::write(workspace.join("diff.txt"), diff_lines("BASELINE_ALPHA"))?;
         for arguments in [
             &["init", "--quiet"][..],
             &["config", "user.name", "Terminal fixture"],
@@ -71,14 +72,14 @@ impl Fixture {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        fs::write(
-            workspace.join("diff.txt"),
-            (0..40)
-                .map(|line| format!("WORKTREE_BETA_{line:02}\n"))
-                .collect::<String>(),
-        )?;
+        fs::write(workspace.join("diff.txt"), diff_lines("WORKTREE_BETA"))?;
         let config = root.path().join("init.w");
-        fs::write(&config, "")?;
+        let settings = if case == "pages" {
+            "set-view-options! 'files : obj 'double-click-command \"data.move-down\"\n"
+        } else {
+            ""
+        };
+        fs::write(&config, settings)?;
         let socket = root.path().join("session.sock");
         let server = Command::new(env!("CARGO_BIN_EXE_zess"))
             .arg("server")
@@ -172,7 +173,12 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<ExitStatus> {
     }
 }
 
-fn explore(case: &str, checkpoints: &[&str], expected_files: &[(&str, &[u8])]) -> Result<()> {
+fn explore(
+    case: &str,
+    checkpoints: &[&str],
+    expected_files: &[(&str, &[u8])],
+    expected_index: &[(&str, &[u8])],
+) -> Result<()> {
     let bombadil =
         PathBuf::from(std::env::var_os("BOMBADIL_BIN").unwrap_or_else(|| "bombadil".into()));
     let bombadil = if bombadil.is_relative() && bombadil.components().count() > 1 {
@@ -199,7 +205,7 @@ fn explore(case: &str, checkpoints: &[&str], expected_files: &[(&str, &[u8])]) -
         .tempdir_in(&output_root)?
         .keep();
     eprintln!("Bombadil {case}: {}", output.display());
-    let mut fixture = Fixture::new()?;
+    let mut fixture = Fixture::new(case)?;
     let result = (|| {
         let mut command = Command::new(&bombadil);
         command
@@ -272,6 +278,24 @@ fn explore(case: &str, checkpoints: &[&str], expected_files: &[(&str, &[u8])]) -
             let actual = fs::read(fixture.workspace.join(name))?;
             ensure!(actual == *expected, "saved {name} differs: {actual:?}");
         }
+        for (name, expected) in expected_index {
+            let result = Command::new("git")
+                .current_dir(&fixture.workspace)
+                .args(["show", &format!(":{name}")])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()?;
+            ensure!(
+                result.status.success(),
+                "read staged {name}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            ensure!(
+                result.stdout == *expected,
+                "staged {name} differs: {}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+        }
         if let Some(directory) = reproduce {
             let (original, expected_actions) = read_trace(&directory)?;
             ensure!(
@@ -302,12 +326,15 @@ fn explore(case: &str, checkpoints: &[&str], expected_files: &[(&str, &[u8])]) -
 
 #[test]
 #[ignore = "requires Bombadil 0.7.10; set BOMBADIL_BIN or install it on PATH"]
-fn browser_pages_preserve_unsaved_text_and_the_return_selection() -> Result<()> {
+fn browser_pages_preserve_unsaved_text_while_staging_selected_diff_rows() -> Result<()> {
+    let mut index = diff_lines("BASELINE_ALPHA");
+    index.push_str("WORKTREE_BETA_35\nWORKTREE_BETA_36\n");
     explore(
         "pages",
         &[
             "unsaved-origin-selected",
             "files-opened",
+            "double-click-moves-from-the-clicked-file",
             "files-help-opened",
             "files-help-resized",
             "changes-preview-focused",
@@ -316,14 +343,27 @@ fn browser_pages_preserve_unsaved_text_and_the_return_selection() -> Result<()> 
             "first-return-edited",
             "history-opened",
             "commit-files-opened",
+            "active-history-tab-keeps-commit-files",
+            "changes-from-commit-files",
+            "history-restores-commit-files",
+            "active-history-command-keeps-commit-files",
             "commit-preview-focused",
+            "historical-source-opens-at-the-selected-line",
+            "closing-historical-source-restores-preview-focus",
             "files-from-commit-preview",
             "second-return-preserves-selection",
             "second-return-edited",
+            "mouse-selected-additions",
+            "selected-additions-staged",
+            "closing-changes-restores-the-edited-file",
             "origin-saved",
             "closed-normally",
         ],
-        &[("origin.txt", b"UN#AVED_abcdef\n")],
+        &[
+            ("origin.txt", b"UN#AVED_abcdef\n"),
+            ("diff.txt", diff_lines("WORKTREE_BETA").as_bytes()),
+        ],
+        &[("diff.txt", index.as_bytes())],
     )
 }
 
@@ -346,11 +386,13 @@ fn cancelling_temporary_input_preserves_text_and_named_registers() -> Result<()>
             "register-command-cancelled",
             "named-register-preserved",
             "register-output-saved",
+            "closing-saved-buffer-returns-to-origin",
             "closed-normally",
         ],
         &[
             ("origin.txt", b"ZXbcdef\n"),
             ("register-output.txt", b"ZAFTER"),
         ],
+        &[],
     )
 }

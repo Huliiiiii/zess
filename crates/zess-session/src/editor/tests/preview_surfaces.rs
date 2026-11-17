@@ -1,18 +1,4 @@
-use zess_ui::{MouseEvent, MouseKind};
-
 use super::*;
-
-fn mouse(session: &mut Session, kind: MouseKind, rect: Rect, row: usize) {
-    let frame = session.frame();
-    session.mouse(
-        frame.mouse_context,
-        MouseEvent {
-            kind,
-            column: rect.x as u16,
-            row: (rect.y + row) as u16,
-        },
-    );
-}
 
 #[test]
 fn file_previews_keep_keyboard_focus_in_the_browser() {
@@ -47,12 +33,14 @@ fn file_previews_keep_keyboard_focus_in_the_browser() {
     session.input("K");
     assert_eq!(preview_surface(&session, source).viewport.scroll, 0);
     assert_eq!(session.selection_snapshot(), selection);
-    let rows = preview_rows(&mut session, source);
-    assert_eq!(rows[0].spans[0].text, "preview");
-    assert!(rows.iter().flat_map(|row| &row.spans).all(|span| !matches!(
-        span.style.as_str(),
-        "selection" | "cursor" | "linenr" | "status.normal"
-    )));
+    let snapshot = session.snapshot();
+    assert_eq!(snapshot.focused_view, Some(source));
+    assert_eq!(snapshot.views.len(), 1);
+    assert_eq!(snapshot.surfaces.len(), 1);
+    assert_eq!(
+        text_lines(&snapshot.surfaces[0].content)[0].text,
+        "preview\n"
+    );
     assert_eq!(session.active_preview(source), Some(target));
     assert_eq!(session.views.values().count(), 1);
     session.input("Enter");
@@ -85,82 +73,26 @@ fn file_preview_wrap_is_enabled_by_default_and_can_be_disabled() {
             .dispatch(source, "navigate", json!({"path":"note.txt"}))
             .unwrap();
         settle(&mut session);
-        let rows = preview_rows(&mut session, source);
+        let surface = preview_surface_snapshot(&mut session, source);
+        let lines = text_lines(&surface.content);
         let width = preview_surface(&session, source).viewport.width;
-        let text = |row: &FrameRow| {
-            row.spans
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<String>()
-        };
-        assert_eq!(text(&rows[0]), content[..width]);
+        assert_eq!(surface.soft_wrap, wrap);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].first_char, 0);
+        assert_eq!(lines[0].text[..width], content[..width]);
+        session.input("J");
+        let surface = preview_surface_snapshot(&mut session, source);
+        let line = &text_lines(&surface.content)[0];
         if wrap {
-            assert_eq!(text(&rows[1]), content[width..width * 2]);
-            session.input("J");
-            assert_eq!(preview_surface(&session, source).viewport.scroll, 1);
-            let rows = preview_rows(&mut session, source);
-            assert_eq!(text(&rows[0]), content[width..width * 2]);
+            assert_eq!(surface.scroll, 1);
+            assert_eq!(line.first_char, width);
+            assert_eq!(line.text[..width], content[width..width * 2]);
         } else {
-            assert!(rows[1].spans.is_empty());
-            session.input("J");
-            assert_eq!(preview_surface(&session, source).viewport.scroll, 0);
+            assert_eq!(surface.scroll, 0);
+            assert_eq!(line.first_char, 0);
+            assert_eq!(line.text, content[..width]);
         }
     }
-}
-
-#[test]
-fn surface_mouse_events_belong_to_their_page_and_leave_file_selection_unchanged() {
-    let fixture = Fixture::new();
-    fs::write(fixture.0.join("a.txt"), "first\n".repeat(60)).unwrap();
-    fs::write(fixture.0.join("b.txt"), "second").unwrap();
-    let mut session = fixture.session(&[]);
-    session.resize(160, 16);
-    session.command("files").unwrap();
-    settle(&mut session);
-    let left = session.focus;
-    let left_page = session.views.page_id(left);
-    session.command("vsplit").unwrap();
-    settle(&mut session);
-    let right = session.focus;
-    let selection = serde_json::to_value(&session.views[&left].location.selection).unwrap();
-    session.frame();
-    let rect = session.mouse_regions.iter().find(|region| matches!(&region.target, RenderTarget::Surface { page, .. } if *page == left_page)).unwrap().body;
-    mouse(&mut session, MouseKind::ScrollDown, rect, 0);
-    assert_eq!(session.focus, right);
-    assert_eq!(preview_surface(&session, left).viewport.scroll, 3);
-    assert_eq!(preview_surface(&session, right).viewport.scroll, 0);
-    mouse(&mut session, MouseKind::Press, rect, 1);
-    assert_eq!(session.focus, left);
-    mouse(&mut session, MouseKind::Drag, rect, 4);
-    mouse(&mut session, MouseKind::DoubleClick, rect, 2);
-    assert_eq!(session.views.values().count(), 2);
-    assert_eq!(
-        serde_json::to_value(&session.views[&left].location.selection).unwrap(),
-        selection
-    );
-    assert_eq!(session.views.child(left), None);
-    let frame = session.frame();
-    session.mouse(
-        frame.mouse_context,
-        MouseEvent {
-            kind: MouseKind::Press,
-            column: u16::MAX,
-            row: u16::MAX,
-        },
-    );
-    assert_eq!(session.focus, left);
-    assert_eq!(session.views.values().count(), 2);
-    let main = session
-        .mouse_regions
-        .iter()
-        .find(|region| region.target == RenderTarget::View(left))
-        .unwrap()
-        .body;
-    mouse(&mut session, MouseKind::Press, main, 1);
-    settle(&mut session);
-    assert_eq!(selected_row(&session, left).id, "b.txt");
-    assert_eq!(preview_text(&session, left), "second");
-    assert_eq!(preview_text(&session, right), "first\n".repeat(60));
 }
 
 #[test]
@@ -176,9 +108,12 @@ fn file_preview_help_uses_the_browser_context() {
         .execute_command("preview.focus", serde_json::json!({}))
         .unwrap();
     session.command("help").unwrap();
-    let help = rendered(&mut session);
-    assert!(help.contains("Files"), "{help}");
-    assert!(help.contains("Open selected file"), "{help}");
+    let help = session.focus;
+    let help = view_snapshot(&mut session, help);
+    let rows = item_rows(&help.content);
+    for label in ["Files", "Open selected file"] {
+        assert!(rows.iter().any(|row| row.text.contains(label)), "{rows:?}");
+    }
     session.input("Esc");
     assert_eq!(session.focus, source);
     assert_eq!(session.active_preview(source), Some(target));
@@ -292,124 +227,18 @@ fn unwrapped_previews_preserve_their_viewport_until_replacement_contents_shrink(
     assert_eq!(selected_row(&session, source).id, "b.txt");
     assert_eq!(session.active_preview(source), Some(target.clone()));
     assert_eq!(preview_buffer(&session, source), buffer);
-    let rows = preview_rows(&mut session, source);
-    assert!(
-        rows[0]
-            .spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>()
-            .starts_with("3 ")
-    );
-    assert_eq!(preview_surface(&session, source).viewport.scroll, 3);
-    assert_eq!(
-        preview_surface(&session, source).viewport.horizontal_scroll,
-        2
-    );
+    let surface = preview_surface_snapshot(&mut session, source);
+    let line = &text_lines(&surface.content)[0];
+    assert_eq!((surface.scroll, surface.horizontal_scroll), (3, 2));
+    assert_eq!((line.line, line.first_column), (3, 2));
+    assert!(line.text.starts_with("3 "));
     fs::write(fixture.0.join("b.txt"), "short").unwrap();
     session.input("R");
     settle(&mut session);
-    assert_eq!(preview_rows(&mut session, source)[0].spans[0].text, "short");
-    assert_eq!(preview_surface(&session, source).viewport.scroll, 0);
-    assert_eq!(
-        preview_surface(&session, source).viewport.horizontal_scroll,
-        0
-    );
+    let surface = preview_surface_snapshot(&mut session, source);
+    assert_eq!((surface.scroll, surface.horizontal_scroll), (0, 0));
+    assert_eq!(text_lines(&surface.content)[0].text, "short");
     assert_eq!(session.active_preview(source), Some(target));
     assert_eq!(session.focus, source);
     assert_eq!(session.views.values().count(), 1);
-}
-
-#[test]
-fn consecutive_wheel_events_from_one_displayed_frame_keep_scrolling_the_surface() {
-    let fixture = Fixture::new();
-    fs::write(fixture.0.join("note.txt"), "preview\n".repeat(60)).unwrap();
-    let mut session = fixture.session(&[]);
-    session.command("files").unwrap();
-    settle(&mut session);
-    let source = session.focus;
-    let selection = session.selection_snapshot();
-    let frame = session.frame();
-    let region = session
-        .mouse_regions
-        .iter()
-        .find(|region| matches!(region.target, RenderTarget::Surface { .. }))
-        .unwrap()
-        .body;
-    for expected in [3, 6, 9] {
-        session.mouse(
-            frame.mouse_context,
-            MouseEvent {
-                kind: MouseKind::ScrollDown,
-                column: region.x as u16,
-                row: region.y as u16,
-            },
-        );
-        let next = session.frame();
-        assert_eq!(preview_surface(&session, source).viewport.scroll, expected);
-        assert_eq!(
-            next.mouse_context.layout_revision,
-            frame.mouse_context.layout_revision
-        );
-        assert_eq!(session.focus, source);
-        assert_eq!(session.selection_snapshot(), selection);
-    }
-}
-
-#[test]
-fn clicking_a_surface_finishes_pending_browser_input_before_the_next_key() {
-    let fixture = Fixture::new();
-    for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
-        fs::write(fixture.0.join(name), "preview").unwrap();
-    }
-    for double_click in [false, true] {
-        let mut session = fixture.session(&[]);
-        session.command("files").unwrap();
-        settle(&mut session);
-        let source = session.focus;
-        for prefix in [&["C-w"][..], &["3"][..], &["\""][..], &["g", "w"][..]] {
-            session
-                .execute_command("data.goto-first", serde_json::json!({}))
-                .unwrap();
-            settle(&mut session);
-            assert_eq!(selected_row(&session, source).id, "a.txt");
-            for key in prefix {
-                session.input(key);
-            }
-            assert!(
-                !session.key_sequence.keys().is_empty()
-                    || !session.views[&source].count.is_empty()
-                    || !matches!(session.views[&source].register, RegisterInput::None)
-                    || session.views[&source].jump.is_some(),
-                "{prefix:?}"
-            );
-            let frame = session.frame();
-            let region = session
-                .mouse_regions
-                .iter()
-                .find(|region| matches!(region.target, RenderTarget::Surface { .. }))
-                .unwrap()
-                .body;
-            session.mouse(
-                frame.mouse_context,
-                MouseEvent {
-                    kind: if double_click {
-                        MouseKind::DoubleClick
-                    } else {
-                        MouseKind::Press
-                    },
-                    column: region.x as u16,
-                    row: region.y as u16,
-                },
-            );
-            assert_eq!(selected_row(&session, source).id, "a.txt");
-            session.input("j");
-            assert_eq!(
-                selected_row(&session, source).id,
-                "b.txt",
-                "double click: {double_click}; prefix: {prefix:?}"
-            );
-            assert_eq!(session.focus, source);
-        }
-    }
 }

@@ -18,6 +18,67 @@ fn listener() -> (SocketPath, Listener) {
     (socket, listener)
 }
 
+fn local_connection(socket: &SocketPath) -> Box<dyn ConnectionStream> {
+    let stream = Stream::connect(socket).unwrap();
+    let process = NativeDaemonControl.watch(&stream).unwrap();
+    Box::new(LocalConnection::new(stream, process))
+}
+
+#[test]
+fn a_large_page_subscription_arrives_in_bounded_frames() {
+    use zess_protocol::resource::{PageInput, PageSource, ResourceRequest};
+
+    let (socket, listener) = listener();
+    let mut connection =
+        Connection::connect(local_connection(&socket), "resource", &[], None, 80, 24).unwrap();
+    let _peer = listener.accept().unwrap();
+    let original = "界\n".repeat(MAX_INPUT_BYTES / 3);
+    connection
+        .send(&ClientMessage::Resource {
+            request: ResourceRequest::Subscribe {
+                subscription_id: 16,
+                page_id: zess_protocol::resource::PageId {
+                    context_epoch: 0,
+                    sequence: 9,
+                },
+                clone_from: None,
+                source: PageSource {
+                    kind: "git-commit-files".into(),
+                    argument: serde_json::json!(original),
+                },
+                input: PageInput {
+                    generation: 4,
+                    selection: Default::default(),
+                    register: None,
+                    mode: "normal".into(),
+                    filter: None,
+                    source_buffer: None,
+                    width: 40,
+                    active: true,
+                    preview_width: 39,
+                    preview_height: 22,
+                },
+            },
+        })
+        .unwrap();
+    let mut stream = zess_protocol::chunks::MessageStream::default();
+    for frame in connection.output.into_iter().skip(1) {
+        assert!(frame.len() <= MAX_INPUT_BYTES);
+        let ClientMessage::Chunk { json, last } = serde_json::from_slice(&frame).unwrap() else {
+            panic!("expected a resource fragment");
+        };
+        let received = stream.client(json, last).unwrap();
+        if last {
+            assert!(
+                matches!(received, Some(ClientMessage::Resource { request: ResourceRequest::Subscribe {subscription_id:16, page_id: zess_protocol::resource::PageId { context_epoch: 0, sequence: 9 }, clone_from:None, input:PageInput{generation:4,..},source}}) if source.argument == original)
+            );
+            return;
+        }
+        assert!(received.is_none());
+    }
+    panic!("missing end of subscription")
+}
+
 #[test]
 fn a_frame_is_presented_after_all_rows_are_written() {
     let frame = Frame {
@@ -64,70 +125,59 @@ fn narrow_rows_keep_joined_emoji_and_following_cells_visible() {
 }
 
 #[test]
-fn reconnect_replays_keys_and_discards_mouse_coordinates_in_sequence() {
-    let (socket, listener) = listener();
-    let writer = Stream::connect(&socket).unwrap();
-    let reader = listener.accept().unwrap();
-    reader
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .unwrap();
-    writer.set_nonblocking(true).unwrap();
-    let mut connection = Connection {
-        stream: Box::new(LocalConnection::new(
-            writer.try_clone().unwrap(),
-            NativeDaemonControl.watch(&writer).unwrap(),
-        )),
-        input: framing::Decoder::default(),
-        output: VecDeque::new(),
-        written: 0,
-        pending_attach: None,
-    };
-    let pending = VecDeque::from([
-        (1, PendingInput::Key("i".into())),
-        (2, PendingInput::Mouse),
-        (3, PendingInput::Key("x".into())),
-    ]);
-    send_pending(
-        &mut connection,
-        &pending,
-        42,
-        &ServerInstanceId("same".into()),
-    )
-    .unwrap();
-    connection.poll().unwrap();
-    let messages = BufReader::new(reader)
-        .lines()
-        .take(3)
-        .map(|line| serde_json::from_str::<ClientMessage>(&line.unwrap()).unwrap())
-        .collect::<Vec<_>>();
-    assert!(
-        matches!(&messages[0], ClientMessage::Input { sequence: 1, key, context_epoch: 42 } if key == "i")
-    );
-    assert!(matches!(
-        &messages[1],
-        ClientMessage::Skip {
-            through: 2,
-            context_epoch: 42
+fn terminal_rows_keep_graphemes_whole_across_style_changes() {
+    use zess_ui::{AnsiText, StyleColor};
+
+    crossterm::style::force_color_output(true);
+    let mut decoded = AnsiText::parse("a\x1b[31m👩\x1b[32m\u{200d}💻X");
+    let row = decoded.rows.pop().unwrap();
+    for (width, expected) in [(0, ""), (2, "a"), (3, "a👩‍💻"), (4, "a👩‍💻X")] {
+        let mut output = Vec::new();
+        render_row(&mut output, &row, width, &decoded.styles).unwrap();
+
+        let printed = AnsiText::parse(std::str::from_utf8(&output).unwrap());
+        let text = printed
+            .rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert_eq!(text, expected, "{width} columns");
+        if width == 3 {
+            let spans = &printed.rows[0].spans;
+            assert_eq!(
+                printed.styles[&spans[1].style].foreground,
+                Some(StyleColor::Indexed(1))
+            );
+            assert_eq!(
+                printed.styles[&spans[2].style].foreground,
+                Some(StyleColor::Indexed(2))
+            );
         }
-    ));
-    assert!(
-        matches!(&messages[2], ClientMessage::Input { sequence: 3, key, context_epoch: 42 } if key == "x")
-    );
+    }
+}
+
+#[test]
+fn terminal_rows_fit_control_character_escapes_into_the_available_columns() {
+    let row = FrameRow {
+        spans: vec![zess_ui::Span {
+            base_style: None,
+            text: "\nX".into(),
+            style: String::new(),
+        }],
+    };
+    let mut output = Vec::new();
+    render_row(&mut output, &row, 2, &Default::default()).unwrap();
+
+    let printed = zess_ui::AnsiText::parse(std::str::from_utf8(&output).unwrap());
+    assert_eq!(printed.rows[0].spans[0].text, "\\n");
 }
 
 #[test]
 fn dropping_a_connection_closes_the_socket_without_waiting_for_the_peer() {
     let (socket, listener) = listener();
-    let connection = Connection::connect(
-        &mut LocalConnectionFactory(socket.clone()),
-        "close",
-        &[],
-        None,
-        None,
-        80,
-        24,
-    )
-    .unwrap();
+    let connection =
+        Connection::connect(local_connection(&socket), "close", &[], None, 80, 24).unwrap();
     let mut peer = listener.accept().unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
     drop(connection);
@@ -135,51 +185,17 @@ fn dropping_a_connection_closes_the_socket_without_waiting_for_the_peer() {
 }
 
 #[test]
-fn reconnecting_to_a_replacement_server_preserves_pending_input_and_rejects_attachment() {
-    let mut ledger = InputLedger::new();
-    ledger.attach(ServerInstanceId("old".into()), 0).unwrap();
-    ledger.push(PendingInput::Key("i".into()));
-    ledger.push(PendingInput::Key("x".into()));
-    ledger.acknowledge(1);
-    assert!(ledger.attach(ServerInstanceId("new".into()), 0).is_err());
-    assert_eq!(ledger.server_instance, Some(ServerInstanceId("old".into())));
-    assert_eq!(ledger.pending.len(), 1);
-    assert_eq!(ledger.pending[0].0, 2);
-    assert!(matches!(&ledger.pending[0].1, PendingInput::Key(key) if key == "x"));
-}
-
-#[test]
-fn reconnecting_to_the_same_server_preserves_the_deduplication_sequence() {
-    let mut ledger = InputLedger::new();
-    ledger.attach(ServerInstanceId("same".into()), 0).unwrap();
-    ledger.push(PendingInput::Key("i".into()));
-    ledger.push(PendingInput::Key("x".into()));
-    ledger.acknowledge(1);
-    ledger.attach(ServerInstanceId("same".into()), 2).unwrap();
-    assert!(ledger.pending.is_empty());
-    assert_eq!(ledger.push(PendingInput::Key("y".into())), 3);
-}
-
-#[test]
 fn a_peer_that_stops_reading_does_not_block_terminal_progress() {
     let (socket, listener) = listener();
-    let mut connection = Connection::connect(
-        &mut LocalConnectionFactory(socket.clone()),
-        "stalled",
-        &[],
-        None,
-        None,
-        80,
-        24,
-    )
-    .unwrap();
+    let mut connection =
+        Connection::connect(local_connection(&socket), "stalled", &[], None, 80, 24).unwrap();
     let _peer = listener.accept().unwrap();
-    for sequence in 1..16 {
+    for id in 1..16 {
         connection
-            .send(&ClientMessage::Input {
-                sequence,
-                key: "x".repeat(512 * 1024),
-                context_epoch: 1,
+            .send(&ClientMessage::ClipboardResponse {
+                id,
+                text: Some("x".repeat(512 * 1024)),
+                error: None,
             })
             .unwrap();
     }
@@ -348,10 +364,9 @@ fn a_clipboard_response_completed_while_disconnected_is_reused_after_reconnect()
     }
     let (socket, listener) = listener();
     let mut connection = Connection::connect(
-        &mut LocalConnectionFactory(socket.clone()),
+        local_connection(&socket),
         "clipboard-response",
         &[],
-        None,
         None,
         80,
         24,
@@ -399,16 +414,8 @@ fn reconnecting_to_another_server_discards_the_previous_clipboard_response() {
 #[test]
 fn a_limit_sized_message_and_the_next_message_can_share_a_socket_read() {
     let (socket, listener) = listener();
-    let mut connection = Connection::connect(
-        &mut LocalConnectionFactory(socket.clone()),
-        "frame-limit",
-        &[],
-        None,
-        None,
-        80,
-        24,
-    )
-    .unwrap();
+    let mut connection =
+        Connection::connect(local_connection(&socket), "frame-limit", &[], None, 80, 24).unwrap();
     let mut peer = listener.accept().unwrap();
     peer.write_all(
         &framing::encode(&ServerMessage::Hello {

@@ -86,6 +86,7 @@ fn script_queries_keep_the_kind_separate_from_literal_text() {
             options: serde_json::Value::Null,
             mode: "filter".into(),
             selection: ItemSelection::default(),
+            view_selection: None,
             register: None,
             context: zess_plugin::PluginContext::default(),
         };

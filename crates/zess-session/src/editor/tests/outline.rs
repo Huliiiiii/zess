@@ -231,3 +231,30 @@ fn split_outlines_keep_their_source_when_another_text_view_gains_focus() {
     assert_eq!(session.views[&session.focus].location.buffer, source);
     assert_eq!(session.views[&outline].location.buffer, unrelated);
 }
+
+#[test]
+fn an_outline_keeps_its_rows_until_reloaded_source_syntax_is_available() {
+    let fixture = Fixture::new();
+    let path = fixture.write("example.rs", "fn original() {}\n");
+    let mut session = fixture.session(&[path.clone()]);
+    let source = session.views[&session.focus].location.buffer;
+    session.command("outline").unwrap();
+    let outline = session.focus;
+
+    fs::write(path, "fn revised() {}\n").unwrap();
+    session.reload_document(source).unwrap();
+    assert_eq!(
+        session.views[&outline].location.display.rows[0].text,
+        "  function_item original"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        session.tick();
+        if session.views[&outline].location.display.rows[0].text == "  function_item revised" {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}

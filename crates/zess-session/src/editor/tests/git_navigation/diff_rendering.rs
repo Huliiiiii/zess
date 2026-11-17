@@ -209,13 +209,13 @@ fn selecting_a_directory_fits_the_planned_diff_panes_before_publication() {
 }
 
 #[test]
-fn opening_and_clicking_a_whole_file_diff_keeps_its_entire_block_selected_for_staging() {
+fn opening_a_whole_file_diff_keeps_its_entire_block_selected_for_staging() {
     let (fixture, path) = repository();
     let mut session = fixture.session(&[]);
     session.command("git").unwrap();
     settle(&mut session);
     let preview = session.preview_target(session.focus).unwrap();
-    session.frame();
+    session.snapshot();
     assert!(matches!(
         session.views[&preview].location.diff_selection,
         diff::Selection::Block { .. }
@@ -226,16 +226,6 @@ fn opening_and_clicking_a_whole_file_diff_keeps_its_entire_block_selected_for_st
         session.views[&preview].location.diff_selection,
         diff::Selection::Block { .. }
     ));
-    let frame = session.frame();
-    let region = session
-        .mouse_regions
-        .iter()
-        .find(|region| region.target == RenderTarget::View(preview))
-        .unwrap();
-    let body = region.body;
-    let crate::editor::mouse::Content::Diff { scroll, .. } = region.content else {
-        panic!("expected diff rows");
-    };
     let view = &session.views[&preview];
     let Buffer::PreviewDiff { diff, .. } = &session.buffers[&view.location.buffer] else {
         panic!("expected diff");
@@ -243,26 +233,6 @@ fn opening_and_clicking_a_whole_file_diff_keeps_its_entire_block_selected_for_st
     let rows = view.location.diff_selection.rows(&diff.index).unwrap();
     assert_eq!(diff.line(*rows.start()), "-historical");
     assert_eq!(diff.line(*rows.end()), "+working");
-    session.mouse(
-        frame.mouse_context,
-        zess_ui::MouseEvent {
-            kind: zess_ui::MouseKind::Press,
-            column: body.x as u16,
-            row: (body.y + *rows.end() - scroll) as u16,
-        },
-    );
-    let view = &session.views[&preview];
-    assert!(matches!(
-        view.location.diff_selection,
-        diff::Selection::Block { .. }
-    ));
-    let Buffer::PreviewDiff { diff, .. } = &session.buffers[&view.location.buffer] else {
-        panic!("expected diff");
-    };
-    assert_eq!(
-        view.location.diff_selection.rows(&diff.index).unwrap(),
-        rows
-    );
     session
         .execute_command("diff.apply-selection", json!({}))
         .unwrap();
@@ -387,11 +357,12 @@ fn a_compact_diff_without_context_keeps_navigation_and_partial_staging() {
     // Captured from delta 0.20.1 with --no-gitconfig --paging=never --side-by-side
     // --width=44 --file-decoration-style=none --hunk-header-decoration-style=none
     // --hunk-header-style='line-number syntax' and OSC1717=V1.
-    let output = include_str!("../../diff/tests/fixtures/delta-0.20.1-compact.ansi")
-        .lines()
-        .filter(|line| !line.starts_with("\x1b]1717;1;c;"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let output =
+        include_str!("../../../../../zess-text/src/diff/tests/fixtures/delta-0.20.1-compact.ansi")
+            .lines()
+            .filter(|line| !line.starts_with("\x1b]1717;1;c;"))
+            .collect::<Vec<_>>()
+            .join("\n");
     let script = fixture.0.join(".git/renderer.sh");
     fs::write(&script, format!("cat <<'ZESS_DIFF'\n{output}ZESS_DIFF\n")).unwrap();
     git(&fixture, &["config", "diff.external", "false"]);
@@ -471,7 +442,7 @@ fn a_compact_diff_without_context_keeps_navigation_and_partial_staging() {
 }
 
 #[test]
-fn clicking_a_mapped_change_keeps_its_rendered_block_for_staging() {
+fn staging_a_mapped_change_updates_only_its_source_file() {
     let (fixture, path) = repository();
     fs::write(&path, "old\ncontext\nsecond old\n").unwrap();
     let sentinel = fixture.0.join("z-sentinel.txt");
@@ -481,7 +452,9 @@ fn clicking_a_mapped_change_keeps_its_rendered_block_for_staging() {
     fs::write(&path, "new\ncontext\nsecond new\n").unwrap();
     fs::write(&sentinel, "new\ncontext\nsecond new\n").unwrap();
     let script = fixture.0.join(".git/renderer.sh");
-    let output = include_str!("../../diff/tests/fixtures/delta-0.20.1-side-by-side.ansi");
+    let output = include_str!(
+        "../../../../../zess-text/src/diff/tests/fixtures/delta-0.20.1-side-by-side.ansi"
+    );
     fs::write(&script, format!("cat <<'ZESS_DIFF'\n{output}ZESS_DIFF\n")).unwrap();
     git(&fixture, &["config", "diff.external", "false"]);
     let config = fixture.0.join(".git/pager-config.w");
@@ -497,21 +470,7 @@ fn clicking_a_mapped_change_keeps_its_rendered_block_for_staging() {
     session.command("git").unwrap();
     settle(&mut session);
     let preview = session.preview_target(session.focus).unwrap();
-    let frame = session.frame();
-    let body = session
-        .mouse_regions
-        .iter()
-        .find(|region| region.target == RenderTarget::View(preview))
-        .unwrap()
-        .body;
-    session.mouse(
-        frame.mouse_context,
-        zess_ui::MouseEvent {
-            kind: zess_ui::MouseKind::Press,
-            column: body.x as u16,
-            row: (body.y + 7) as u16,
-        },
-    );
+    session.input("Enter");
     assert_eq!(session.focus, preview);
     let view = &session.views[&session.focus];
     assert!(matches!(
@@ -565,27 +524,10 @@ fn a_mapped_line_stages_its_original_changes_without_the_next_addition() {
     session.command("git").unwrap();
     settle(&mut session);
     let preview = session.preview_target(session.focus).unwrap();
+    session.input("Enter");
     session
-        .views
-        .get_mut(&preview)
-        .unwrap()
-        .location
-        .diff_selection = diff::Selection::Line { head: None };
-    let frame = session.frame();
-    let body = session
-        .mouse_regions
-        .iter()
-        .find(|region| region.target == RenderTarget::View(preview))
-        .unwrap()
-        .body;
-    session.mouse(
-        frame.mouse_context,
-        zess_ui::MouseEvent {
-            kind: zess_ui::MouseKind::Press,
-            column: body.x as u16,
-            row: (body.y + 1) as u16,
-        },
-    );
+        .execute_command("diff.toggle-selection", json!({}))
+        .unwrap();
     assert_eq!(session.focus, preview);
     assert!(matches!(
         session.views[&preview].location.diff_presentation,
@@ -595,11 +537,6 @@ fn a_mapped_line_stages_its_original_changes_without_the_next_addition() {
         session.views[&preview].location.diff_selection.row(),
         Some(1)
     );
-    let (rows, cursor) = session.render_view(preview, 80, 12);
-    assert!(cursor.is_none());
-    assert!(rows.iter().flat_map(|row| &row.spans).any(|span| {
-        span.text.trim_end() == "historical => working" && span.style == "diff.selection"
-    }));
     session
         .execute_command("diff.apply-selection", json!({}))
         .unwrap();
@@ -704,7 +641,7 @@ fn mapped_navigation_and_search_select_the_original_change_block_for_staging() {
 }
 
 #[test]
-fn separate_display_segments_highlight_and_stage_only_their_original_change_block() {
+fn separate_display_segments_stage_only_their_original_change_block() {
     let (fixture, path) = repository();
     fs::write(&path, "old-a1\nold-a2\ncontext\nold-b\n").unwrap();
     git(&fixture, &["add", "note.txt"]);
@@ -736,25 +673,6 @@ fn separate_display_segments_highlight_and_stage_only_their_original_change_bloc
     settle(&mut session);
     session.input("Enter");
     let preview = session.focus;
-    let frame = session.frame();
-    let body = session
-        .mouse_regions
-        .iter()
-        .find(|region| region.target == RenderTarget::View(preview))
-        .unwrap()
-        .body;
-    session.mouse(
-        frame.mouse_context,
-        zess_ui::MouseEvent {
-            kind: zess_ui::MouseKind::Press,
-            column: body.x as u16,
-            row: (body.y + 3) as u16,
-        },
-    );
-    assert_eq!(
-        session.views[&preview].location.diff_selection.row(),
-        Some(3)
-    );
     for (key, expected) in [
         (None, vec!["A first", "A second"]),
         (Some("j"), vec!["B"]),
@@ -763,19 +681,15 @@ fn separate_display_segments_highlight_and_stage_only_their_original_change_bloc
         if let Some(key) = key {
             session.input(key);
         }
-        let selected = session
-            .frame()
-            .rows
+        let view = view_snapshot(&mut session, preview);
+        let zess_protocol::ViewSelection::Items { ids, .. } = &view.selection else {
+            panic!("expected a diff selection")
+        };
+        let selected = item_rows(&view.content)
             .iter()
-            .filter_map(|row| {
-                let selected = row
-                    .spans
-                    .iter()
-                    .filter(|span| span.style == "diff.selection")
-                    .map(|span| span.text.as_str())
-                    .collect::<String>();
-                (!selected.trim().is_empty()).then(|| selected.trim().to_owned())
-            })
+            .filter(|row| ids.contains(&row.id))
+            .flat_map(|row| row.cells.iter().flatten())
+            .map(|span| span.text.as_str())
             .collect::<Vec<_>>();
         assert_eq!(selected, expected);
     }
@@ -938,66 +852,35 @@ fn external_diff_is_colored_for_browsing_and_raw_when_focused() {
     settle(&mut session);
     let source = session.focus;
     let preview = session.preview_target(source).unwrap();
-    let frame = session.frame();
-    let (rows, _) = session.render_view(preview, 160, 12);
-    let external = rows
+    let browse = session.snapshot();
+    let view = browse
+        .views
         .iter()
-        .flat_map(|row| &row.spans)
-        .find(|span| {
-            frame
-                .styles
-                .get(&span.style)
-                .is_some_and(|style| style.foreground == Some(zess_ui::StyleColor::Indexed(1)))
-        })
+        .find(|view| view.view_id == preview)
         .unwrap();
-    let expected = format!("EXTERNAL note.txt 000 {:0100}", 0);
-    assert_eq!(external.text, expected);
-    let external_style = external.style.clone();
+    let external = item_rows(&view.content)
+        .iter()
+        .flat_map(|row| row.cells.iter().flatten())
+        .find(|span| span.text.starts_with("EXTERNAL note.txt 000"))
+        .unwrap();
+    assert_eq!(external.text, format!("EXTERNAL note.txt 000 {:0100}", 0));
     assert_eq!(
-        frame.styles[&external.style].foreground,
+        browse.styles[&external.style].foreground,
         Some(zess_ui::StyleColor::Indexed(1))
-    );
-    assert!(
-        rows.iter()
-            .flat_map(|row| &row.spans)
-            .all(|span| !span.style.starts_with("selection") && span.style != "linenr.current")
     );
 
     session.focus_view(preview).unwrap();
-    let (rows, _) = session.render_view(preview, 80, 12);
-    let added = rows
-        .iter()
-        .flat_map(|row| &row.spans)
-        .find(|span| matches!(span.style.as_str(), "git.added" | "selection.git.added"))
-        .unwrap();
-    assert_eq!(added.text.trim_end(), "+working");
-    assert!(matches!(
-        session.views[&preview].location.diff_presentation,
-        diff::Presentation::Raw
-    ));
+    let raw = view_snapshot(&mut session, preview);
+    let rows = item_rows(&raw.content);
     assert!(
         rows.iter()
-            .flat_map(|row| &row.spans)
-            .all(|span| span.style != external_style)
+            .any(|row| row.text == "+working" && row.style == "git.added")
     );
-    assert!(
-        rows.iter()
-            .flat_map(|row| &row.spans)
-            .any(|span| span.style.starts_with("selection"))
-    );
+    assert!(rows.iter().all(|row| row.cells.is_empty()));
 
     session.focus_view(source).unwrap();
-    assert!(matches!(
-        session.views[&preview].location.diff_presentation,
-        diff::Presentation::Rendered
-    ));
-    let (rows, _) = session.render_view(preview, 160, 12);
-    let external = rows
-        .iter()
-        .flat_map(|row| &row.spans)
-        .find(|span| span.style == external_style)
-        .unwrap();
-    assert_eq!(external.text, expected);
+    let restored = view_snapshot(&mut session, preview);
+    assert_eq!(restored.content, view.content);
 }
 
 #[test]
@@ -1020,83 +903,6 @@ fn staging_after_external_browsing_uses_the_original_patch() {
     assert_eq!(session.message, "Git index updated");
     assert_eq!(git(&fixture, &["show", ":note.txt"]), "working");
     assert_eq!(fs::read_to_string(path).unwrap(), "working\n");
-}
-
-#[test]
-fn clicking_external_output_focuses_raw_without_selecting_an_unrelated_patch_row() {
-    let (fixture, _) = repository();
-    configure_renderer(&fixture);
-    let mut session = fixture.session(&[]);
-    session.command("git").unwrap();
-    settle(&mut session);
-    let preview = session.preview_target(session.focus).unwrap();
-    let frame = session.frame();
-    let body = session
-        .mouse_regions
-        .iter()
-        .find(|region| region.target == RenderTarget::View(preview))
-        .unwrap()
-        .body;
-    assert!(body.height > 6);
-    session.mouse(
-        frame.mouse_context,
-        zess_ui::MouseEvent {
-            kind: zess_ui::MouseKind::Press,
-            column: body.x as u16,
-            row: (body.y + 6) as u16,
-        },
-    );
-    assert_eq!(session.focus, preview);
-    let view = &session.views[&preview];
-    let Buffer::PreviewDiff { diff, .. } = &session.buffers[&view.location.buffer] else {
-        panic!("expected diff")
-    };
-    assert_eq!(
-        diff.line(view.location.diff_selection.row().unwrap()),
-        "-historical"
-    );
-    assert!(matches!(
-        view.location.diff_presentation,
-        diff::Presentation::Raw
-    ));
-    let (rows, _) = session.render_view(preview, 80, 12);
-    let added = rows
-        .iter()
-        .flat_map(|row| &row.spans)
-        .find(|span| matches!(span.style.as_str(), "git.added" | "selection.git.added"))
-        .unwrap();
-    assert_eq!(added.text.trim_end(), "+working");
-}
-
-#[test]
-fn mouse_wheel_scrolls_external_rows_without_focusing_the_preview() {
-    let (fixture, _) = repository();
-    configure_renderer(&fixture);
-    let mut session = fixture.session(&[]);
-    session.command("git").unwrap();
-    settle(&mut session);
-    let source = session.focus;
-    let preview = session.preview_target(source).unwrap();
-    let frame = session.frame();
-    let body = session
-        .mouse_regions
-        .iter()
-        .find(|region| region.target == RenderTarget::View(preview))
-        .unwrap()
-        .body;
-    for _ in 0..100 {
-        session.mouse(
-            frame.mouse_context,
-            zess_ui::MouseEvent {
-                kind: zess_ui::MouseKind::ScrollDown,
-                column: body.x as u16,
-                row: body.y as u16,
-            },
-        );
-    }
-    let view = &session.views[&preview];
-    assert_eq!(view.location.scroll, 40 - view.viewport_height);
-    assert_eq!(session.focus, source);
 }
 
 #[test]
@@ -1181,7 +987,9 @@ fn returning_from_external_preview_preserves_the_second_block_and_line_mode() {
         fs::write(&path, "new\ncontext\nsecond new\n").unwrap();
         configure_renderer(&fixture);
         if mapped {
-            let output = include_str!("../../diff/tests/fixtures/delta-0.20.1-side-by-side.ansi");
+            let output = include_str!(
+                "../../../../../zess-text/src/diff/tests/fixtures/delta-0.20.1-side-by-side.ansi"
+            );
             fs::write(
                 fixture.0.join(".git/renderer.sh"),
                 format!("cat <<'ZESS_DIFF'\n{output}ZESS_DIFF\n"),
@@ -1202,18 +1010,11 @@ fn returning_from_external_preview_preserves_the_second_block_and_line_mode() {
             Some(9)
         );
         session.input("Esc");
-        assert_eq!(session.focus, source);
+        assert_eq!(session.snapshot().focused_view, Some(source));
         assert!(matches!(
             session.views[&preview].location.diff_presentation,
             diff::Presentation::Rendered
         ));
-        let (rows, cursor) = session.render_view(preview, 80, 12);
-        assert!(cursor.is_none());
-        assert!(
-            rows.iter()
-                .flat_map(|row| &row.spans)
-                .all(|span| span.style != "diff.selection")
-        );
         session.input("Enter");
         assert_eq!(session.focus, preview);
         assert!(
@@ -1243,7 +1044,9 @@ fn browsing_mapped_output_keeps_its_scroll_and_focuses_the_visible_change_block(
     git(&fixture, &["commit", "--quiet", "-m", "two change blocks"]);
     fs::write(&path, "new\ncontext\nsecond new\n").unwrap();
     configure_renderer(&fixture);
-    let output = include_str!("../../diff/tests/fixtures/delta-0.20.1-side-by-side.ansi");
+    let output = include_str!(
+        "../../../../../zess-text/src/diff/tests/fixtures/delta-0.20.1-side-by-side.ansi"
+    );
     let (before, second) = output.rsplit_once("\x1b]1717;1;d;3;3;").unwrap();
     let output = format!(
         "{before}{}\x1b]1717;1;d;3;3;{second}",
@@ -1268,7 +1071,7 @@ fn browsing_mapped_output_keeps_its_scroll_and_focuses_the_visible_change_block(
     }
     let scroll = session.views[&preview].location.scroll;
     assert!(scroll > 9);
-    session.frame();
+    session.snapshot();
     assert_eq!(session.views[&preview].location.scroll, scroll);
     assert_eq!(
         session.views[&preview].location.diff_selection.row(),
@@ -1373,36 +1176,10 @@ fn file_headers_keep_multifile_changes_and_source_navigation_mapped() {
         ]
     );
     assert!(diff.raw_row(diff::Presentation::Rendered, 3).is_none());
-    let selected = session.views[&preview].location.diff_selection.row();
-    let frame = session.frame();
-    let body = session
-        .mouse_regions
-        .iter()
-        .find(|region| region.target == RenderTarget::View(preview))
-        .unwrap()
-        .body;
-    session.mouse(
-        frame.mouse_context,
-        zess_ui::MouseEvent {
-            kind: zess_ui::MouseKind::Press,
-            column: body.x as u16,
-            row: (body.y + 3) as u16,
-        },
-    );
-    assert_eq!(session.focus, preview);
-    assert_eq!(
-        session.views[&preview].location.diff_selection.row(),
-        selected
-    );
-    let frame = session.frame();
-    session.mouse(
-        frame.mouse_context,
-        zess_ui::MouseEvent {
-            kind: zess_ui::MouseKind::Press,
-            column: body.x as u16,
-            row: (body.y + 5) as u16,
-        },
-    );
+    session.input("Enter");
+    session
+        .execute_command("diff.hunk-next", json!({}))
+        .unwrap();
     let view = &session.views[&preview];
     let Buffer::PreviewDiff { diff, .. } = &session.buffers[&buffer] else {
         unreachable!()
@@ -1536,7 +1313,8 @@ fn a_mapped_change_block_can_be_unstaged_without_the_next_block() {
     fs::write(&path, "new\ncontext\nsecond new\n").unwrap();
     fs::write(&sentinel, "new\ncontext\nsecond new\n").unwrap();
     git(&fixture, &["add", "note.txt", "z-sentinel.txt"]);
-    let output = include_str!("../../diff/tests/fixtures/delta-0.20.1-compact.ansi");
+    let output =
+        include_str!("../../../../../zess-text/src/diff/tests/fixtures/delta-0.20.1-compact.ansi");
     let script = fixture.0.join(".git/renderer.sh");
     fs::write(&script, format!("cat <<'ZESS_DIFF'\n{output}ZESS_DIFF\n")).unwrap();
     let config = fixture.0.join(".git/pager-config.w");

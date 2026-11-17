@@ -1,5 +1,15 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
-use zess_ui::{Frame, MouseContext, MouseEvent, Span};
+use zess_ui::Span;
+
+pub mod bindings;
+pub mod chunks;
+pub mod document;
+pub mod editor_events;
+pub mod workspace_view;
+
+pub mod resource;
 
 #[cfg(test)]
 mod tests;
@@ -59,7 +69,11 @@ pub struct RequestId(pub u64);
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
-    pub render_plan: zess_ui::RenderPlan,
+    pub workspace_root: String,
+    pub editor_hooks: editor_events::EditorHooks,
+    pub editor_options: zess_plugin::EditorOptions,
+    pub text_options: serde_json::Value,
+    pub styles: HashMap<String, zess_ui::TextStyle>,
     pub views: Vec<ViewSnapshot>,
     pub surfaces: Vec<SurfaceSnapshot>,
     pub layout: Vec<ViewArea>,
@@ -70,6 +84,84 @@ pub struct SessionSnapshot {
     pub buffers: Vec<BufferSummary>,
     pub workspace: ClientWorkspace,
     pub client_actions: Vec<ClientAction>,
+}
+
+impl SessionSnapshot {
+    /// Checks references and text positions before the client adopts the snapshot.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .focused_view
+            .is_some_and(|id| !self.views.iter().any(|view| view.view_id == id))
+        {
+            return Err("focused view is missing");
+        }
+        for view in &self.views {
+            if let ViewSelection::Text { ranges, primary } = &view.selection
+                && *primary >= ranges.len()
+            {
+                return Err("text view has no primary selection");
+            }
+        }
+
+        if let Some(prompt) = &self.prompt {
+            if !self.views.iter().any(|view| {
+                view.view_id == prompt.owner_view && view.buffer_id == prompt.owner_buffer
+            }) {
+                return Err("prompt owner is missing");
+            }
+            if !prompt.text.is_char_boundary(prompt.cursor) {
+                return Err("prompt cursor is outside its input");
+            }
+        }
+        for (content, metrics) in self
+            .views
+            .iter()
+            .map(|view| (&view.content, &view.text_metrics))
+            .chain(
+                self.surfaces
+                    .iter()
+                    .map(|surface| (&surface.content, &surface.text_metrics)),
+            )
+        {
+            if let ViewContent::Text { lines } = content {
+                let metrics = metrics
+                    .as_ref()
+                    .ok_or("text viewport has no document metrics")?;
+                if metrics.tab_width == 0 || metrics.line_count == 0 {
+                    return Err("text viewport has invalid document metrics");
+                }
+                for line in lines {
+                    if line.line >= metrics.line_count
+                        || line
+                            .first_char
+                            .checked_add(line.text.chars().count())
+                            .is_none()
+                    {
+                        return Err("text viewport contains an invalid source range");
+                    }
+                }
+            }
+        }
+
+        for area in &self.layout {
+            let exists = match (area.view_id, area.page_id, &area.slot_id) {
+                (Some(id), None, None) => self
+                    .views
+                    .iter()
+                    .any(|view| view.view_id == id && view.buffer_id == area.buffer_id),
+                (None, Some(page), Some(slot)) => self.surfaces.iter().any(|surface| {
+                    surface.page_id == page
+                        && surface.slot_id == *slot
+                        && surface.buffer_id == area.buffer_id
+                }),
+                _ => false,
+            };
+            if !exists {
+                return Err("layout refers to a missing view or surface");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -104,6 +196,7 @@ pub struct ClientAction {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientActionKind {
+    OpenPage { source: resource::PageSource },
     Open { buffer_id: u64 },
     Activate { buffer_id: u64 },
     Forget { buffer_id: u64 },
@@ -125,13 +218,16 @@ impl ClientWorkspace {
                     self.current = None;
                 }
             }
-            ClientActionKind::Close { .. } => {}
+            ClientActionKind::OpenPage { .. } | ClientActionKind::Close { .. } => {}
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceSnapshot {
+    pub text_metrics: Option<TextMetrics>,
+    pub column_alignment: zess_ui::ColumnAlignment,
+    pub soft_wrap: bool,
     pub page_id: u64,
     pub slot_id: String,
     pub buffer_id: u64,
@@ -144,6 +240,11 @@ pub struct SurfaceSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ViewSnapshot {
+    pub text_metrics: Option<TextMetrics>,
+    pub statusline: Option<zess_plugin::StatusLine>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<serde_json::Value>,
+    pub key_scopes: Vec<String>,
     pub view_id: u64,
     pub buffer_id: u64,
     pub kind: String,
@@ -158,7 +259,6 @@ pub struct ViewSnapshot {
     pub selection: ViewSelection,
     pub scroll: usize,
     pub horizontal_scroll: usize,
-    pub status: Vec<Span>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -169,14 +269,31 @@ pub enum ViewContent {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextMetrics {
+    pub line_count: usize,
+    pub tab_width: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceHighlight {
+    pub start: usize,
+    pub end: usize,
+    pub style: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisibleTextLine {
     pub line: usize,
     pub first_char: usize,
+    pub first_column: usize,
+    pub end_of_line: bool,
+    pub highlights: Vec<SourceHighlight>,
     pub text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SemanticRow {
+    pub line_number: Option<usize>,
     pub id: String,
     pub text: String,
     pub cells: Vec<Vec<Span>>,
@@ -198,7 +315,7 @@ pub enum ViewSelection {
     None,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TextRange {
     pub anchor: usize,
     pub head: usize,
@@ -218,6 +335,8 @@ pub struct ViewArea {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PromptSnapshot {
+    pub label: String,
+    pub owner_buffer: u64,
     pub kind: String,
     pub text: String,
     pub cursor: usize,
@@ -227,7 +346,13 @@ pub struct PromptSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionDelta {
-    pub render_plan: zess_ui::RenderPlan,
+    pub editor_hooks: editor_events::EditorHooks,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_options: Option<zess_plugin::EditorOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_options: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub styles: Option<HashMap<String, zess_ui::TextStyle>>,
     pub changed_views: Vec<ViewSnapshot>,
     pub surfaces: Vec<SurfaceSnapshot>,
     pub removed_views: Vec<u64>,
@@ -244,7 +369,12 @@ pub struct SessionDelta {
 impl SessionDelta {
     pub fn between(previous: &SessionSnapshot, next: &SessionSnapshot) -> Self {
         Self {
-            render_plan: next.render_plan.clone(),
+            editor_hooks: next.editor_hooks,
+            editor_options: (previous.editor_options != next.editor_options)
+                .then_some(next.editor_options),
+            text_options: (previous.text_options != next.text_options)
+                .then(|| next.text_options.clone()),
+            styles: (previous.styles != next.styles).then(|| next.styles.clone()),
             changed_views: next
                 .views
                 .iter()
@@ -276,7 +406,16 @@ impl SessionDelta {
     }
 
     pub fn apply(self, state: &mut SessionSnapshot) {
-        state.render_plan = self.render_plan;
+        state.editor_hooks = self.editor_hooks;
+        if let Some(options) = self.editor_options {
+            state.editor_options = options;
+        }
+        if let Some(options) = self.text_options {
+            state.text_options = options;
+        }
+        if let Some(styles) = self.styles {
+            state.styles = styles;
+        }
         state
             .views
             .retain(|view| !self.removed_views.contains(&view.view_id));
@@ -306,7 +445,27 @@ impl SessionDelta {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandTarget {
+    View {
+        view_id: u64,
+        buffer_id: u64,
+    },
+    Page {
+        subscription_id: u64,
+        input: resource::PageCommandInput,
+    },
+    Document {
+        buffer_id: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandAction {
+    Observe {
+        source: editor_events::EventSource,
+        event: editor_events::EditorEvent,
+    },
     AcknowledgeClientAction {
         action_id: u64,
     },
@@ -330,6 +489,39 @@ pub enum CommandAction {
         name: String,
         argument: serde_json::Value,
     },
+    ClosePageDocument {
+        buffer_id: u64,
+        force: bool,
+    },
+    ApplyPagePatch {
+        subscription_id: u64,
+        request: resource::PagePatch,
+    },
+    PagePrompt {
+        subscription_id: u64,
+        input: resource::PageCommandInput,
+        purpose: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmation: Option<String>,
+        text: String,
+        cancelled: bool,
+    },
+    Invoke {
+        target: CommandTarget,
+        name: String,
+        argument: serde_json::Value,
+    },
+    Request {
+        target: CommandTarget,
+        request: zess_plugin::HostRequest,
+    },
+    OpenDocument {
+        path: Option<String>,
+    },
+    DiscardScratch {
+        buffer_id: u64,
+        replacement: u64,
+    },
     Save {
         buffer_id: u64,
         version: u64,
@@ -351,14 +543,53 @@ pub enum OperationResult {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandOutcome {
     Applied,
-    BufferClosed { buffer_id: u64, replacement: u64 },
-    Saved { buffer_id: u64, version: u64 },
-    Failed { message: String },
+    ClientRequest {
+        request: zess_plugin::HostRequest,
+    },
+    Yanked {
+        values: Vec<String>,
+        register: char,
+    },
+    Message {
+        message: String,
+    },
+    BufferClosed {
+        buffer_id: u64,
+        replacement: u64,
+    },
+    PageDocumentClosed {
+        buffer_id: u64,
+    },
+    PageApplied {
+        page_id: resource::PageId,
+        subscription_id: u64,
+        navigation: Vec<zess_plugin::Navigation>,
+        document: Option<resource::PageDocument>,
+    },
+    DocumentOpened {
+        buffer_id: u64,
+    },
+    ScratchDiscarded {
+        buffer_id: u64,
+        replacement: u64,
+    },
+    Saved {
+        buffer_id: u64,
+        version: u64,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    Document(document::DocumentRequest),
+    ClaimPendingSession {
+        pid: u32,
+    },
+    ConfirmAttach,
     Hello {
         build_id: String,
     },
@@ -373,34 +604,13 @@ pub enum ClientMessage {
         height: u16,
         #[serde(default)]
         files: Vec<String>,
-        #[serde(default)]
-        context_epoch: Option<u64>,
-    },
-    Input {
-        sequence: u64,
-        key: String,
-        context_epoch: u64,
-    },
-    TrackedInput {
-        request_id: RequestId,
-        server_instance: ServerInstanceId,
-        sequence: u64,
-        key: String,
-        context_epoch: u64,
-    },
-    Mouse {
-        sequence: u64,
-        context_epoch: u64,
-        mouse_context: MouseContext,
-        event: MouseEvent,
-    },
-    Skip {
-        through: u64,
-        context_epoch: u64,
     },
     Resize {
         width: u16,
         height: u16,
+    },
+    SaveWorkspaceView {
+        view: workspace_view::WorkspaceView,
     },
     ClipboardResponse {
         id: u64,
@@ -415,6 +625,18 @@ pub enum ClientMessage {
         request_id: RequestId,
         server_instance: ServerInstanceId,
         action: CommandAction,
+    },
+    Chunk {
+        json: String,
+        last: bool,
+    },
+    FormatStatusline {
+        id: u64,
+        name: String,
+        context: zess_plugin::StatusContext,
+    },
+    Resource {
+        request: resource::ResourceRequest,
     },
     QueryOperation {
         request_id: RequestId,
@@ -431,6 +653,10 @@ pub enum ClientMessage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    Bindings(bindings::BindingCatalog),
+    Document(document::DocumentEvent),
+    AttachPending,
+    AttachConfirmed,
     Hello {
         build_id: String,
     },
@@ -444,24 +670,21 @@ pub enum ServerMessage {
         workspace: String,
         attached: bool,
         modified: bool,
+        #[serde(default)]
+        pending: bool,
     },
     Attached {
         server_instance: ServerInstanceId,
-        acknowledged: u64,
         context_epoch: u64,
-        replay_allowed: bool,
-        frame: Frame,
+        workspace_view: Option<workspace_view::WorkspaceView>,
     },
-    Update {
-        acknowledged: u64,
-        frame: Frame,
-    },
+    WorkspaceViewSaved,
     Snapshot {
         session_id: SessionId,
         server_instance: ServerInstanceId,
         state_revision: u64,
         state: SessionSnapshot,
-        frame: Frame,
+        bindings: bindings::BindingCatalog,
     },
     Delta {
         session_id: SessionId,
@@ -469,11 +692,21 @@ pub enum ServerMessage {
         base_revision: u64,
         state_revision: u64,
         delta: SessionDelta,
-        frame: Option<Frame>,
     },
-    Ack {
-        acknowledged: u64,
-        context_epoch: u64,
+    Chunk {
+        json: String,
+        last: bool,
+    },
+    FormattedStatusline {
+        id: u64,
+        result: Result<zess_plugin::StatusLine, String>,
+    },
+    Resource {
+        update: resource::ResourceUpdate,
+    },
+    ResourceCacheInvalidated {
+        entries: Vec<resource::PageCacheEntry>,
+        reason: resource::ResourceCacheInvalidation,
     },
     CommandResult {
         request_id: RequestId,
@@ -497,92 +730,4 @@ pub enum ServerMessage {
         reason: String,
     },
     Exited,
-}
-
-pub fn render_snapshot(state: &SessionSnapshot) -> Result<Frame, zess_ui::RenderError> {
-    zess_ui::render_plan(&state.render_plan, |source| match source {
-        zess_ui::RenderContent::Literal { text } => Some(text.clone()),
-        zess_ui::RenderContent::Text {
-            buffer_id,
-            start_char,
-            end_char,
-        } => state
-            .views
-            .iter()
-            .filter(|view| view.buffer_id == *buffer_id)
-            .map(|view| &view.content)
-            .chain(
-                state
-                    .surfaces
-                    .iter()
-                    .filter(|surface| surface.buffer_id == *buffer_id)
-                    .map(|surface| &surface.content),
-            )
-            .find_map(|content| text_source(content, *start_char, *end_char)),
-        zess_ui::RenderContent::Item {
-            source,
-            row_id,
-            cell,
-            start_char,
-            end_char,
-        } => {
-            let content = match source {
-                zess_ui::ContentSource::View { view_id } => {
-                    &state
-                        .views
-                        .iter()
-                        .find(|view| view.view_id == *view_id)?
-                        .content
-                }
-                zess_ui::ContentSource::Surface { page_id, slot_id } => {
-                    &state
-                        .surfaces
-                        .iter()
-                        .find(|surface| surface.page_id == *page_id && surface.slot_id == *slot_id)?
-                        .content
-                }
-            };
-            let ViewContent::Items { rows } = content else {
-                return None;
-            };
-            let row = rows.iter().find(|row| row.id == *row_id)?;
-            let text = match cell {
-                None => row.text.clone(),
-                Some(cell) => row
-                    .cells
-                    .get(*cell)?
-                    .iter()
-                    .map(|span| span.text.as_str())
-                    .collect(),
-            };
-            char_slice(&text, *start_char, *end_char)
-        }
-    })
-}
-
-fn text_source(content: &ViewContent, start: usize, end: usize) -> Option<String> {
-    let ViewContent::Text { lines } = content else {
-        return None;
-    };
-    lines.iter().find_map(|line| {
-        if start < line.first_char {
-            return None;
-        }
-        char_slice(
-            &line.text,
-            start - line.first_char,
-            end.checked_sub(line.first_char)?,
-        )
-    })
-}
-
-fn char_slice(text: &str, start: usize, end: usize) -> Option<String> {
-    if end < start {
-        return None;
-    }
-    let mut chars = text.chars();
-    for _ in 0..start {
-        chars.next()?;
-    }
-    (start..end).map(|_| chars.next()).collect()
 }

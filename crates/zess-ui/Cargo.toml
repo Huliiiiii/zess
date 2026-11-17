@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 unicode-width.workspace = true
+unicode-segmentation.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 vte.workspace = true

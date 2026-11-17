@@ -7,4 +7,6 @@ edition.workspace = true
 zess-build.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zess-plugin.workspace = true
 zess-ui.workspace = true
+zess-git.workspace = true

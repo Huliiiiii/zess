@@ -60,9 +60,10 @@ define : compile-status-element element
 
 define : status-region compiled name
   if (hash-contains? compiled name)
-    let
-      : fragment : hash-ref compiled name
-      %make-statusline-region (status-fragment-render fragment) : status-fragment-components fragment
+    let*
+      : entry : hash-ref compiled name
+        fragment : car entry
+      %make-statusline-region (status-fragment-render fragment) (status-fragment-components fragment) : cadr entry
     . #f
 
 define : set-statusline-layout! kind regions
@@ -86,4 +87,4 @@ define : set-statusline-layout! kind regions
         let
           : fragment : status-sequence (map compile-status-element (cdr region)) '()
           loop (cdr remaining)
-            hash-insert compiled name fragment
+            hash-insert compiled name : list fragment : cdr region

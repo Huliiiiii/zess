@@ -67,11 +67,17 @@ pub enum ProxyOperation {
         force: bool,
     },
     Stop {
-        session_id: Option<String>,
-        workspace: Option<String>,
+        target: StopTarget,
         force: bool,
     },
     Status,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StopTarget {
+    Session(String),
+    Workspace(String),
 }
 
 /// Sends the initial workspace/management request before the protocol stream.

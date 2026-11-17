@@ -7,6 +7,7 @@ mod grid;
 mod history;
 mod multi_file_diff;
 mod page_return;
+mod patch_revision;
 mod preview_loading;
 mod staging;
 mod temporary_navigation;
@@ -413,11 +414,6 @@ fn numbered_pages_select_changes_and_history_without_toggling_the_current_page()
         session.input(key);
     }
     assert_eq!(session.views[&source].location.buffer, changes);
-    assert_eq!(view_rows(&mut session, source)[0], "[Changes]  History");
-    session.input("C-w");
-    assert_eq!(view_rows(&mut session, source)[0], "[1 Changes]  2 History");
-    session.input("Esc");
-    assert_eq!(view_rows(&mut session, source)[0], "[Changes]  History");
     for key in ["C-w", "2"] {
         session.input(key);
     }
@@ -425,9 +421,7 @@ fn numbered_pages_select_changes_and_history_without_toggling_the_current_page()
     let history = session.views[&source].location.buffer;
     assert_ne!(history, changes);
     assert_eq!(
-        session.views[&source]
-            .location
-            .display
+        view_snapshot(&mut session, source)
             .tabs
             .iter()
             .map(|tab| (tab.label.as_str(), tab.command.as_str(), tab.active))
@@ -437,10 +431,6 @@ fn numbered_pages_select_changes_and_history_without_toggling_the_current_page()
             ("History", "git-history.page-history", true),
         ]
     );
-    assert_eq!(view_rows(&mut session, source)[0], "Changes  [History]");
-    session.input("C-w");
-    assert_eq!(view_rows(&mut session, source)[0], "1 Changes  [2 History]");
-    session.input("Esc");
     for key in ["C-w", "2"] {
         session.input(key);
     }
@@ -451,9 +441,7 @@ fn numbered_pages_select_changes_and_history_without_toggling_the_current_page()
     settle(&mut session);
     assert_eq!(session.views[&source].location.buffer, changes);
     assert_eq!(
-        session.views[&source]
-            .location
-            .display
+        view_snapshot(&mut session, source)
             .tabs
             .iter()
             .map(|tab| (tab.label.as_str(), tab.command.as_str(), tab.active))
@@ -463,13 +451,6 @@ fn numbered_pages_select_changes_and_history_without_toggling_the_current_page()
             ("History", "git.page-history", false),
         ]
     );
-    let (_, _, _, width, height) = panes(&session)
-        .into_iter()
-        .find(|(id, ..)| *id == source)
-        .unwrap();
-    let (rows, _) = session.render_view(source, width, height);
-    assert_eq!(rows[0].spans[0].text.trim_end(), "[Changes]  History");
-    assert_eq!(rows[0].spans[0].style, "");
 }
 
 fn group_request(text: &str, loading: bool) -> HostRequest {
@@ -534,7 +515,7 @@ fn loading_updates_preserve_preview_group_members_and_geometry() {
     session
         .request(source, group_request("ready\n", true))
         .unwrap();
-    session.frame();
+    session.snapshot();
     assert_eq!(panes(&session), narrow);
     assert_eq!(session.focus, source);
     for (view, _) in members {
@@ -821,7 +802,7 @@ fn replacing_preview_contents_closes_a_text_prompt_whose_selection_was_invalidat
         .unwrap();
     assert!(session.prompt.is_none());
     session.input("Enter");
-    session.frame();
+    session.snapshot();
     let buffer = session.views[&session.focus].location.buffer;
     assert_eq!(
         session
@@ -840,6 +821,7 @@ fn initial_diff_position_preserves_patch_headers_and_later_user_navigation() {
     let fixture = Fixture::new();
     for (line_count, height) in [(2, 20), (40, 8)] {
         let mut session = fixture.session(&[]);
+        session.resize(120, height + 1);
         let source = session.focus;
         let body = (0..line_count)
             .map(|line| format!("+line {line}\n"))
@@ -867,18 +849,14 @@ fn initial_diff_position_preserves_patch_headers_and_later_user_navigation() {
             Some(5)
         );
         assert_eq!(diff.raw, patch);
-        let (rows, _) = session.render_view(target, 60, height);
-        let first = rows[0]
-            .spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>();
+        let view = view_snapshot(&mut session, target);
+        let first = &item_rows(&view.content)[view.scroll];
         assert_eq!(
-            first.trim_end(),
+            first.text,
             if line_count == 2 {
-                "  diff --git a/note.txt b/note.txt".to_owned()
+                "diff --git a/note.txt b/note.txt".to_owned()
             } else {
-                format!("   @@ -0,0 +1,{line_count} @@")
+                format!("@@ -0,0 +1,{line_count} @@")
             }
         );
         let Buffer::PreviewDiff { diff, .. } = &session.buffers[&buffer] else {
@@ -934,7 +912,7 @@ fn reloading_shared_text_closes_a_prompt_whose_selection_was_invalidated() {
     assert!(session.prompt.is_some());
     fs::write(&path, "x\n").unwrap();
     session.command("reload").unwrap();
-    session.frame();
+    session.snapshot();
     assert!(session.prompt.is_none());
     session.input("Enter");
     let buffer = session.views[&session.focus].location.buffer;
@@ -1033,8 +1011,7 @@ fn help_pinned_beside_staged_diff_survives_page_changes_and_closing_its_source()
     assert!(!session.views.contains_key(&staged));
     session.focus_view(help).unwrap();
     assert_eq!(session.focus, help);
-    assert_eq!(session.views[&help].location.display.header, "Help: Diff");
-    assert_eq!(view_rows(&mut session, help)[0], "Help: Diff");
+    assert_eq!(view_snapshot(&mut session, help).header, "Help: Diff");
     session.focus_view(source).unwrap();
     session.command("quit").unwrap();
     assert!(!session.exiting());
@@ -1050,7 +1027,7 @@ fn help_pinned_beside_staged_diff_survives_page_changes_and_closing_its_source()
     assert!(session.views.contains_key(&source));
     assert!(preview_groups(&session).next().is_none());
     assert!(panes(&session).iter().any(|(id, ..)| *id == help));
-    session.frame();
+    session.snapshot();
 }
 
 #[test]
@@ -1101,26 +1078,10 @@ map-modal "user/git" "z" "custom-key"
     assert_eq!(session.views[&source].location.options, options);
     session.input("z");
     assert_eq!(session.message, "USER KEY");
-    let (_, _, _, width, height) = panes(&session)
-        .into_iter()
-        .find(|(id, ..)| *id == source)
-        .unwrap();
-    let (rows, _) = session.render_view(source, width, height);
-    assert_eq!(
-        rows[0].spans[0].text.trim_end(),
-        "[Changes]  History    /note"
-    );
-    assert_eq!(rows[0].spans[0].style, "keyword");
-    assert_eq!(
-        rows.last()
-            .unwrap()
-            .spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>()
-            .trim_end(),
-        "CUSTOM STATUS"
-    );
+    let view = view_snapshot(&mut session, source);
+    assert_eq!(view.header.trim(), "/note");
+    assert_eq!(view.options.unwrap()["header-style"], "keyword");
+    assert_eq!(view.statusline.unwrap().left[0].text, "CUSTOM STATUS");
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     io::{self, Read, Write},
     path::PathBuf,
@@ -15,28 +16,43 @@ use crossterm::{
     style::{Attribute, Print, ResetColor, SetAttribute},
     terminal::{Clear, ClearType},
 };
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 use zess_ipc::platform::{DaemonControl, NativeDaemonControl, ProcessWait};
 use zess_ipc::{SocketPath, Stream, framing};
 use zess_platform::{NativePlatform, Platform};
+use zess_plugin::HostRequest;
 use zess_protocol::{
-    ClientMessage, MAX_INPUT_BYTES, MAX_MESSAGE_BYTES, RequestId, ServerInstanceId, ServerMessage,
+    ClientActionKind, ClientMessage, CommandAction, CommandOutcome, CommandTarget, MAX_INPUT_BYTES,
+    MAX_MESSAGE_BYTES, RequestId, ServerInstanceId, ServerMessage, SessionId,
+    editor_events::EventSource,
 };
-use zess_ui::{CursorShape, Frame, FrameRow, MouseEvent, MouseKind};
+use zess_ui::{CursorShape, Frame, FrameRow, MouseEvent, MouseKind, fitting_prefix};
 
 mod clipboard;
 mod clipboard_actions;
 mod clipboard_helper;
 mod clipboard_write;
+mod connection;
+mod documents;
+mod editor;
+mod pages;
+mod presentation;
 mod state;
+mod statusline;
 mod style;
 mod terminal;
+mod workbench;
+mod workspace_view;
 
 #[cfg(test)]
 mod tests;
 
 use clipboard_actions::ClipboardActions;
+use connection::{ConnectionPage, ConnectionTask};
+
+pub use connection::{
+    AuthenticationKind, AuthenticationPrompt, ByteProgress, ConnectionContext, ConnectionProgress,
+    SessionCandidate,
+};
 
 pub use clipboard::{
     Clipboard, ClipboardJob, ClipboardReadJob, ClipboardWrite, ClipboardWriteJob, NativeClipboard,
@@ -61,24 +77,20 @@ pub fn run(socket: &SocketPath) -> Result<()> {
 
 /// Run the terminal client and open the requested files on the first attach.
 pub fn run_files(socket: &SocketPath, files: &[PathBuf]) -> Result<()> {
-    run_connection(&mut LocalConnectionFactory(socket.clone()), files)
+    run_connection(LocalConnectionFactory(socket.clone()), files)
 }
 
 /// Creates a fresh transport for the first connection and each reconnect.
-pub trait ConnectionFactory {
-    fn connect(&mut self) -> Result<Box<dyn ConnectionStream>>;
+pub trait ConnectionFactory: Send {
+    fn connect(&mut self, context: &ConnectionContext) -> Result<Box<dyn ConnectionStream>>;
 
-    fn connect_with_cancellation(
-        &mut self,
-        cancellation: &zess_platform::CancellationToken,
-    ) -> Result<Box<dyn ConnectionStream>> {
-        cancellation.check()?;
-        self.connect()
+    fn display_target(&self) -> &str {
+        "zess"
     }
 }
 
 /// Nonblocking byte transport consumed by the terminal event loop.
-pub trait ConnectionStream: Read + Write {
+pub trait ConnectionStream: Read + Write + Send {
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
     fn wait_for_server_exit(&mut self, timeout: Duration) -> Result<bool>;
     fn session_id(&self) -> Option<&zess_protocol::SessionId> {
@@ -142,7 +154,8 @@ impl ConnectionStream for LocalConnection {
 pub struct LocalConnectionFactory(pub SocketPath);
 
 impl ConnectionFactory for LocalConnectionFactory {
-    fn connect(&mut self) -> Result<Box<dyn ConnectionStream>> {
+    fn connect(&mut self, context: &ConnectionContext) -> Result<Box<dyn ConnectionStream>> {
+        context.cancellation().check()?;
         let stream = Stream::connect(&self.0)
             .with_context(|| format!("connect to zess socket {}", self.0.display()))?;
         let process = NativeDaemonControl.watch(&stream)?;
@@ -151,13 +164,13 @@ impl ConnectionFactory for LocalConnectionFactory {
 }
 
 /// Runs a terminal client over a reconnectable local or remote transport.
-pub fn run_connection(factory: &mut impl ConnectionFactory, files: &[PathBuf]) -> Result<()> {
+pub fn run_connection(factory: impl ConnectionFactory + 'static, files: &[PathBuf]) -> Result<()> {
     run_connection_with_platform(factory, files, &NativePlatform)
 }
 
 /// Runs a terminal client with host identity facts supplied by the launcher.
 pub fn run_connection_with_platform(
-    factory: &mut impl ConnectionFactory,
+    factory: impl ConnectionFactory + 'static,
     files: &[PathBuf],
     platform: &dyn Platform,
 ) -> Result<()> {
@@ -175,7 +188,7 @@ pub fn run_connection_with_platform(
 
 /// Runs with caller-owned terminal and clipboard devices.
 pub fn run_connection_with_devices(
-    factory: &mut impl ConnectionFactory,
+    factory: impl ConnectionFactory + 'static,
     files: &[PathBuf],
     terminal: &mut impl TerminalIo,
     clipboard: &mut impl Clipboard,
@@ -185,7 +198,7 @@ pub fn run_connection_with_devices(
 
 /// Runs the terminal client with host identity facts supplied by the launcher.
 pub fn run_connection_with_devices_and_platform(
-    factory: &mut impl ConnectionFactory,
+    factory: impl ConnectionFactory + 'static,
     files: &[PathBuf],
     terminal: &mut impl TerminalIo,
     clipboard: &mut impl Clipboard,
@@ -219,37 +232,40 @@ fn client_id(platform: &dyn Platform) -> Result<String> {
 
 struct Connection {
     stream: Box<dyn ConnectionStream>,
+    expected_session: Option<SessionId>,
     input: framing::Decoder,
+    message_stream: zess_protocol::chunks::MessageStream,
     output: VecDeque<Vec<u8>>,
     written: usize,
+    last_read: Option<Instant>,
     pending_attach: Option<ClientMessage>,
 }
 
 impl Connection {
     fn connect(
-        factory: &mut impl ConnectionFactory,
+        stream: Box<dyn ConnectionStream>,
         client_id: &str,
         files: &[String],
-        context_epoch: Option<u64>,
-        expected_session: Option<&zess_protocol::SessionId>,
+        expected_session: Option<&SessionId>,
         width: u16,
         height: u16,
     ) -> Result<Self> {
-        let stream = factory.connect()?;
         let expected_session = expected_session
             .cloned()
             .or_else(|| stream.session_id().cloned());
         stream.set_nonblocking(true)?;
         let mut connection = Self {
             stream,
+            expected_session: expected_session.clone(),
             input: framing::Decoder::default(),
+            message_stream: Default::default(),
             output: VecDeque::new(),
             written: 0,
+            last_read: None,
             pending_attach: Some(ClientMessage::Attach {
                 expected_session,
                 client_id: client_id.to_owned(),
                 files: files.to_vec(),
-                context_epoch,
                 width,
                 height,
             }),
@@ -261,7 +277,19 @@ impl Connection {
     }
 
     fn send(&mut self, message: &ClientMessage) -> serde_json::Result<()> {
-        self.output.push_back(framing::encode(message)?);
+        let bytes = framing::encode(message)?;
+        if bytes.len() > MAX_INPUT_BYTES && message.can_chunk() {
+            let json = std::str::from_utf8(&bytes).expect("JSON is UTF-8");
+            for (part, last) in zess_protocol::chunks::json_parts(json, MAX_INPUT_BYTES) {
+                self.output
+                    .push_back(framing::encode(&ClientMessage::Chunk {
+                        json: part.to_owned(),
+                        last,
+                    })?);
+            }
+        } else {
+            self.output.push_back(bytes);
+        }
         Ok(())
     }
 
@@ -295,6 +323,7 @@ impl Connection {
                 Ok(0) if !messages.is_empty() => break,
                 Ok(0) => anyhow::bail!("server closed the connection"),
                 Ok(count) => {
+                    self.last_read = Some(Instant::now());
                     for fragment in bytes[..count].split_inclusive(|byte| *byte == b'\n') {
                         self.input.push(fragment, MAX_MESSAGE_BYTES)?;
                         if fragment.last() == Some(&b'\n') {
@@ -315,6 +344,10 @@ impl Connection {
                                     _ => {
                                         anyhow::bail!("expected zess Hello before server messages")
                                     }
+                                }
+                            } else if let ServerMessage::Chunk { json, last } = message {
+                                if let Some(message) = self.message_stream.server(json, last)? {
+                                    messages.push(message);
                                 }
                             } else {
                                 messages.push(message);
@@ -340,13 +373,40 @@ impl Connection {
     }
 }
 
+#[derive(Clone, Copy)]
+enum AttachKind {
+    Retained,
+    Pending,
+}
+
+struct AttachMetadata {
+    workspace_view: Option<zess_protocol::workspace_view::WorkspaceView>,
+    server_instance: ServerInstanceId,
+    epoch: u64,
+}
+
+enum Attachment {
+    AwaitingResponse(AttachKind),
+    AwaitingSnapshot(AttachKind, AttachMetadata),
+    Confirming {
+        metadata: AttachMetadata,
+        snapshot: Box<RemoteStateCache>,
+    },
+}
+
 enum ClientConnection {
     Disconnected {
         retry_at: Instant,
         attempts: u8,
     },
+    Connecting {
+        task: ConnectionTask,
+        attempts: u8,
+    },
+    Failed(anyhow::Error),
     Attaching {
         connection: Connection,
+        attachment: Attachment,
         deadline: Instant,
         attempts: u8,
     },
@@ -357,7 +417,7 @@ impl ClientConnection {
     fn active_mut(&mut self) -> Option<&mut Connection> {
         match self {
             Self::Attaching { connection, .. } | Self::Attached(connection) => Some(connection),
-            Self::Disconnected { .. } => None,
+            Self::Disconnected { .. } | Self::Connecting { .. } | Self::Failed(_) => None,
         }
     }
 
@@ -365,14 +425,26 @@ impl ClientConnection {
         matches!(self, Self::Attached(_))
     }
 
-    fn disconnect(&mut self) {
+    fn attachment_mut(&mut self) -> Option<&mut Attachment> {
+        match self {
+            Self::Attaching { attachment, .. } => Some(attachment),
+            _ => None,
+        }
+    }
+
+    fn retry_or_fail(&mut self, error: anyhow::Error) {
         let attempts = match self {
-            Self::Disconnected { attempts, .. } | Self::Attaching { attempts, .. } => *attempts,
+            Self::Connecting { attempts, .. } | Self::Attaching { attempts, .. } => *attempts,
             Self::Attached(_) => 0,
+            Self::Disconnected { .. } | Self::Failed(_) => return,
         };
-        *self = Self::Disconnected {
-            retry_at: Instant::now() + RECONNECT_INTERVAL,
-            attempts,
+        *self = if attempts >= MAX_CONNECT_ATTEMPTS {
+            Self::Failed(error)
+        } else {
+            Self::Disconnected {
+                retry_at: Instant::now() + RECONNECT_INTERVAL,
+                attempts,
+            }
         };
     }
 
@@ -393,43 +465,102 @@ impl ClientConnection {
     }
 }
 
-#[derive(Clone, Copy)]
-pub enum InputRecovery {
-    Ready,
-    ConfirmReplay { epoch: u64 },
-    AwaitSkip { epoch: u64, through: u64 },
+enum OperationCompletion {
+    None,
+    PageCommand,
+    WorkspaceAction {
+        id: u64,
+        acknowledged_change: Option<ClientActionKind>,
+    },
+    PagePrompt {
+        subscription_id: u64,
+        purpose: String,
+    },
+    OpenDocument {
+        view_id: u64,
+    },
+    DiscardScratch {
+        buffer_id: u64,
+    },
+    Reload {
+        buffer_id: u64,
+    },
 }
 
-enum PendingInput {
-    Key(String),
-    TrackedKey { key: String, request_id: RequestId },
-    Mouse,
+impl OperationCompletion {
+    fn for_action(action: &CommandAction) -> Self {
+        match action {
+            CommandAction::PagePrompt {
+                subscription_id,
+                purpose,
+                ..
+            } => Self::PagePrompt {
+                subscription_id: *subscription_id,
+                purpose: purpose.clone(),
+            },
+            CommandAction::Invoke {
+                target: CommandTarget::Page { .. },
+                ..
+            }
+            | CommandAction::Request {
+                target: CommandTarget::Page { .. },
+                ..
+            } => Self::PageCommand,
+            CommandAction::DiscardScratch { buffer_id, .. } => Self::DiscardScratch {
+                buffer_id: *buffer_id,
+            },
+            CommandAction::Request {
+                target: CommandTarget::Document { buffer_id },
+                request: HostRequest::Action { name, .. },
+            } if name == "reload" => Self::Reload {
+                buffer_id: *buffer_id,
+            },
+            _ => Self::None,
+        }
+    }
+
+    fn not_submitted(&self, workbench: &mut workbench::Workbench, reason: &str) {
+        match self {
+            Self::PagePrompt {
+                subscription_id,
+                purpose,
+            } => workbench.page_prompt_result(
+                *subscription_id,
+                purpose,
+                &CommandOutcome::Failed {
+                    message: reason.into(),
+                },
+            ),
+            Self::DiscardScratch { buffer_id } => workbench.scratch_discard_result(*buffer_id),
+            Self::Reload { buffer_id } => workbench.documents.cancel_queued_reload(*buffer_id),
+            Self::None
+            | Self::PageCommand
+            | Self::WorkspaceAction { .. }
+            | Self::OpenDocument { .. } => {}
+        }
+    }
 }
 
 struct PendingOperation {
+    completion: OperationCompletion,
+    interaction: u64,
     server_instance: ServerInstanceId,
-    action_id: Option<u64>,
-    workspace_change: Option<zess_protocol::ClientActionKind>,
 }
 
-struct InputLedger {
+struct CommandLedger {
     server_instance: Option<ServerInstanceId>,
-    pending: VecDeque<(u64, PendingInput)>,
-    next_sequence: u64,
     next_request_id: u64,
-    acknowledged: u64,
     operations: HashMap<RequestId, PendingOperation>,
+    page_acks: HashSet<RequestId>,
 }
 
-impl InputLedger {
+impl CommandLedger {
     fn new() -> Self {
         Self {
             server_instance: None,
-            pending: VecDeque::new(),
-            next_sequence: 1,
             next_request_id: 1,
-            acknowledged: 0,
             operations: HashMap::new(),
+            page_acks: HashSet::new(),
         }
     }
 
@@ -441,7 +572,7 @@ impl InputLedger {
         Ok(RequestId(sequence))
     }
 
-    fn attach(&mut self, server_instance: ServerInstanceId, acknowledged: u64) -> Result<()> {
+    fn attach(&mut self, server_instance: ServerInstanceId) -> Result<()> {
         anyhow::ensure!(
             self.server_instance
                 .as_ref()
@@ -449,27 +580,7 @@ impl InputLedger {
             "the original zess server is no longer available"
         );
         self.server_instance = Some(server_instance);
-        self.acknowledge(acknowledged);
         Ok(())
-    }
-
-    fn acknowledge(&mut self, acknowledged: u64) {
-        self.acknowledged = self.acknowledged.max(acknowledged);
-        while self
-            .pending
-            .front()
-            .is_some_and(|(sequence, _)| *sequence <= self.acknowledged)
-        {
-            self.pending.pop_front();
-        }
-        self.next_sequence = self.next_sequence.max(self.acknowledged.saturating_add(1));
-    }
-
-    fn push(&mut self, input: PendingInput) -> u64 {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        self.pending.push_back((sequence, input));
-        sequence
     }
 }
 
@@ -583,8 +694,60 @@ fn clipboard_response(id: u64, result: Result<String>) -> Result<ClientMessage> 
 }
 
 struct QueuedCommand {
+    interaction: u64,
     server_instance: ServerInstanceId,
-    action: zess_protocol::CommandAction,
+    action: CommandAction,
+    completion: OperationCompletion,
+}
+
+enum CommandScope {
+    Workspace,
+    Document(u64),
+    Independent,
+}
+
+impl QueuedCommand {
+    fn scope(&self) -> CommandScope {
+        match &self.action {
+            CommandAction::ClientExit { .. }
+            | CommandAction::Command { .. }
+            | CommandAction::CommandLine { .. }
+            | CommandAction::Paste { .. } => CommandScope::Workspace,
+            CommandAction::Request {
+                request: HostRequest::Action { name, .. },
+                ..
+            } if name == "exit" => CommandScope::Workspace,
+            CommandAction::Request {
+                request: HostRequest::Action { name, .. },
+                ..
+            } if matches!(name.as_str(), "open" | "new" | "config-reload" | "buffers") => {
+                CommandScope::Independent
+            }
+            CommandAction::Invoke { target, .. } | CommandAction::Request { target, .. } => {
+                match target {
+                    CommandTarget::View { buffer_id, .. }
+                    | CommandTarget::Document { buffer_id } => CommandScope::Document(*buffer_id),
+                    CommandTarget::Page { .. } => CommandScope::Independent,
+                }
+            }
+            CommandAction::Observe {
+                source: EventSource::View { buffer_id, .. },
+                ..
+            }
+            | CommandAction::CloseBuffer { buffer_id, .. }
+            | CommandAction::ClosePageDocument { buffer_id, .. }
+            | CommandAction::DiscardScratch { buffer_id, .. }
+            | CommandAction::Save { buffer_id, .. } => CommandScope::Document(*buffer_id),
+            CommandAction::Observe {
+                source: EventSource::Page { .. },
+                ..
+            }
+            | CommandAction::AcknowledgeClientAction { .. }
+            | CommandAction::ApplyPagePatch { .. }
+            | CommandAction::PagePrompt { .. }
+            | CommandAction::OpenDocument { .. } => CommandScope::Independent,
+        }
+    }
 }
 
 struct ClientUiState {
@@ -594,14 +757,65 @@ struct ClientUiState {
     commands: VecDeque<QueuedCommand>,
 }
 
+impl ClientUiState {
+    fn ready_command(
+        &mut self,
+        workbench: &workbench::Workbench,
+        ledger: &CommandLedger,
+    ) -> Option<QueuedCommand> {
+        let mut waiting_for_workspace = false;
+        for (index, command) in self.commands.iter().enumerate() {
+            match command.scope() {
+                CommandScope::Workspace
+                    if !ledger.operations.is_empty()
+                        || !workbench.documents.workspace_command_ready() =>
+                {
+                    waiting_for_workspace = true;
+                }
+                CommandScope::Document(buffer)
+                    if waiting_for_workspace || !workbench.documents.command_ready(buffer) => {}
+                _ => return self.commands.remove(index),
+            }
+        }
+        None
+    }
+}
+
+fn sanitize(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len());
+
+    for character in text.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{1b}' => escaped.push_str("\\x1b"),
+            character if character.is_control() => {
+                escaped.push_str(&format!("\\u{{{:x}}}", character as u32));
+            }
+            character => escaped.push(character),
+        }
+    }
+
+    Cow::Owned(escaped)
+}
+
 fn run_client<C: Clipboard>(
-    factory: &mut impl ConnectionFactory,
+    factory: impl ConnectionFactory + 'static,
     client_id: String,
     files: Vec<String>,
     terminal: &mut impl TerminalIo,
     provider: &mut C,
 ) -> Result<()> {
     let (mut width, mut height) = terminal.size().unwrap_or((80, 24));
+    let mut page = ConnectionPage::new(factory.display_target().to_owned());
+    let mut factory: Option<Box<dyn ConnectionFactory>> = Some(Box::new(factory));
+    let initial = page.frame(width, height, None);
+    terminal.set_mouse_capture(false)?;
+    render(terminal.writer(), &initial, width, height, None)?;
     let mut connection = ClientConnection::Disconnected {
         retry_at: Instant::now(),
         attempts: 0,
@@ -611,15 +825,20 @@ fn run_client<C: Clipboard>(
         height,
         ..Frame::default()
     };
-    let mut ledger = InputLedger::new();
+    let mut ledger = CommandLedger::new();
     let mut submitted_actions = HashSet::new();
     let mut client_workspace = zess_protocol::ClientWorkspace::default();
-    let mut context_epoch = None;
-    let mut expected_session = None;
+    let mut attached_session = None;
     let mut remote_state: Option<RemoteStateCache> = None;
-    let mut attach_metadata = None;
+    let mut pages_available = false;
+    let mut has_frame = false;
     let mut resync_deadline = None;
-    let mut recovery = InputRecovery::Ready;
+    let mut workbench = workbench::Workbench::default();
+    let mut positions = workspace_view::WorkspaceViewSync::default();
+    let mut interaction = 0_u64;
+    let mut detaching = false;
+    let mut detach_sent = false;
+    let mut effects = VecDeque::<workbench::Effect>::new();
     let mut clipboard = ClipboardActions::new();
     let mut ui = ClientUiState {
         notice: Some("Connecting to zess server...".to_owned()),
@@ -629,64 +848,80 @@ fn run_client<C: Clipboard>(
     };
 
     loop {
-        if let ClientConnection::Disconnected { retry_at, attempts } = &connection {
-            if *attempts >= MAX_CONNECT_ATTEMPTS {
-                anyhow::bail!(
-                    "could not attach to zess after {MAX_CONNECT_ATTEMPTS} attempts: {}",
-                    ui.notice.as_deref().unwrap_or("connection lost")
-                );
-            }
-            if Instant::now() >= *retry_at {
-                let attempts = attempts + 1;
-                terminal.suspend()?;
-                let attempt = Connection::connect(
-                    factory,
-                    &client_id,
-                    &files,
-                    context_epoch,
-                    expected_session.as_ref(),
-                    width,
-                    height,
-                );
-                terminal.resume()?;
-                connection = match attempt {
-                    Ok(connection) => {
-                        if expected_session.is_none() {
-                            expected_session = connection.stream.session_id().cloned();
-                        }
-                        ui.notice = Some("Connected; attaching...".into());
-                        ClientConnection::Attaching {
-                            connection,
+        if let ClientConnection::Connecting { task, attempts } = &mut connection {
+            task.update(&mut page);
+            if let Some(finished) = task.finish() {
+                let attempts = *attempts;
+                let (returned_factory, result) = finished?;
+                factory = Some(returned_factory);
+                if page.cancelling {
+                    drop(result);
+                    return Ok(());
+                }
+                let attempt = result.and_then(|stream| {
+                    Connection::connect(
+                        stream,
+                        &client_id,
+                        &files,
+                        attached_session.as_ref(),
+                        width,
+                        height,
+                    )
+                });
+                match attempt {
+                    Ok(active) => {
+                        page.progress = ConnectionProgress {
+                            message: "Connected; attaching…".into(),
+                            bytes: None,
+                        };
+                        ui.notice = None;
+                        connection = ClientConnection::Attaching {
+                            connection: active,
+                            attachment: Attachment::AwaitingResponse(AttachKind::Retained),
                             deadline: Instant::now() + ATTACH_TIMEOUT,
                             attempts,
-                        }
+                        };
                     }
                     Err(error) => {
                         ui.notice = Some(format!("Connection failed: {error:#}"));
-                        ClientConnection::Disconnected {
-                            retry_at: Instant::now() + RECONNECT_INTERVAL,
-                            attempts,
-                        }
+                        connection.retry_or_fail(error);
                     }
-                };
+                }
                 ui.dirty = true;
             }
         }
-        if connection.attached()
-            && remote_state.is_some()
-            && resync_deadline.is_none()
-            && matches!(recovery, InputRecovery::Ready)
+        if let ClientConnection::Disconnected { retry_at, attempts } = &connection
+            && Instant::now() >= *retry_at
         {
+            resync_deadline = None;
+            page.reset();
+            connection = ClientConnection::Connecting {
+                task: ConnectionTask::start(
+                    factory
+                        .take()
+                        .context("connection factory is unavailable")?,
+                    attached_session.clone(),
+                )?,
+                attempts: attempts + 1,
+            };
+            ui.dirty = true;
+        }
+        if connection.attached() && remote_state.is_some() && resync_deadline.is_none() {
             let state = &remote_state.as_ref().unwrap().state;
             for pending in &state.client_actions {
-                if ledger
-                    .operations
-                    .values()
-                    .any(|operation| operation.action_id.is_some())
-                {
+                if ledger.operations.values().any(|operation| {
+                    matches!(
+                        operation.completion,
+                        OperationCompletion::WorkspaceAction { .. }
+                    )
+                }) {
                     break;
                 }
                 if !submitted_actions.contains(&pending.id) {
+                    if let zess_protocol::ClientActionKind::OpenPage { source } = &pending.kind {
+                        workbench.pages.open(&source.kind, source.argument.clone());
+                        ui.dirty = true;
+                    }
                     let action = match &pending.kind {
                         zess_protocol::ClientActionKind::Close { buffer_id, force } => {
                             let Some(buffer) =
@@ -701,6 +936,9 @@ fn run_client<C: Clipboard>(
                                 )
                                 && !buffer.modified
                             {
+                                if workbench.documents.has_closed_edits() {
+                                    continue;
+                                }
                                 zess_protocol::CommandAction::ClientExit {
                                     action_id: pending.id,
                                     buffer_id: *buffer_id,
@@ -722,56 +960,53 @@ fn run_client<C: Clipboard>(
                             action_id: pending.id,
                         },
                     };
+                    let acknowledged_change =
+                        matches!(action, CommandAction::AcknowledgeClientAction { .. })
+                            .then(|| pending.kind.clone());
                     submitted_actions.insert(pending.id);
                     ui.commands.push_back(QueuedCommand {
+                        interaction,
                         server_instance: ledger.server_instance.clone().unwrap(),
                         action,
+                        completion: OperationCompletion::WorkspaceAction {
+                            id: pending.id,
+                            acknowledged_change,
+                        },
                     });
                     break;
                 }
             }
-            while let Some(command) = ui.commands.pop_front() {
+            while let Some(command) = ui.ready_command(&workbench, &ledger) {
                 if ledger.server_instance.as_ref() != Some(&command.server_instance) {
-                    ui.notice =
-                        Some("Session changed; the queued command was not submitted".into());
+                    let message = "Session changed; the queued command was not submitted";
+                    command.completion.not_submitted(&mut workbench, message);
+                    ui.notice = Some(message.into());
                     ui.dirty = true;
                     continue;
                 }
-                let action = command.action;
-                let action_id = match &action {
-                    zess_protocol::CommandAction::AcknowledgeClientAction { action_id }
-                    | zess_protocol::CommandAction::CloseBuffer { action_id, .. }
-                    | zess_protocol::CommandAction::ClientExit { action_id, .. } => {
-                        Some(*action_id)
-                    }
-                    _ => None,
-                };
-                let workspace_change = match &action {
-                    zess_protocol::CommandAction::AcknowledgeClientAction { action_id } => state
-                        .client_actions
-                        .iter()
-                        .find(|pending| pending.id == *action_id)
-                        .map(|pending| pending.kind.clone()),
-                    _ => None,
-                };
                 let request_id = ledger.request_id()?;
-                let server_instance = ledger.server_instance.clone().unwrap();
+                let server_instance = command.server_instance;
                 let message = ClientMessage::Command {
                     request_id,
                     server_instance: server_instance.clone(),
-                    action,
+                    action: command.action,
                 };
                 if framing::encode(&message)?.len() > MAX_INPUT_BYTES {
-                    ui.notice = Some("Command exceeds the input byte limit".into());
+                    let reason = "Command exceeds the input byte limit";
+                    command.completion.not_submitted(&mut workbench, reason);
+                    ui.notice = Some(reason.into());
                     ui.dirty = true;
                     continue;
+                }
+                if let OperationCompletion::Reload { buffer_id } = &command.completion {
+                    workbench.documents.reload_submitted(*buffer_id);
                 }
                 ledger.operations.insert(
                     request_id,
                     PendingOperation {
+                        completion: command.completion,
+                        interaction: command.interaction,
                         server_instance,
-                        action_id,
-                        workspace_change,
                     },
                 );
                 connection.active_mut().unwrap().send(&message)?;
@@ -785,10 +1020,11 @@ fn run_client<C: Clipboard>(
                     .downcast_ref::<zess_protocol::BuildMismatch>()
                     .is_some()
                 {
-                    return Err(error);
+                    connection = ClientConnection::Failed(error);
+                } else {
+                    ui.notice = Some(format!("Disconnected; reconnecting: {error}"));
+                    connection.retry_or_fail(error);
                 }
-                ui.notice = Some(format!("Disconnected; reconnecting: {error}"));
-                connection.disconnect();
                 ui.dirty = true;
                 Vec::new()
             }
@@ -797,130 +1033,223 @@ fn run_client<C: Clipboard>(
             let primary_write = matches!(&message, ServerMessage::ClipboardWritePrimary { .. });
             match message {
                 ServerMessage::Hello { .. } => anyhow::bail!("unexpected duplicate zess Hello"),
+                ServerMessage::AttachPending => {
+                    let Some(Attachment::AwaitingResponse(kind @ AttachKind::Retained)) =
+                        connection.attachment_mut()
+                    else {
+                        anyhow::bail!("unexpected pending zess attachment");
+                    };
+                    *kind = AttachKind::Pending;
+                }
                 ServerMessage::Attached {
                     server_instance,
-                    acknowledged,
                     context_epoch: epoch,
-                    replay_allowed,
-                    frame: _,
+                    workspace_view,
+                    ..
                 } => {
-                    anyhow::ensure!(
-                        ledger
-                            .server_instance
-                            .as_ref()
-                            .is_none_or(|expected| expected == &server_instance),
-                        "the original zess server is no longer available"
-                    );
-                    attach_metadata = Some((server_instance, acknowledged, epoch, replay_allowed));
-                    remote_state = None;
+                    if ledger
+                        .server_instance
+                        .as_ref()
+                        .is_some_and(|expected| expected != &server_instance)
+                    {
+                        connection = ClientConnection::Failed(anyhow::anyhow!(
+                            "the original zess server is no longer available"
+                        ));
+                        ui.dirty = true;
+                        break;
+                    }
+                    let metadata = AttachMetadata {
+                        workspace_view,
+                        server_instance,
+                        epoch,
+                    };
+                    let attachment = connection
+                        .attachment_mut()
+                        .context("unexpected zess attachment")?;
+                    let Attachment::AwaitingResponse(kind) = *attachment else {
+                        anyhow::bail!("unexpected duplicate zess attachment");
+                    };
+                    *attachment = Attachment::AwaitingSnapshot(kind, metadata);
                     ui.dirty = true;
                 }
-                ServerMessage::Snapshot {
-                    session_id,
-                    server_instance,
-                    state_revision,
-                    state,
-                    frame: _,
-                } => {
-                    anyhow::ensure!(
-                        expected_session
-                            .as_ref()
-                            .is_none_or(|expected| expected == &session_id),
-                        "the original zess session is no longer available"
-                    );
-                    let expected_server = attach_metadata
-                        .as_ref()
-                        .map(|(instance, _, _, _)| instance)
-                        .or(ledger.server_instance.as_ref());
-                    if expected_server.is_some_and(|expected| expected != &server_instance) {
-                        anyhow::bail!("the original zess server is no longer available");
-                    }
-                    let next_state = RemoteStateCache {
-                        session_id,
-                        server_instance: server_instance.clone(),
-                        revision: state_revision,
-                        state,
-                    };
-                    match zess_protocol::render_snapshot(&next_state.state) {
-                        Ok(next_frame) => {
-                            frame = next_frame;
-                            remote_state = Some(next_state);
-                        }
-                        Err(error) => {
-                            if let Some(active) = connection.active_mut() {
-                                active.send(&ClientMessage::Resync {
-                                    session_id: next_state.session_id,
-                                    state_revision: remote_state
-                                        .as_ref()
-                                        .map_or(0, |state| state.revision),
-                                })?;
+                message @ (ServerMessage::Snapshot { .. } | ServerMessage::AttachConfirmed) => {
+                    let (next_state, metadata) = match message {
+                        ServerMessage::Snapshot {
+                            session_id,
+                            server_instance,
+                            state_revision,
+                            bindings,
+                            state,
+                        } => {
+                            let unexpected_session = attached_session
+                                .as_ref()
+                                .or_else(|| {
+                                    connection
+                                        .active_mut()
+                                        .and_then(|active| active.expected_session.as_ref())
+                                })
+                                .is_some_and(|expected| expected != &session_id);
+                            let (expected_server, pending) = match connection.attachment_mut() {
+                                Some(Attachment::AwaitingSnapshot(kind, metadata)) => (
+                                    Some(&metadata.server_instance),
+                                    matches!(kind, AttachKind::Pending),
+                                ),
+                                Some(_) => {
+                                    anyhow::bail!("unexpected zess snapshot during attachment")
+                                }
+                                None => (ledger.server_instance.as_ref(), false),
+                            };
+                            let error = if unexpected_session {
+                                Some("the original zess session is no longer available")
+                            } else if expected_server
+                                .is_some_and(|expected| expected != &server_instance)
+                            {
+                                Some("the original zess server is no longer available")
+                            } else {
+                                None
+                            };
+                            if let Some(error) = error {
+                                connection = ClientConnection::Failed(anyhow::anyhow!(error));
+                                ui.dirty = true;
+                                break;
                             }
-                            resync_deadline = Some(Instant::now() + ATTACH_TIMEOUT);
-                            ui.notice = Some(format!("Synchronizing session state: {error}"));
-                            ui.dirty = true;
-                            continue;
+                            let next_state = RemoteStateCache {
+                                session_id,
+                                server_instance,
+                                revision: state_revision,
+                                state,
+                            };
+                            if let Err(error) = next_state.state.validate() {
+                                ui.dirty = true;
+                                if pending {
+                                    ui.notice = Some(format!(
+                                        "Could not synchronize pending session; reconnecting: {error}"
+                                    ));
+                                    connection.retry_or_fail(anyhow::anyhow!(
+                                        "Could not synchronize pending session: {error}"
+                                    ));
+                                    break;
+                                }
+                                if let Some(active) = connection.active_mut() {
+                                    active.send(&ClientMessage::Resync {
+                                        session_id: next_state.session_id,
+                                        state_revision: remote_state
+                                            .as_ref()
+                                            .map_or(0, |state| state.revision),
+                                    })?;
+                                }
+                                resync_deadline = Some(Instant::now() + ATTACH_TIMEOUT);
+                                ui.notice = Some(format!("Synchronizing session state: {error}"));
+                                continue;
+                            }
+                            workbench.statuslines.invalidate();
+                            workbench.editor.set_catalog(bindings);
+                            let metadata = if let Some(attachment) = connection.attachment_mut() {
+                                let Attachment::AwaitingSnapshot(_, metadata) = std::mem::replace(
+                                    attachment,
+                                    Attachment::AwaitingResponse(AttachKind::Retained),
+                                ) else {
+                                    unreachable!("attachment awaits its snapshot");
+                                };
+                                if pending {
+                                    *attachment = Attachment::Confirming {
+                                        metadata,
+                                        snapshot: Box::new(next_state),
+                                    };
+                                    connection
+                                        .active_mut()
+                                        .unwrap()
+                                        .send(&ClientMessage::ConfirmAttach)?;
+                                    continue;
+                                }
+                                Some(metadata)
+                            } else {
+                                None
+                            };
+                            (next_state, metadata)
                         }
+                        ServerMessage::AttachConfirmed => {
+                            let attachment = connection
+                                .attachment_mut()
+                                .context("unexpected zess attachment confirmation")?;
+                            let Attachment::Confirming { metadata, snapshot } = std::mem::replace(
+                                attachment,
+                                Attachment::AwaitingResponse(AttachKind::Retained),
+                            ) else {
+                                anyhow::bail!("unexpected zess attachment confirmation");
+                            };
+                            (*snapshot, Some(metadata))
+                        }
+                        _ => unreachable!(),
+                    };
+                    has_frame = true;
+                    let resynchronized = resync_deadline.take().is_some();
+                    if resynchronized {
+                        workbench.statuslines.invalidate();
                     }
-                    resync_deadline = None;
-                    expected_session = Some(remote_state.as_ref().unwrap().session_id.clone());
-                    client_workspace = remote_state.as_ref().unwrap().state.workspace.clone();
-                    let Some((attached_instance, acknowledged, epoch, replay_allowed)) =
-                        attach_metadata.take()
+                    client_workspace = next_state.state.workspace.clone();
+                    let keep_local_position = remote_state.as_ref().is_some_and(|previous| {
+                        !workbench.detach_synchronized()
+                            || !positions.is_saved(&workbench.workspace_view(&previous.state))
+                    });
+                    workbench.synchronize(&next_state.state);
+                    remote_state = Some(next_state);
+                    let Some(AttachMetadata {
+                        server_instance,
+                        epoch,
+                        workspace_view,
+                    }) = metadata
                     else {
-                        if matches!(recovery, InputRecovery::Ready) {
-                            ui.notice = None;
+                        if resynchronized && let Some(active) = connection.active_mut() {
+                            for (request_id, operation) in &ledger.operations {
+                                if matches!(
+                                    operation.completion,
+                                    OperationCompletion::OpenDocument { .. }
+                                        | OperationCompletion::DiscardScratch { .. }
+                                        | OperationCompletion::PageCommand
+                                        | OperationCompletion::PagePrompt { .. }
+                                ) {
+                                    active.send(&ClientMessage::QueryOperation {
+                                        request_id: *request_id,
+                                        server_instance: operation.server_instance.clone(),
+                                    })?;
+                                }
+                            }
                         }
+                        ui.notice = None;
                         ui.dirty = true;
                         continue;
                     };
-                    anyhow::ensure!(
-                        attached_instance == server_instance,
-                        "snapshot does not match attachment server"
-                    );
-                    clipboard.attach(&server_instance);
-                    ledger.attach(server_instance, acknowledged)?;
-                    connection.finish_attach();
-                    context_epoch = Some(epoch);
-                    recovery = match recovery {
-                        InputRecovery::AwaitSkip { through, .. } if !ledger.pending.is_empty() => {
-                            InputRecovery::AwaitSkip { epoch, through }
-                        }
-                        _ if ledger.pending.is_empty() => InputRecovery::Ready,
-                        InputRecovery::ConfirmReplay { .. } => {
-                            InputRecovery::ConfirmReplay { epoch }
-                        }
-                        _ if replay_allowed => InputRecovery::Ready,
-                        _ => InputRecovery::ConfirmReplay { epoch },
-                    };
-                    let active = connection.active_mut().unwrap();
-                    ui.notice = None;
-                    match recovery {
-                        InputRecovery::Ready => {
-                            send_pending(
-                                active,
-                                &ledger.pending,
-                                epoch,
-                                ledger.server_instance.as_ref().unwrap(),
-                            )?;
-                        }
-                        InputRecovery::ConfirmReplay { .. } => {}
-                        InputRecovery::AwaitSkip { through, .. } => {
-                            active.send(&ClientMessage::Skip {
-                                through,
-                                context_epoch: epoch,
-                            })?;
+                    let previous_epoch = workbench.pages.attach(epoch);
+                    if attached_session.is_some() {
+                        workbench.reconnect();
+                    }
+                    let state = &remote_state.as_ref().unwrap().state;
+                    if (attached_session.is_none()
+                        || (previous_epoch != epoch && !keep_local_position))
+                        && let Some(saved) = &workspace_view
+                    {
+                        workbench.restore(saved, state)?;
+                        if attached_session.is_none() && !files.is_empty() {
+                            workbench.focus_opened(state);
                         }
                     }
+                    positions.attach(workspace_view);
+                    detach_sent = false;
+                    attached_session = Some(remote_state.as_ref().unwrap().session_id.clone());
+                    clipboard.attach(&server_instance);
+                    ledger.attach(server_instance)?;
+                    connection.finish_attach();
+                    let active = connection.active_mut().unwrap();
+                    ui.notice = None;
                     for (request_id, operation) in &ledger.operations {
                         active.send(&ClientMessage::QueryOperation {
                             request_id: *request_id,
                             server_instance: operation.server_instance.clone(),
                         })?;
                     }
-                    // Resizing while attaching must reach the final attached View.
-                    if frame.width != width || frame.height != height {
-                        active.send(&ClientMessage::Resize { width, height })?;
-                    }
+                    active.send(&ClientMessage::Resize { width, height })?;
+                    workbench.resize_pages(width, height);
                     ui.dirty = true;
                 }
                 ServerMessage::Delta {
@@ -929,10 +1258,9 @@ fn run_client<C: Clipboard>(
                     base_revision,
                     state_revision,
                     delta,
-                    frame: _,
                 } => {
                     let mut next_state = remote_state.clone();
-                    let rendered = if resync_deadline.is_none()
+                    let applied = resync_deadline.is_none()
                         && next_state.as_mut().is_some_and(|state| {
                             state.apply_delta(
                                 &session_id,
@@ -940,14 +1268,10 @@ fn run_client<C: Clipboard>(
                                 base_revision,
                                 state_revision,
                                 delta,
-                            )
-                        }) {
-                        zess_protocol::render_snapshot(&next_state.as_ref().unwrap().state).ok()
-                    } else {
-                        None
-                    };
-                    if let Some(next_frame) = rendered {
-                        frame = next_frame;
+                            ) && state.state.validate().is_ok()
+                        });
+                    if applied {
+                        workbench.synchronize(&next_state.as_ref().unwrap().state);
                         remote_state = next_state;
                         ui.dirty = true;
                     } else if resync_deadline.is_none() {
@@ -964,20 +1288,42 @@ fn run_client<C: Clipboard>(
                         ui.dirty = true;
                     }
                 }
-                ServerMessage::Ack {
-                    acknowledged,
-                    context_epoch: epoch,
-                } => {
-                    if context_epoch == Some(epoch) {
-                        ledger.acknowledge(acknowledged);
-                        if matches!(recovery, InputRecovery::AwaitSkip { through, .. } if ledger.acknowledged >= through)
-                            || matches!(recovery, InputRecovery::ConfirmReplay { .. } if ledger.pending.is_empty())
-                        {
-                            recovery = InputRecovery::Ready;
+                ServerMessage::Bindings(catalog) => {
+                    workbench.statuslines.invalidate();
+                    workbench.editor.set_catalog(catalog);
+                    ui.dirty = true;
+                }
+                ServerMessage::Document(event) => {
+                    let state = remote_state
+                        .as_ref()
+                        .context("document arrived before Session snapshot")?;
+                    effects.extend(workbench.apply_document(event, &state.state)?);
+                    ui.dirty = true;
+                }
+                ServerMessage::FormattedStatusline { id, result } => {
+                    match workbench.statuslines.receive(id, result) {
+                        Ok(changed) => ui.dirty |= changed,
+                        Err(message) => {
+                            ui.notice = Some(message);
                             ui.dirty = true;
                         }
                     }
                 }
+                ServerMessage::Chunk { .. } => {
+                    unreachable!("the connection assembles message chunks")
+                }
+                ServerMessage::Resource { update } => {
+                    let state = remote_state
+                        .as_ref()
+                        .context("resource arrived before Session snapshot")?;
+                    effects.extend(workbench.apply_resource(update, &state.state)?);
+                    ui.dirty = true;
+                }
+                ServerMessage::ResourceCacheInvalidated { entries, reason } => {
+                    workbench.invalidate_resource_cache(&entries, reason);
+                    ui.dirty = true;
+                }
+                ServerMessage::WorkspaceViewSaved => positions.acknowledge()?,
                 ServerMessage::CommandResult {
                     request_id,
                     server_instance,
@@ -985,36 +1331,132 @@ fn run_client<C: Clipboard>(
                 } => {
                     if ledger.server_instance.as_ref() == Some(&server_instance) {
                         match result {
+                            zess_protocol::OperationResult::Completed {
+                                outcome:
+                                    zess_protocol::CommandOutcome::DocumentOpened { .. }
+                                    | zess_protocol::CommandOutcome::ScratchDiscarded { .. }
+                                    | zess_protocol::CommandOutcome::PageApplied { .. },
+                                ..
+                            } if resync_deadline.is_some() => {}
                             zess_protocol::OperationResult::Completed { outcome, .. } => {
                                 if let Some(operation) = ledger.operations.remove(&request_id) {
-                                    match (&outcome, operation.workspace_change) {
-                                        (zess_protocol::CommandOutcome::Applied, Some(change)) => {
-                                            client_workspace.apply(&change)
+                                    match operation.completion {
+                                        OperationCompletion::DiscardScratch { buffer_id } => {
+                                            workbench.scratch_discard_result(buffer_id);
                                         }
-                                        (
-                                            zess_protocol::CommandOutcome::BufferClosed {
-                                                buffer_id,
-                                                replacement,
-                                            },
-                                            _,
-                                        ) => {
-                                            client_workspace.buffers.retain(|id| id != buffer_id);
-                                            if !client_workspace.buffers.contains(replacement) {
-                                                client_workspace.buffers.push(*replacement);
+                                        OperationCompletion::Reload { buffer_id } => {
+                                            workbench.documents.reload_result(buffer_id);
+                                        }
+                                        OperationCompletion::PagePrompt {
+                                            subscription_id,
+                                            purpose,
+                                        } => {
+                                            workbench.page_prompt_result(
+                                                subscription_id,
+                                                &purpose,
+                                                &outcome,
+                                            );
+                                            ui.dirty = true;
+                                        }
+                                        OperationCompletion::WorkspaceAction {
+                                            acknowledged_change: Some(change),
+                                            ..
+                                        } if matches!(outcome, CommandOutcome::Applied) => {
+                                            client_workspace.apply(&change);
+                                        }
+                                        OperationCompletion::OpenDocument { view_id } => {
+                                            if let (
+                                                CommandOutcome::DocumentOpened { buffer_id },
+                                                Some(state),
+                                            ) = (&outcome, &remote_state)
+                                            {
+                                                effects.extend(workbench.document_opened(
+                                                    view_id,
+                                                    *buffer_id,
+                                                    &state.state,
+                                                ));
+                                                ui.dirty = true;
                                             }
-                                            client_workspace.current = Some(*replacement);
+                                        }
+                                        OperationCompletion::None
+                                        | OperationCompletion::PageCommand
+                                        | OperationCompletion::WorkspaceAction { .. } => {}
+                                    }
+                                    match outcome {
+                                        CommandOutcome::BufferClosed {
+                                            buffer_id,
+                                            replacement,
+                                        } => {
+                                            client_workspace.buffers.retain(|id| *id != buffer_id);
+                                            if !client_workspace.buffers.contains(&replacement) {
+                                                client_workspace.buffers.push(replacement);
+                                            }
+                                            client_workspace.current = Some(replacement);
+                                        }
+                                        CommandOutcome::PageDocumentClosed { buffer_id } => {
+                                            workbench.page_document_closed(buffer_id);
+                                            ui.dirty = true;
+                                        }
+                                        CommandOutcome::PageApplied {
+                                            page_id,
+                                            subscription_id,
+                                            navigation,
+                                            document,
+                                        } => {
+                                            if let Some(state) = &remote_state
+                                                && let Some(applied) = workbench.apply_page_result(
+                                                    page_id,
+                                                    subscription_id,
+                                                    navigation,
+                                                    document,
+                                                    &state.state,
+                                                )?
+                                            {
+                                                effects.extend(applied);
+                                                ledger.page_acks.insert(request_id);
+                                                ui.dirty = true;
+                                            }
+                                        }
+                                        CommandOutcome::ScratchDiscarded {
+                                            buffer_id,
+                                            replacement,
+                                        } => {
+                                            if client_workspace.current == Some(buffer_id) {
+                                                client_workspace.apply(&ClientActionKind::Open {
+                                                    buffer_id: replacement,
+                                                });
+                                                client_workspace.current = Some(replacement);
+                                            }
+                                            client_workspace.buffers.retain(|id| *id != buffer_id);
+                                        }
+                                        zess_protocol::CommandOutcome::Failed { message }
+                                        | zess_protocol::CommandOutcome::Message { message } => {
+                                            ui.notice = Some(message);
+                                            ui.dirty = true;
+                                        }
+                                        zess_protocol::CommandOutcome::Yanked {
+                                            values,
+                                            register,
+                                        } => {
+                                            effects.extend(workbench.yank(register, values)?);
+                                            ui.dirty = true;
+                                        }
+                                        zess_protocol::CommandOutcome::ClientRequest {
+                                            request,
+                                        } if operation.interaction == interaction => {
+                                            effects.extend(workbench.apply_request(
+                                                request,
+                                                &remote_state.as_ref().unwrap().state,
+                                            )?);
+                                            ui.dirty = true;
                                         }
                                         _ => {}
                                     }
-                                    if let zess_protocol::CommandOutcome::Failed { message } =
-                                        outcome
-                                    {
-                                        ui.notice = Some(message);
-                                        ui.dirty = true;
-                                    }
                                 }
                                 // A reconnect can resend a result if its earlier ACK was lost.
-                                if let Some(active) = connection.active_mut() {
+                                if !ledger.page_acks.contains(&request_id)
+                                    && let Some(active) = connection.active_mut()
+                                {
                                     active.send(&ClientMessage::ResultAck {
                                         request_id,
                                         server_instance,
@@ -1023,10 +1465,34 @@ fn run_client<C: Clipboard>(
                             }
                             zess_protocol::OperationResult::Unknown => {
                                 if let Some(operation) = ledger.operations.remove(&request_id) {
-                                    if let Some(action_id) = operation.action_id {
-                                        submitted_actions.remove(&action_id);
+                                    let reason = "The previous operation's outcome is unknown; check the remote state before retrying";
+                                    match operation.completion {
+                                        OperationCompletion::DiscardScratch { buffer_id } => {
+                                            workbench.scratch_discard_result(buffer_id);
+                                        }
+                                        OperationCompletion::Reload { buffer_id } => {
+                                            workbench.documents.reload_result(buffer_id);
+                                        }
+                                        OperationCompletion::WorkspaceAction { id, .. } => {
+                                            submitted_actions.remove(&id);
+                                        }
+                                        OperationCompletion::PagePrompt {
+                                            subscription_id,
+                                            purpose,
+                                        } => {
+                                            workbench.page_prompt_result(
+                                                subscription_id,
+                                                &purpose,
+                                                &CommandOutcome::Failed {
+                                                    message: reason.into(),
+                                                },
+                                            );
+                                        }
+                                        OperationCompletion::None
+                                        | OperationCompletion::PageCommand
+                                        | OperationCompletion::OpenDocument { .. } => {}
                                     }
-                                    ui.notice = Some("The previous operation's outcome is unknown; check the remote state before retrying".into());
+                                    ui.notice = Some(reason.into());
                                     ui.dirty = true;
                                 }
                             }
@@ -1043,7 +1509,6 @@ fn run_client<C: Clipboard>(
                     }
                     return Ok(());
                 }
-                ServerMessage::Update { .. } => {}
                 ServerMessage::ClipboardWrite { text }
                 | ServerMessage::ClipboardWritePrimary { text } => {
                     clipboard.copy(primary_write, text);
@@ -1056,7 +1521,12 @@ fn run_client<C: Clipboard>(
                     }
                 }
                 ServerMessage::Rejected { reason } => {
-                    anyhow::bail!("zess server rejected the client: {}", sanitize(&reason));
+                    connection = ClientConnection::Failed(anyhow::anyhow!(
+                        "zess server rejected the client: {}",
+                        sanitize(&reason)
+                    ));
+                    ui.dirty = true;
+                    break;
                 }
                 ServerMessage::Exited => {
                     connection
@@ -1068,16 +1538,23 @@ fn run_client<C: Clipboard>(
                 ServerMessage::Status { .. } => anyhow::bail!("unexpected server status response"),
             }
         }
+        let now = Instant::now();
+        let read_idle = connection.active_mut().is_some_and(|active| {
+            active
+                .last_read
+                .is_none_or(|last_read| now >= last_read + ATTACH_TIMEOUT)
+        });
         if let ClientConnection::Attaching { deadline, .. } = connection
-            && Instant::now() >= deadline
+            && now >= deadline
+            && read_idle
         {
-            ui.notice = Some("Timed out waiting for server attachment".into());
-            connection.disconnect();
+            let error = anyhow::anyhow!("Timed out waiting for server attachment");
+            ui.notice = Some(error.to_string());
+            connection.retry_or_fail(error);
             ui.dirty = true;
-        }
-        if resync_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        } else if read_idle && resync_deadline.is_some_and(|deadline| now >= deadline) {
             ui.notice = Some("Timed out synchronizing session state; reconnecting".into());
-            connection.disconnect();
+            connection.retry_or_fail(anyhow::anyhow!("Timed out synchronizing session state"));
             resync_deadline = None;
             ui.dirty = true;
         }
@@ -1088,247 +1565,273 @@ fn run_client<C: Clipboard>(
 
         let synchronized =
             connection.attached() && remote_state.is_some() && resync_deadline.is_none();
-        let ready = synchronized && matches!(recovery, InputRecovery::Ready);
-        if ui.dirty {
-            terminal.set_mouse_capture(
-                frame.mouse_enabled
-                    && connection.attached()
-                    && remote_state.is_some()
-                    && resync_deadline.is_none()
-                    && matches!(recovery, InputRecovery::Ready),
-            )?;
+        if pages_available != synchronized {
+            workbench.set_pages_available(synchronized);
+            pages_available = synchronized;
+        }
+        let editing = attached_session.is_some()
+            && remote_state.is_some()
+            && !page.awaiting_input()
+            && !matches!(connection, ClientConnection::Failed(_));
+        if let Some((id, result)) = clipboard.take_local_result()
+            && let Some(state) = &remote_state
+        {
+            effects.extend(workbench.paste_clipboard(id, result, &state.state)?);
+            ui.dirty = true;
+        }
+        while let Some(effect) = effects.pop_front() {
+            match effect {
+                workbench::Effect::Command(action) => {
+                    let completion = OperationCompletion::for_action(&action);
+                    if synchronized {
+                        ui.commands.push_back(QueuedCommand {
+                            interaction,
+                            server_instance: ledger
+                                .server_instance
+                                .clone()
+                                .context("command before attach")?,
+                            action,
+                            completion,
+                        });
+                    } else {
+                        let reason = "Workspace unavailable; command was not submitted";
+                        completion.not_submitted(&mut workbench, reason);
+                        ui.notice = Some(reason.into());
+                    }
+                }
+                workbench::Effect::OpenDocument { .. } if !synchronized => {
+                    ui.notice = Some("Workspace unavailable; command was not submitted".into());
+                }
+                workbench::Effect::OpenDocument { view_id, path } => {
+                    ui.commands.push_back(QueuedCommand {
+                        interaction,
+                        server_instance: ledger
+                            .server_instance
+                            .clone()
+                            .context("command before attach")?,
+                        action: CommandAction::OpenDocument { path },
+                        completion: OperationCompletion::OpenDocument { view_id },
+                    });
+                }
+                workbench::Effect::ClipboardRead { id, primary } => {
+                    clipboard.read_for_editor(id, primary)
+                }
+                workbench::Effect::ClipboardWrite { primary, text } => {
+                    clipboard.copy(primary, text)
+                }
+                workbench::Effect::Notice(message) => ui.notice = Some(message),
+            }
+            ui.dirty = true;
+        }
+        if synchronized {
+            let active = connection.active_mut().unwrap();
+            for request in workbench.documents.requests() {
+                active.send(&ClientMessage::Document(request))?;
+            }
+            for request in workbench.statuslines.requests() {
+                active.send(&request)?;
+            }
+            if let Some(interest) = workbench.pages.cache_interest() {
+                active.send(&interest)?;
+            }
+            for message in workbench.pages.take_requests() {
+                active.send(&message)?;
+            }
+            let saved = workbench.workspace_view_ready()
+                && workbench.detach_synchronized()
+                && positions.synchronize(
+                    workbench.workspace_view(&remote_state.as_ref().unwrap().state),
+                    active,
+                )?;
+            if saved {
+                for request_id in ledger.page_acks.drain() {
+                    active.send(&ClientMessage::ResultAck {
+                        request_id,
+                        server_instance: ledger.server_instance.clone().unwrap(),
+                    })?;
+                }
+            }
+            if detaching
+                && !detach_sent
+                && saved
+                && workbench.detach_synchronized()
+                && ledger.operations.is_empty()
+                && ui.commands.is_empty()
+                && clipboard.is_idle()
+            {
+                active.send(&ClientMessage::Detach)?;
+                detach_sent = true;
+            }
+        }
+        ui.dirty |= workbench.poll_syntax() || workbench.statuslines.loading_due(now);
+        if ui.dirty || !connection.attached() {
+            if editing {
+                frame = workbench.render(&remote_state.as_ref().unwrap().state, width, height)?;
+            }
+            terminal.set_mouse_capture(frame.mouse_enabled && editing && !detaching)?;
             if !terminal.mouse_capture() {
                 ui.clicks = ClickTracker::default();
             }
-            let control_notice = match recovery {
-                InputRecovery::ConfirmReplay { .. } => Some(recovery_notice()),
-                InputRecovery::AwaitSkip { .. } => {
-                    Some("Discarding queued input; waiting for server confirmation".into())
-                }
-                InputRecovery::Ready => None,
-            };
-            let notice = match (control_notice, ui.notice.as_deref()) {
-                (Some(control), Some(message)) => Some(format!("{control} | {message}")),
-                (Some(control), None) => Some(control),
-                (None, _) => ui.notice.clone(),
-            };
-            let notice = notice.map(|notice| {
-                if !connection.attached() {
-                    format!("Esc/Ctrl-c exit | {notice}")
-                } else if !matches!(recovery, InputRecovery::Ready) {
-                    format!("Ctrl-c exit | {notice}")
-                } else {
-                    notice
-                }
-            });
+            let notice = ui
+                .notice
+                .as_ref()
+                .filter(|_| !editing || detaching || !workbench.editor.external_prompt())
+                .map(|message| {
+                    if editing {
+                        message.clone()
+                    } else {
+                        format!("Esc/Ctrl-c exit | {message}")
+                    }
+                });
             let (width, height) = terminal.size().unwrap_or((frame.width, frame.height));
-            render(terminal.writer(), &frame, width, height, notice.as_deref())?;
+            if editing {
+                render(terminal.writer(), &frame, width, height, notice.as_deref())?;
+            } else {
+                if let ClientConnection::Failed(error) = &connection {
+                    page.failed = true;
+                    page.progress = ConnectionProgress {
+                        message: format!("{error:#}"),
+                        bytes: None,
+                    };
+                } else if matches!(connection, ClientConnection::Disconnected { .. })
+                    && let Some(message) = &ui.notice
+                {
+                    page.progress = ConnectionProgress {
+                        message: message.clone(),
+                        bytes: None,
+                    };
+                }
+                let panel = page.frame(width, height, has_frame.then_some(&frame));
+                render(terminal.writer(), &panel, width, height, None)?;
+            }
             ui.dirty = false;
         }
         let Some(event) = terminal.poll_event(EVENT_POLL_INTERVAL)? else {
             continue;
         };
+        if !editing && !connection.attached() {
+            let cancel = matches!(&event, Event::Key(key)
+                if key.kind != KeyEventKind::Release && (key.code == KeyCode::Esc
+                    || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+                    || (key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL))));
+            if cancel {
+                if let ClientConnection::Connecting { task, .. } = &connection {
+                    page.cancel();
+                    task.cancel();
+                    ui.dirty = true;
+                } else {
+                    return if let ClientConnection::Failed(error) = connection {
+                        Err(error)
+                    } else {
+                        Ok(())
+                    };
+                }
+                continue;
+            }
+            if page.cancelling {
+                continue;
+            }
+            if matches!(connection, ClientConnection::Failed(_))
+                && matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && key.code == KeyCode::Char('r'))
+            {
+                page.reset();
+                connection = ClientConnection::Disconnected {
+                    retry_at: Instant::now(),
+                    attempts: 0,
+                };
+                continue;
+            }
+            if page.event(&event) {
+                ui.dirty = true;
+                continue;
+            }
+        }
         let new_input = match &event {
             Event::Paste(_) => true,
             Event::Key(key) => key.kind != KeyEventKind::Release,
             _ => false,
         };
-        if ready && new_input && ui.notice.take().is_some() {
+        if synchronized && new_input && ui.notice.take().is_some() {
             ui.dirty = true;
         }
         if !matches!(event, Event::Mouse(_)) {
             ui.clicks = ClickTracker::default();
         }
-        match event {
-            Event::Paste(text) => {
-                if !ready {
-                    ui.notice = Some("Session is not ready; paste was not submitted".into());
-                    ui.dirty = true;
-                    continue;
-                }
-                ui.commands.push_back(QueuedCommand {
-                    server_instance: ledger.server_instance.clone().unwrap(),
-                    action: zess_protocol::CommandAction::Paste { text },
-                });
-            }
-            Event::Resize(new_width, new_height) => {
-                width = new_width;
-                height = new_height;
-                ui.dirty = true;
-                if connection.attached()
-                    && let Some(active) = connection.active_mut()
-                {
-                    active.send(&ClientMessage::Resize { width, height })?;
-                }
-            }
-            Event::Mouse(mouse)
-                if terminal.mouse_capture() && frame.width == width && frame.height == height =>
+        if let Event::Resize(new_width, new_height) = event {
+            width = new_width;
+            height = new_height;
+            workbench.resize_pages(width, height);
+            ui.dirty = true;
+            if connection.attached()
+                && let Some(active) = connection.active_mut()
             {
+                active.send(&ClientMessage::Resize { width, height })?;
+            }
+            continue;
+        }
+        if !editing || detach_sent {
+            continue;
+        }
+        let state = &remote_state.as_ref().unwrap().state;
+        let result = match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    let notice = if let Some(notice) = workbench.documents.closed_notice() {
+                        notice
+                    } else {
+                        detaching = true;
+                        "Synchronizing before detach…".into()
+                    };
+                    ui.notice = Some(notice);
+                    Ok(Vec::new())
+                } else if detaching && key.code == KeyCode::Esc {
+                    detaching = false;
+                    ui.notice = None;
+                    Ok(Vec::new())
+                } else {
+                    let Some(key) = encode_key(key) else { continue };
+                    workbench.key(&key, state, width)
+                }
+            }
+            Event::Paste(text) => workbench.paste(&text, state),
+            Event::Mouse(mouse) if terminal.mouse_capture() => {
                 let Some(kind) = ui
                     .clicks
                     .at(mouse.kind, mouse.column, mouse.row, Instant::now())
                 else {
                     continue;
                 };
-                let sequence = ledger.push(PendingInput::Mouse);
-                if let Some(active) = connection.active_mut() {
-                    active.send(&ClientMessage::Mouse {
-                        sequence,
-                        context_epoch: context_epoch
-                            .expect("attached clients have a context epoch"),
-                        mouse_context: frame.mouse_context,
-                        event: MouseEvent {
-                            kind,
-                            column: mouse.column,
-                            row: mouse.row,
-                        },
-                    })?;
-                }
+                workbench.mouse(
+                    &MouseEvent {
+                        kind,
+                        column: mouse.column,
+                        row: mouse.row,
+                    },
+                    state,
+                    width,
+                    height,
+                )
             }
-            Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    if let Some(active) = connection.active_mut() {
-                        active.send(&ClientMessage::Detach)?;
-                        let _ = active.poll();
-                    }
-                    return Ok(());
-                }
-                let cancel =
-                    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-                if (!connection.attached() && key.code == KeyCode::Esc)
-                    || ((!connection.attached() || !matches!(recovery, InputRecovery::Ready))
-                        && cancel)
-                {
-                    return Ok(());
-                }
-                if !synchronized {
-                    continue;
-                }
-                let active = connection.active_mut().unwrap();
-                match recovery {
-                    InputRecovery::ConfirmReplay { epoch } => {
-                        if key.code == KeyCode::Char('r')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            recovery = InputRecovery::Ready;
-                            for (_, input) in &ledger.pending {
-                                if let PendingInput::TrackedKey { request_id, .. } = input {
-                                    ledger.operations.insert(
-                                        *request_id,
-                                        PendingOperation {
-                                            server_instance: ledger
-                                                .server_instance
-                                                .clone()
-                                                .unwrap(),
-                                            action_id: None,
-                                            workspace_change: None,
-                                        },
-                                    );
-                                }
-                            }
-                            send_pending(
-                                active,
-                                &ledger.pending,
-                                epoch,
-                                ledger.server_instance.as_ref().unwrap(),
-                            )?;
-                        } else if key.code == KeyCode::Esc {
-                            if let Some((through, _)) = ledger.pending.back() {
-                                let through = *through;
-                                recovery = InputRecovery::AwaitSkip { epoch, through };
-                                active.send(&ClientMessage::Skip {
-                                    through,
-                                    context_epoch: epoch,
-                                })?;
-                            } else {
-                                recovery = InputRecovery::Ready;
-                            }
-                        }
-                        ui.dirty = true;
-                        continue;
-                    }
-                    InputRecovery::AwaitSkip { epoch, through } => {
-                        if key.code == KeyCode::Esc {
-                            active.send(&ClientMessage::Skip {
-                                through,
-                                context_epoch: epoch,
-                            })?;
-                        }
-                        continue;
-                    }
-                    InputRecovery::Ready => {}
-                }
-                let Some(key) = encode_key(key) else { continue };
-                let epoch = context_epoch.expect("attached clients have a context epoch");
-                let tracked = key == "Enter";
-                if tracked {
-                    let request_id = ledger.request_id()?;
-                    let server_instance = ledger.server_instance.clone().unwrap();
-                    let sequence = ledger.push(PendingInput::TrackedKey {
-                        key: key.clone(),
-                        request_id,
-                    });
-                    ledger.operations.insert(
-                        request_id,
-                        PendingOperation {
-                            server_instance: server_instance.clone(),
-                            action_id: None,
-                            workspace_change: None,
-                        },
-                    );
-                    active.send(&ClientMessage::TrackedInput {
-                        sequence,
-                        key,
-                        context_epoch: epoch,
-                        request_id,
-                        server_instance,
-                    })?;
-                } else {
-                    let sequence = ledger.push(PendingInput::Key(key.clone()));
-                    active.send(&ClientMessage::Input {
-                        sequence,
-                        key,
-                        context_epoch: epoch,
-                    })?;
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn send_pending(
-    connection: &mut Connection,
-    pending: &VecDeque<(u64, PendingInput)>,
-    context_epoch: u64,
-    server_instance: &ServerInstanceId,
-) -> Result<()> {
-    for (sequence, input) in pending {
-        let message = match input {
-            PendingInput::Key(key) => ClientMessage::Input {
-                sequence: *sequence,
-                key: key.clone(),
-                context_epoch,
-            },
-            PendingInput::TrackedKey { key, request_id } => ClientMessage::TrackedInput {
-                sequence: *sequence,
-                key: key.clone(),
-                request_id: *request_id,
-                server_instance: server_instance.clone(),
-                context_epoch,
-            },
-            PendingInput::Mouse => ClientMessage::Skip {
-                through: *sequence,
-                context_epoch,
-            },
+            _ => continue,
         };
-        connection.send(&message)?;
+        interaction = interaction.wrapping_add(1);
+        match result {
+            Ok(next) => {
+                for effect in next {
+                    if !synchronized && let workbench::Effect::Command(action) = &effect {
+                        let reason = "Workspace unavailable; command was not submitted";
+                        OperationCompletion::for_action(action)
+                            .not_submitted(&mut workbench, reason);
+                        ui.notice = Some(reason.into());
+                    } else {
+                        effects.push_back(effect);
+                    }
+                }
+            }
+            Err(error) => ui.notice = Some(format!("{error:#}")),
+        }
+        ui.dirty = true;
     }
-    Ok(())
-}
-
-fn recovery_notice() -> String {
-    "Session changed: Ctrl-r replay queued input here; Esc discard queued input".to_owned()
 }
 
 struct Click {
@@ -1439,6 +1942,44 @@ fn encode_key(event: KeyEvent) -> Option<String> {
     Some(key)
 }
 
+fn render_row(
+    stdout: &mut impl Write,
+    row: &FrameRow,
+    width: u16,
+    styles: &std::collections::HashMap<String, zess_ui::TextStyle>,
+) -> Result<()> {
+    let text = row
+        .spans
+        .iter()
+        .map(|span| sanitize(&span.text))
+        .collect::<Vec<_>>();
+    let (mut bytes, _) = fitting_prefix(text.iter().map(|text| text.as_ref()), usize::from(width));
+
+    for (span, text) in row.spans.iter().zip(text) {
+        if bytes == 0 {
+            break;
+        }
+        let visible = text.len().min(bytes);
+        if visible == 0 {
+            continue;
+        }
+
+        let resolve = |role: &str| style::resolve_in(role, styles);
+        let base = span.base_style.as_deref().map(resolve).unwrap_or_default();
+        style::apply(stdout, &base.patch(&resolve(&span.style)))?;
+        queue!(stdout, Print(&text[..visible]))?;
+        bytes -= visible;
+    }
+
+    queue!(stdout, SetAttribute(Attribute::Reset), ResetColor)?;
+    Ok(())
+}
+
+fn clip_to_width(text: &str, maximum: usize) -> (&str, usize) {
+    let (bytes, columns) = fitting_prefix(std::iter::once(text), maximum);
+    (&text[..bytes], columns)
+}
+
 fn render(
     stdout: &mut impl Write,
     frame: &Frame,
@@ -1478,10 +2019,9 @@ fn render(
                     Clear(ClearType::CurrentLine)
                 )?;
                 if on_prompt && notice.is_none() {
-                    queue!(stdout, Print(&visible_prompt))?;
+                    queue!(stdout, Print(visible_prompt))?;
                 } else {
-                    let pending = clip_to_width(&prompt, width as usize).0;
-                    let pending_width = UnicodeWidthStr::width(pending.as_str());
+                    let (pending, pending_width) = clip_to_width(&prompt, width as usize);
                     let message_width = if pending_width > 0 && notice.is_none() {
                         (width as usize).saturating_sub(pending_width + 1)
                     } else {
@@ -1532,68 +2072,4 @@ fn render(
             Ok(())
         })
         .context("flush terminal frame")?
-}
-
-fn render_row(
-    stdout: &mut impl Write,
-    row: &FrameRow,
-    width: u16,
-    styles: &std::collections::HashMap<String, zess_ui::TextStyle>,
-) -> Result<()> {
-    let mut remaining = width as usize;
-
-    for span in &row.spans {
-        if remaining == 0 {
-            break;
-        }
-
-        let resolve = |role: &str| style::resolve_in(role, styles);
-        let base = span.base_style.as_deref().map(resolve).unwrap_or_default();
-        style::apply(stdout, &base.patch(&resolve(&span.style)))?;
-        let (text, cells, truncated) = clip_to_width(&sanitize(&span.text), remaining);
-        queue!(stdout, Print(text))?;
-        remaining -= cells;
-        if truncated {
-            break;
-        }
-    }
-
-    queue!(stdout, SetAttribute(Attribute::Reset), ResetColor)?;
-    Ok(())
-}
-
-fn clip_to_width(text: &str, maximum: usize) -> (String, usize, bool) {
-    let mut output = String::new();
-    let mut cells = 0;
-
-    for grapheme in text.graphemes(true) {
-        let width = UnicodeWidthStr::width(grapheme);
-        if cells + width > maximum {
-            return (output, cells, true);
-        }
-
-        output.push_str(grapheme);
-        cells += width;
-    }
-
-    (output, cells, false)
-}
-
-fn sanitize(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-
-    for character in text.chars() {
-        match character {
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            '\u{1b}' => escaped.push_str("\\x1b"),
-            character if character.is_control() => {
-                escaped.push_str(&format!("\\u{{{:x}}}", character as u32));
-            }
-            character => escaped.push(character),
-        }
-    }
-
-    escaped
 }

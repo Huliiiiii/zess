@@ -83,32 +83,18 @@ impl<'a, 'session> ScratchEditor<'a, 'session> {
     }
 
     #[invariant(always_run)]
-    fn rendering_and_selections_stay_within_their_bounds(&mut self, _tc: TestCase) {
+    fn layout_and_selections_stay_within_their_bounds(&mut self, _tc: TestCase) {
         assert_editor_bounds(self.input, self.width, self.height);
     }
 }
 
 fn assert_editor_bounds(input: &mut Input<'_>, width: u16, height: u16) {
     assert!(!input.session.exiting());
-    let frame = input.session.frame();
-    assert_eq!((frame.width, frame.height), (width, height));
-    assert_eq!(frame.rows.len(), usize::from(height - 1));
-    for row in frame.rows {
-        let cells = row
-            .spans
-            .iter()
-            .map(|span| UnicodeWidthStr::width(span.text.as_str()))
-            .sum::<usize>();
-        assert!(
-            cells <= usize::from(width),
-            "row uses {cells} cells at width {width}"
-        );
-    }
-    if let Some((x, y)) = frame.cursor {
-        assert!(
-            x < width && y < height,
-            "cursor ({x}, {y}) outside {width}x{height}"
-        );
+    let snapshot = input.session.snapshot();
+    snapshot.validate().unwrap();
+    for area in snapshot.layout {
+        assert!(area.x + area.width <= usize::from(width), "{area:?}");
+        assert!(area.y + area.height < usize::from(height), "{area:?}");
     }
 
     let state = input.text_state();

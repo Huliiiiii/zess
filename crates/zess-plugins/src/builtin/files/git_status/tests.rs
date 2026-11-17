@@ -41,6 +41,7 @@ impl Fixture {
                 options: serde_json::Value::Null,
                 mode: "normal".into(),
                 selection: ItemSelection::default(),
+                view_selection: None,
                 register: None,
                 context: PluginContext::default(),
             },

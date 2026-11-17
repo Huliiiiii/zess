@@ -151,6 +151,250 @@ fn git_file_layers_stay_open_after_saving_until_explicitly_closed() {
     assert_eq!(panes(&session), layout);
 }
 
+#[cfg(unix)]
+fn files_save_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.0.join("dir")).unwrap();
+    fs::create_dir_all(fixture.0.join("other/dir")).unwrap();
+    std::os::unix::fs::symlink(&fixture.0, fixture.0.join("alias")).unwrap();
+    fixture
+}
+
+#[cfg(unix)]
+fn redirect_files_save_alias(fixture: &Fixture) {
+    assert_eq!(fs::read(fixture.0.join("dir/first")).unwrap(), b"");
+    let alias = fixture.0.join("alias");
+    fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(fixture.0.join("other"), alias).unwrap();
+}
+
+#[cfg(unix)]
+fn files_save_error(fixture: &Fixture) -> String {
+    let error = fs::File::create_new(fixture.0.join("dir/first")).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    error.to_string()
+}
+
+#[cfg(unix)]
+#[test]
+fn files_save_reports_partial_failure_and_retries_pending_page_operations() {
+    use zess_protocol::resource::{
+        PageCommandInput, PageId, PageInput, PageSource, ResourceRequest,
+    };
+    use zess_protocol::{CommandAction, CommandOutcome, CommandTarget};
+
+    for name in ["write", "write-quit"] {
+        let fixture = files_save_fixture();
+        let mut session = fixture.session(&[]);
+        let page_id = PageId {
+            context_epoch: 0,
+            sequence: 1,
+        };
+        let input = PageCommandInput {
+            generation: 1,
+            selection: Default::default(),
+            register: None,
+        };
+        session.handle_resource(ResourceRequest::Subscribe {
+            subscription_id: 1,
+            page_id,
+            clone_from: None,
+            source: PageSource {
+                kind: "files".into(),
+                argument: Value::Null,
+            },
+            input: PageInput {
+                generation: input.generation,
+                selection: input.selection.clone(),
+                register: None,
+                mode: "normal".into(),
+                filter: None,
+                source_buffer: None,
+                width: 40,
+                active: true,
+                preview_width: 40,
+                preview_height: 22,
+            },
+        });
+        for (completion, path) in [("first", "dir/first"), ("second", "alias/dir/first")] {
+            assert_eq!(
+                session.begin_operation(
+                    completion,
+                    &CommandAction::PagePrompt {
+                        subscription_id: 1,
+                        input: input.clone(),
+                        purpose: "create".into(),
+                        confirmation: None,
+                        text: path.into(),
+                        cancelled: false,
+                    },
+                ),
+                Some(CommandOutcome::Applied)
+            );
+        }
+        session.take_resource_updates();
+        let save = CommandAction::Invoke {
+            target: CommandTarget::Page {
+                subscription_id: 1,
+                input,
+            },
+            name: name.into(),
+            argument: Value::Null,
+        };
+        let outcome = session.begin_operation("save", &save);
+        let Some(CommandOutcome::Failed { message }) = outcome else {
+            panic!("{name}: expected filesystem error, got {outcome:?}");
+        };
+        assert_eq!(message, files_save_error(&fixture));
+        let updates = session.take_resource_updates();
+        let [update] = updates.as_slice() else {
+            panic!("expected one update for the partially saved page");
+        };
+        assert_eq!(update.output.modified, Some(true));
+        let display = update.output.display.as_ref().unwrap();
+        assert_eq!(display.status_data["files"]["pending_count"], 1);
+        assert!(
+            display
+                .rows
+                .iter()
+                .any(|row| row.id == "alias/dir/first" && row.text.ends_with("[new, unsaved]"))
+        );
+        assert!(
+            !display
+                .rows
+                .iter()
+                .any(|row| row.id == "dir/first" && row.text.ends_with("[new, unsaved]"))
+        );
+        assert!(!update.output.requests.iter().any(|request| {
+            matches!(
+                request,
+                HostRequest::Close
+                    | HostRequest::Navigate {
+                        navigation: zess_plugin::Navigation::Back,
+                    }
+            )
+        }));
+
+        redirect_files_save_alias(&fixture);
+        assert!(!fixture.0.join("alias/dir/first").exists());
+        let outcome = session.begin_operation("retry", &save);
+        if name == "write-quit" {
+            assert!(matches!(
+                outcome,
+                Some(CommandOutcome::PageApplied { page_id: page, navigation, .. })
+                    if page == page_id && navigation == [zess_plugin::Navigation::Back]
+            ));
+        } else {
+            assert_eq!(outcome, Some(CommandOutcome::Applied));
+        }
+        assert!(
+            session
+                .take_resource_updates()
+                .iter()
+                .any(|update| { update.output.modified == Some(false) })
+        );
+        assert_eq!(fs::read(fixture.0.join("dir/first")).unwrap(), b"");
+        assert_eq!(fs::read(fixture.0.join("alias/dir/first")).unwrap(), b"");
+    }
+}
+
+#[cfg(unix)]
+fn stage_legacy_files_save(fixture: &Fixture) -> Session {
+    let mut session = fixture.session(&[]);
+    session.command("files").unwrap();
+    settle(&mut session);
+    for path in ["dir/first", "alias/dir/first"] {
+        session.command("files.create").unwrap();
+        session
+            .execute_command("prompt.clear", Value::Null)
+            .unwrap();
+        session
+            .execute_command("prompt.insert-text", json!({"text": path}))
+            .unwrap();
+        session
+            .execute_command("prompt.submit", Value::Null)
+            .unwrap();
+    }
+    session
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_files_save_reports_the_filesystem_error_and_preserves_pending_operations() {
+    use zess_protocol::{CommandAction, CommandOutcome};
+
+    for command in ["w", "wq"] {
+        let fixture = files_save_fixture();
+        let mut session = stage_legacy_files_save(&fixture);
+        let files = session.views[&session.focus].location.buffer;
+        let save = CommandAction::CommandLine {
+            text: command.into(),
+        };
+        let outcome = session.begin_operation("save", &save);
+        assert_eq!(
+            outcome,
+            Some(CommandOutcome::Failed {
+                message: files_save_error(&fixture),
+            })
+        );
+        assert_eq!(session.views[&session.focus].location.buffer, files);
+        assert!(session.modified());
+
+        redirect_files_save_alias(&fixture);
+        assert_eq!(
+            session.begin_operation("retry", &save),
+            Some(CommandOutcome::Applied)
+        );
+        assert_eq!(fs::read(fixture.0.join("alias/dir/first")).unwrap(), b"");
+        assert_eq!(
+            session.views[&session.focus].location.buffer == files,
+            command == "w"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_files_save_returns_the_filesystem_error_and_preserves_pending_operations() {
+    for command in ["w", "wq"] {
+        let fixture = files_save_fixture();
+        let mut session = stage_legacy_files_save(&fixture);
+        let files = session.views[&session.focus].location.buffer;
+
+        let result = session.command(command);
+        let expected = files_save_error(&fixture);
+        assert_eq!(result.unwrap_err().to_string(), expected);
+        assert_eq!(session.views[&session.focus].location.buffer, files);
+        assert!(session.modified());
+
+        redirect_files_save_alias(&fixture);
+        session.command(command).unwrap();
+        assert_eq!(fs::read(fixture.0.join("alias/dir/first")).unwrap(), b"");
+        assert_eq!(
+            session.views[&session.focus].location.buffer == files,
+            command == "w"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn files_save_from_command_prompt_shows_the_filesystem_error_and_keeps_the_page_open() {
+    let fixture = files_save_fixture();
+    let mut session = stage_legacy_files_save(&fixture);
+    let files = session.views[&session.focus].location.buffer;
+
+    for key in [":", "w", "q", "Enter"] {
+        session.input(key);
+    }
+    assert_eq!(
+        session.message,
+        format!("error: {}", files_save_error(&fixture))
+    );
+    assert_eq!(session.views[&session.focus].location.buffer, files);
+    assert!(session.modified());
+}
+
 #[test]
 fn changes_show_only_the_diff_sides_present_in_the_selected_file() {
     for (staged, unstaged, expected) in [
@@ -376,7 +620,7 @@ fn staged_and_unstaged_diffs_are_visible_together_and_keep_the_focused_pane() {
     session.focus_view(staged).unwrap();
     for (width, columns) in [(241, false), (242, true), (80, false), (300, true)] {
         session.resize(width, 24);
-        session.frame();
+        session.snapshot();
         let layout = panes(&session);
         let (_, ax, ay, aw, ah) = layout
             .iter()
@@ -686,21 +930,24 @@ fn directory_preview_keeps_the_first_entry_when_the_contents_fit_after_resize() 
             false,
         )
         .unwrap();
-    session.frame();
+    session.snapshot();
     session
         .execute_command("preview.move-down", serde_json::json!({}))
         .unwrap();
     let target = session.preview_target(source).unwrap();
     assert_eq!(session.views[&target].location.scroll, 1);
     session.resize(80, 24);
+    let view = view_snapshot(&mut session, target);
+    assert_eq!(view.scroll, 0);
+    assert_eq!(item_rows(&view.content)[0].text, "child-0");
     for _ in 0..10 {
         session
             .execute_command("preview.move-down", serde_json::json!({}))
             .unwrap();
     }
     assert_eq!(session.views[&target].location.scroll, 0);
-    let (rows, _) = session.render_view(target, 39, 23);
-    assert_eq!(rows[0].spans[0].text, "child-0");
+    let view = view_snapshot(&mut session, target);
+    assert_eq!(item_rows(&view.content)[view.scroll].text, "child-0");
 }
 
 #[test]
@@ -725,7 +972,7 @@ fn rapid_file_navigation_keeps_the_previous_preview_until_the_latest_selection_l
     settle(&mut session);
     let source = session.focus;
     let target = session.active_preview(source).unwrap();
-    session.frame();
+    session.snapshot();
     session
         .execute_command("preview.move-down", serde_json::json!({}))
         .unwrap();

@@ -1,11 +1,14 @@
 use super::*;
-use zess_ui::{RenderContent, RenderPlan, RenderRow, RenderSpan};
 
 #[test]
-fn applying_a_delta_rebuilds_the_changed_text_and_cursor() {
-    fn snapshot(text: &str, cursor: u16) -> SessionSnapshot {
+fn applying_a_delta_updates_text_and_selection_together() {
+    fn snapshot(text: &str, cursor: usize) -> SessionSnapshot {
         SessionSnapshot {
             views: vec![ViewSnapshot {
+                text_metrics: None,
+                statusline: None,
+                options: None,
+                key_scopes: vec!["global".into(), "text".into()],
                 view_id: 1,
                 buffer_id: 2,
                 kind: "text".into(),
@@ -20,38 +23,37 @@ fn applying_a_delta_rebuilds_the_changed_text_and_cursor() {
                     lines: vec![VisibleTextLine {
                         line: 0,
                         first_char: 0,
+                        first_column: 0,
+                        end_of_line: true,
+                        highlights: vec![],
                         text: text.into(),
                     }],
                 },
-                selection: ViewSelection::None,
+                selection: ViewSelection::Text {
+                    ranges: vec![TextRange {
+                        anchor: cursor,
+                        head: cursor,
+                    }],
+                    primary: 0,
+                },
                 scroll: 0,
                 horizontal_scroll: 0,
-                status: Vec::new(),
             }],
-            render_plan: RenderPlan {
-                width: 80,
-                height: 24,
-                cursor: Some((cursor, 0)),
-                rows: vec![RenderRow {
-                    spans: vec![RenderSpan {
-                        base_style: None,
-                        style: "text".into(),
-                        content: RenderContent::Text {
-                            buffer_id: 2,
-                            start_char: 0,
-                            end_char: text.chars().count(),
-                        },
-                    }],
-                }],
-                ..RenderPlan::default()
-            },
             ..SessionSnapshot::default()
         }
     }
     let mut state = snapshot("old", 2);
     let next = snapshot("updated", 6);
     SessionDelta::between(&state, &next).apply(&mut state);
-    let frame = render_snapshot(&state).unwrap();
-    assert_eq!(frame.rows[0].spans[0].text, "updated");
-    assert_eq!(frame.cursor, Some((6, 0)));
+    let ViewContent::Text { lines } = &state.views[0].content else {
+        panic!("expected document text")
+    };
+    assert_eq!(lines[0].text, "updated");
+    assert_eq!(
+        state.views[0].selection,
+        ViewSelection::Text {
+            ranges: vec![TextRange { anchor: 6, head: 6 }],
+            primary: 0
+        }
+    );
 }

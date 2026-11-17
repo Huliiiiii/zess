@@ -1,7 +1,39 @@
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zess_ui::Span;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+use zess_ui::{Span, clip_spans, spans_width};
 
 use crate::{BufferId, ViewId};
+
+mod layout;
+mod render;
+pub use layout::{StatusConfig, StatusElement, StatusLayout};
+
+pub fn format_mode_label(label: &str, width: usize, active: bool) -> String {
+    let cells = label.width();
+    if width.saturating_sub(cells) >= 2 {
+        return if active {
+            format!(" {label} ")
+        } else {
+            " ".repeat(cells + 2)
+        };
+    }
+    let label = if cells > width {
+        label
+            .graphemes(true)
+            .next()
+            .filter(|first| first.width() <= width)
+            .unwrap_or_default()
+    } else {
+        label
+    };
+    if active {
+        label.into()
+    } else {
+        " ".repeat(label.width())
+    }
+}
 
 pub const DEFAULT_STATUS_FORMATS: &[(&str, &str)] = &[
     ("modified", " [+]"),
@@ -12,6 +44,7 @@ pub const DEFAULT_STATUS_FORMATS: &[(&str, &str)] = &[
     ("git-loading", "Loading changes…"),
     ("git-failed", "Could not load changes"),
     ("git-refreshing", "Refreshing…  "),
+    ("git-writing", "Git file operation is running…  "),
     ("git-unavailable", "Line counts unavailable"),
     ("git-added", "+{count}"),
     ("git-deleted", "-{count}"),
@@ -61,7 +94,7 @@ pub fn validate_status_formats(value: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatusContext {
     pub kind: String,
     pub title: String,
@@ -79,7 +112,8 @@ pub struct StatusContext {
     pub content: StatusContent,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StatusContent {
     #[default]
     None,
@@ -100,13 +134,54 @@ pub enum StatusContent {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StatusPosition {
     pub row: usize,
     pub column: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StatusLine {
     pub left: Vec<Span>,
     pub center: Vec<Span>,
     pub right: Vec<Span>,
+}
+
+impl StatusLine {
+    pub fn render(&self, width: usize, right_inset: usize, active: bool) -> Vec<Span> {
+        let style = if active { "status" } else { "status.inactive" };
+        let left_width = spans_width(&self.left).min(width);
+        let right_inset = right_inset.min(width.saturating_sub(left_width));
+        let width = width - right_inset;
+        let right_width = spans_width(&self.right).min(width.saturating_sub(left_width));
+        let center_width =
+            spans_width(&self.center).min(width.saturating_sub(left_width + right_width));
+        let center_start = ((width.saturating_sub(center_width)) / 2)
+            .max(left_width)
+            .min(width.saturating_sub(right_width + center_width));
+        let mut spans = clip_spans(self.left.clone(), left_width);
+        spans.push(Span {
+            base_style: None,
+            text: " ".repeat(center_start - left_width),
+            style: String::new(),
+        });
+        spans.extend(clip_spans(self.center.clone(), center_width));
+        spans.push(Span {
+            base_style: None,
+            text: " ".repeat(width - right_width - center_start - center_width),
+            style: String::new(),
+        });
+        spans.extend(clip_spans(self.right.clone(), right_width));
+        if right_inset > 0 {
+            spans.push(Span {
+                base_style: None,
+                text: " ".repeat(right_inset),
+                style: String::new(),
+            });
+        }
+        for span in &mut spans {
+            span.base_style = Some(style.into());
+        }
+        spans
+    }
 }

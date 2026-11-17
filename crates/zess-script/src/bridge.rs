@@ -66,6 +66,12 @@ impl Custom for Context {}
 pub(super) fn register(engine: &mut Engine) {
     let mut module = BuiltInModule::new("zess/native");
     module.register_fn("%status-spans", status::spans);
+    module.register_fn(
+        "%format-mode-label",
+        |label: String, width: Option<usize>, active: bool| {
+            zess_plugin::format_mode_label(&label, width.unwrap_or(usize::MAX), active)
+        },
+    );
     module.register_fn("%status-format-defaults", || {
         Json(
             zess_plugin::DEFAULT_STATUS_FORMATS
@@ -374,6 +380,7 @@ pub(super) fn register(engine: &mut Engine) {
                 purpose,
                 text,
                 key_scope,
+                confirmation: None,
             })
         },
     );

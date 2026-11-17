@@ -755,7 +755,8 @@ fn leaving_cancels_an_unconfirmed_discard() {
         OperationResult::Cancelled
     ));
     input.event = "layer_result".into();
-    input.argument = json!({"purpose": purpose, "text": "yes"});
+    input.argument =
+        json!({"purpose": purpose, "confirmation": "discard-operation", "text": "yes"});
     let Err(error) = git.update(&input) else {
         panic!("expected an expired confirmation");
     };
@@ -1273,13 +1274,13 @@ fn opening_a_historical_file_reports_completion_with_the_loaded_snapshot() {
     );
     assert!(matches!(
         output.completed_operations[0].result,
-        OperationResult::Completed
+        OperationResult::DocumentOpened
     ));
     assert!(output.requests.iter().any(|request| matches!(request, HostRequest::OpenSnapshot { snapshot, .. } if snapshot.text == "committed\n")));
 }
 
 #[test]
-fn write_completions_are_separate_from_yank_requests() {
+fn pending_writes_and_yanks_keep_their_own_results() {
     let workspace = Workspace::new();
     fs::write(workspace.0.join("file"), "worktree\n").unwrap();
     let mut git = workspace.plugin();
@@ -1338,10 +1339,12 @@ fn write_completions_are_separate_from_yank_requests() {
                 .any(|completion| completion.operation_id == "yank-operation")
         })
         .unwrap();
-    assert_eq!(yank.completed_operations.len(), 1);
-    assert!(
-        matches!(yank.requests.as_slice(), [HostRequest::Yank { values, .. }] if values == &["file"])
-    );
+    assert!(matches!(
+        yank.completed_operations.as_slice(),
+        [OperationCompletion { result: OperationResult::Yanked { values, register: '+' }, .. }]
+            if values == &["file"]
+    ));
+    assert!(yank.requests.is_empty());
     assert!(git.poll_operations().is_empty());
 }
 
@@ -1401,7 +1404,7 @@ fn replacing_a_snapshot_keeps_the_cancelled_operation_separate_from_the_new_open
     assert_eq!(output.completed_operations[0].operation_id, "new-snapshot");
     assert!(matches!(
         output.completed_operations[0].result,
-        OperationResult::Completed
+        OperationResult::DocumentOpened
     ));
     assert!(output.requests.iter().any(|request| matches!(request, HostRequest::OpenSnapshot { snapshot, .. } if snapshot.text == "committed\n")));
     assert!(git.poll_operations().is_empty());

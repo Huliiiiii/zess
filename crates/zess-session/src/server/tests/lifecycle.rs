@@ -1,3 +1,6 @@
+mod documents;
+mod page_effects;
+
 use super::*;
 use zess_protocol::ClientExitDisposition;
 
@@ -155,7 +158,6 @@ fn attaching_to_a_different_session_does_not_open_files() {
             width: 80,
             height: 24,
             files: vec![server.root.join("new-file").to_string_lossy().into_owned()],
-            context_epoch: None,
         },
     )
     .unwrap();
@@ -181,7 +183,6 @@ fn attaching_to_a_different_session_does_not_open_files() {
             width: 80,
             height: 24,
             files: vec![],
-            context_epoch: None,
         },
     )
     .unwrap();
@@ -197,6 +198,95 @@ fn attaching_to_a_different_session_does_not_open_files() {
         state.buffers[0].kind,
         zess_protocol::BufferKind::Text { path: None }
     ));
+}
+
+#[test]
+fn a_new_terminal_recovers_the_last_confirmed_workspace_view() {
+    use zess_protocol::workspace_view::{
+        Axis, DocumentPanes, DocumentView, DocumentViewState, WorkspaceDraft, WorkspaceView,
+    };
+
+    let server = Server::start("stop-if-unused");
+    let attach = |client: &str| {
+        let (mut stream, mut reader) = server.connect();
+        hello(&mut stream, &mut reader);
+        framing::write(
+            &mut stream,
+            &ClientMessage::Attach {
+                expected_session: None,
+                client_id: client.to_owned(),
+                width: 80,
+                height: 24,
+                files: vec![],
+            },
+        )
+        .unwrap();
+        let ServerMessage::Attached { workspace_view, .. } = receive(&mut reader) else {
+            panic!("attachment expected")
+        };
+        let ServerMessage::Snapshot { state, .. } = receive(&mut reader) else {
+            panic!("snapshot expected")
+        };
+        (stream, reader, workspace_view, state)
+    };
+    let (mut first, mut reader, saved, state) = attach("first");
+    assert!(saved.is_none());
+    let buffer_id = state.workspace.current.unwrap();
+    let mut text_panes = DocumentPanes::new(state.focused_view.unwrap(), buffer_id);
+    let (_, pane) = text_panes.split(Axis::Vertical);
+    let view = WorkspaceView {
+        text_panes: Some(text_panes),
+        documents: vec![DocumentView {
+            buffer_id,
+            view_id: pane.view_id,
+            state: DocumentViewState {
+                ranges: vec![zess_protocol::TextRange { anchor: 0, head: 0 }],
+                primary: 0,
+                mode: "insert".into(),
+                scroll: 0,
+                horizontal_scroll: 0,
+            },
+        }],
+        draft: Some(WorkspaceDraft {
+            purpose: "commit-message".into(),
+            text: "界".repeat(MAX_INPUT_BYTES / 3 + 1),
+            inline: false,
+            position: DocumentViewState {
+                ranges: vec![zess_protocol::TextRange { anchor: 0, head: 0 }],
+                primary: 0,
+                mode: "insert".into(),
+                scroll: 0,
+                horizontal_scroll: 0,
+            },
+        }),
+        ..Default::default()
+    };
+    let message = ClientMessage::SaveWorkspaceView { view: view.clone() };
+    let json = serde_json::to_string(&message).unwrap();
+    assert!(json.len() > MAX_INPUT_BYTES);
+    for (part, last) in zess_protocol::chunks::json_parts(&json, MAX_INPUT_BYTES) {
+        let frame = framing::encode(&ClientMessage::Chunk {
+            json: part.into(),
+            last,
+        })
+        .unwrap();
+        assert!(frame.len() <= MAX_INPUT_BYTES);
+        first.write_all(&frame).unwrap();
+    }
+    framing::write(&mut first, &ClientMessage::Detach).unwrap();
+    loop {
+        if matches!(receive(&mut reader), ServerMessage::WorkspaceViewSaved) {
+            break;
+        }
+    }
+    assert!(matches!(
+        receive(&mut reader),
+        ServerMessage::Detached {
+            disposition: ClientExitDisposition::Retained
+        }
+    ));
+    let (_, _, restored, _) = attach("second");
+    assert_eq!(restored.as_ref(), Some(&view));
 }
 
 #[test]
@@ -216,7 +306,6 @@ fn normal_quit_reports_whether_the_session_will_stop() {
                 width: 80,
                 height: 24,
                 files: vec![],
-                context_epoch: None,
             },
         )
         .unwrap();
@@ -278,6 +367,112 @@ fn normal_quit_reports_whether_the_session_will_stop() {
                     ..
                 }
             ));
+        }
+    }
+}
+
+#[test]
+fn file_page_updates_follow_the_subscribed_selection() {
+    use zess_plugin::{HostRequest, ItemNavigation, ItemSelection, PreviewContent, PreviewPane};
+    use zess_protocol::resource::{PageInput, PageSource, ResourceEvent, ResourceRequest};
+
+    let server = Server::start("keep");
+    fs::write(server.root.join("first.txt"), "first document").unwrap();
+    fs::write(server.root.join("second.txt"), "second document").unwrap();
+    let (mut stream, mut reader) = server.connect();
+    hello(&mut stream, &mut reader);
+    framing::write(
+        &mut stream,
+        &ClientMessage::Attach {
+            expected_session: None,
+            client_id: "files-client".into(),
+            width: 80,
+            height: 24,
+            files: vec![],
+        },
+    )
+    .unwrap();
+    while !matches!(receive(&mut reader), ServerMessage::Snapshot { .. }) {}
+    let mut input = PageInput {
+        generation: 1,
+        selection: ItemSelection::default(),
+        mode: "normal".into(),
+        filter: None,
+        register: None,
+        source_buffer: None,
+        width: 40,
+        active: true,
+        preview_width: 39,
+        preview_height: 22,
+    };
+    framing::write(
+        &mut stream,
+        &ClientMessage::Resource {
+            request: ResourceRequest::Subscribe {
+                subscription_id: 8,
+                page_id: zess_protocol::resource::PageId {
+                    context_epoch: 0,
+                    sequence: 8,
+                },
+                clone_from: None,
+                source: PageSource {
+                    kind: "files".into(),
+                    argument: serde_json::json!({}),
+                },
+                input: input.clone(),
+            },
+        },
+    )
+    .unwrap();
+    loop {
+        let ServerMessage::Resource { update } = receive(&mut reader) else {
+            continue;
+        };
+        if update.subscription_id == 8
+            && update.generation == 1
+            && update
+                .output
+                .display
+                .is_some_and(|display| display.rows.iter().any(|row| row.id == "second.txt"))
+        {
+            break;
+        }
+    }
+    input.generation = 2;
+    input.selection = ItemSelection {
+        primary: Some("second.txt".into()),
+        anchor: Some("second.txt".into()),
+        selected: vec!["second.txt".into()],
+    };
+    framing::write(
+        &mut stream,
+        &ClientMessage::Resource {
+            request: ResourceRequest::Update {
+                subscription_id: 8,
+                input,
+                event: ResourceEvent::Select {
+                    navigation: ItemNavigation::Step,
+                },
+            },
+        },
+    )
+    .unwrap();
+    loop {
+        let ServerMessage::Resource { update } = receive(&mut reader) else {
+            continue;
+        };
+        if update.subscription_id == 8
+            && update.generation == 2
+            && update.output.requests.iter().any(|request| {
+                matches!(request,
+                    HostRequest::PreviewGroup { panes, .. }
+                        if panes.iter().any(|pane| matches!(pane, PreviewPane::Surface {
+                            path, content: PreviewContent::Text { text }, ..
+                        } if path == "second.txt" && text == "second document"))
+                )
+            })
+        {
+            break;
         }
     }
 }

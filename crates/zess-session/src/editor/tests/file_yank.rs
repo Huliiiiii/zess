@@ -253,49 +253,6 @@ fn a_failed_command_discards_the_selected_register() {
 }
 
 #[test]
-fn clicking_the_same_view_discards_the_register_prefix() {
-    use zess_ui::{MouseEvent, MouseKind};
-
-    let fixture = Fixture::new();
-    fs::write(fixture.0.join("note.txt"), "content").unwrap();
-    let mut session = fixture.session(&[]);
-    for keys in [&["3", "\""][..], &["3", "\"", "*"][..]] {
-        session.command("files").unwrap();
-        settle(&mut session);
-        for key in keys {
-            session.input(key);
-        }
-        let frame = session.frame();
-        let region = session
-            .mouse_regions
-            .iter()
-            .find(|region| region.target == RenderTarget::View(session.focus))
-            .unwrap();
-        session.mouse(
-            frame.mouse_context,
-            MouseEvent {
-                kind: MouseKind::Press,
-                column: region.body.x as u16,
-                row: region.body.y as u16,
-            },
-        );
-        assert!(session.command_count().is_empty());
-        for key in ["y", "p"] {
-            session.input(key);
-        }
-        let mut clipboard = Vec::new();
-        session.flush_clipboard_writes(|text| {
-            clipboard.push(text);
-            Ok(())
-        });
-        assert_eq!(clipboard, ["note.txt"]);
-        assert!(
-            !session.flush_primary_clipboard_writes(|_| panic!("click retained primary register"))
-        );
-    }
-}
-
-#[test]
 fn content_yanks_copy_all_selected_files_to_the_system_clipboard() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join("a.txt"), "first").unwrap();

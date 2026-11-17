@@ -4,8 +4,13 @@ pub use identity::{BufferKindId, IdentityRegistry, KeyScopeId, ModeId};
 mod command;
 pub use command::{CommandCatalog, CommandImplementation, CommandInfo, CommandLineEntry};
 
+pub mod command_menu;
+
 mod keymap;
 pub use keymap::{KeyResolution, KeyState, Keymap, ResolvedBinding};
+
+mod bindings;
+pub use bindings::{BindingCatalog, BindingCommand};
 
 mod registry;
 pub use registry::{BufferBackend, ModeRegistration, Registry};
@@ -16,10 +21,16 @@ pub use buffer::{
     PluginContext, PluginInput, PluginOutput, QueryWatch, SelectionChange, TextContext,
 };
 
+mod file_tree;
+pub use file_tree::{
+    FileTree, FileTreeDirectory, FileTreeKey, FileTreeListing, FileTreeRow, file_tree_disclosure,
+    file_tree_parent, set_file_tree_expanded,
+};
+
 mod host;
 pub use host::{
-    FileSnapshot, HostRequest, Navigation, PreviewArea, PreviewContent, PreviewLayout, PreviewPane,
-    SnapshotId, SnapshotPresentation, validate_register_write,
+    FileSnapshot, HostRequest, Navigation, PageNavigationSource, PreviewArea, PreviewContent,
+    PreviewLayout, PreviewPane, SnapshotId, SnapshotPresentation, validate_register_write,
 };
 
 mod options;
@@ -27,8 +38,9 @@ pub use options::{DEFAULT_PREVIEW_DEBOUNCE, EditorOptions, OnClientExit};
 
 mod status;
 pub use status::{
-    DEFAULT_STATUS_FORMATS, StatusContent, StatusContext, StatusLine, StatusPosition,
-    default_status_text, validate_status_formats,
+    DEFAULT_STATUS_FORMATS, StatusConfig, StatusContent, StatusContext, StatusElement,
+    StatusLayout, StatusLine, StatusPosition, default_status_text, format_mode_label,
+    validate_status_formats,
 };
 
 mod count;

@@ -98,13 +98,8 @@ const exploration = explore([
     reached: (state) => body(state, "ZXbcdef") && !prompt(state, ":help"),
   },
   {
-    name: "fuzzy-candidate-selected",
-    action: text(":hlp"),
-    reached: (state) => prompt(state, ":hlp") && selectedHelpCandidate(state),
-  },
-  {
     name: "enter-executes-selected-candidate",
-    action: text("\r"),
+    action: text(":hlp\r"),
     reached: (state) => exactRow(state, "Help: Text"),
   },
   {
@@ -155,8 +150,20 @@ const exploration = explore([
       body(state, "ZAFTER") && fileStatus(state, "register-output.txt"),
   },
   {
-    name: "closed-normally",
+    name: "closing-saved-buffer-returns-to-origin",
+    action: text(":quit\r"),
+    reached: (state) =>
+      body(state, "ZXbcdef") && fileStatus(state, "origin.txt"),
+  },
+  {
+    name: "closing-origin-returns-to-scratch",
     action: text(":q\r"),
+    reached: (state) =>
+      body(state, "") && fileStatus(state, "[scratch]"),
+  },
+  {
+    name: "closed-normally",
+    action: text(":quit\r"),
     reached: (state) => state.exitStatus?.code === 0,
   },
 ]);

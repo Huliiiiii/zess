@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
 
-use crate::DisplayRow;
+use crate::{DisplayRow, rows::spans_width};
 
 #[cfg(test)]
 mod tests;
@@ -52,12 +52,7 @@ impl RowColumns {
                 .cell_widths
                 .resize(group.cell_widths.len().max(row.cells.len()), 0);
             for (width, cell) in group.cell_widths.iter_mut().zip(&row.cells) {
-                *width = (*width).max(
-                    cell.spans
-                        .iter()
-                        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
-                        .sum(),
-                );
+                *width = (*width).max(spans_width(&cell.spans));
             }
         }
         columns

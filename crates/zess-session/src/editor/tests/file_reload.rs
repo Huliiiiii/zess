@@ -159,14 +159,15 @@ fn saving_a_stale_file_layer_preserves_the_other_buffers_write() {
     let Buffer::Text(text) = &session.buffers[&buffer_id] else {
         unreachable!()
     };
-    let version = text.version();
-    assert_eq!(
+    let version = text.document_version();
+    assert!(matches!(
         session.begin_operation(
             "save-original",
             &zess_protocol::CommandAction::Save { buffer_id, version },
         ),
-        Some(zess_protocol::CommandOutcome::Saved { buffer_id, version })
-    );
+        Some(zess_protocol::CommandOutcome::Saved { buffer_id: saved_buffer, version: saved })
+            if saved_buffer == buffer_id && saved > version
+    ));
 
     let error = session.command("w").unwrap_err();
     assert!(format!("{error:#}").contains("file changed on disk"));
@@ -215,16 +216,10 @@ fn hidden_files_continue_observing_external_changes() {
     session.command(&format!("buffer {buffer}")).unwrap();
     let view = session.focus;
     assert_eq!(session.views[&view].location.buffer, buffer);
-    let (rows, _) = session.render_view(view, 80, 24);
-    assert_eq!(
-        rows[0]
-            .spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>()
-            .trim(),
-        "1 external"
-    );
+    let snapshot = view_snapshot(&mut session, view);
+    let line = &text_lines(&snapshot.content)[0];
+    assert_eq!(line.line, 0);
+    assert_eq!(line.text, "external\n");
 }
 
 #[test]

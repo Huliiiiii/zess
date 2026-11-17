@@ -283,24 +283,29 @@ impl BuiltinPlugins {
             "files",
             "toggle_ignored",
         );
-        for (kind, description) in [
-            ("git", "Read diff"),
-            ("git-history", "Browse commit files"),
-            ("git-commit-files", "Read historical diff"),
+        for (source, description) in [
+            (git::Page::Changes, "Read diff"),
+            (git::Page::History, "Browse commit files"),
+            (git::Page::CommitFiles, "Read historical diff"),
         ] {
+            let kind = source.kind();
             for (direction, key) in [("previous", "["), ("next", "]")] {
                 let command = format!("{kind}.page-{direction}");
-                registry.buffer_command(&command, "Switch Git page", kind, "page");
+                registry.command(
+                    &command,
+                    "Switch Git page",
+                    source.tab_request(source.other_tab()),
+                );
                 for mode in ["normal", "select"] {
                     registry.binding(kind, mode, &["C-w", key], &command);
                 }
             }
             for (page, key, description) in [
-                ("changes", "1", "Browse changes"),
-                ("history", "2", "Browse history"),
+                (git::Page::Changes, "1", "Browse changes"),
+                (git::Page::History, "2", "Browse history"),
             ] {
-                let command = format!("{kind}.page-{page}");
-                registry.buffer_command(&command, description, kind, &format!("page-{page}"));
+                let command = source.tab_command(page);
+                registry.command(&command, description, source.tab_request(page));
                 for mode in ["normal", "select"] {
                     registry.binding(kind, mode, &["C-w", key], &command);
                 }

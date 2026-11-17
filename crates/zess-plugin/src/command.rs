@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::HostRequest;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommandInfo {
     pub id: String,
     pub description: String,
     pub command_line: Option<CommandLineEntry>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommandLineEntry {
     pub name: String,
     pub aliases: Vec<String>,
@@ -21,7 +25,7 @@ pub enum CommandImplementation<H> {
     BufferEvent { kind: String, event: String },
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CommandCatalog {
     commands: BTreeMap<String, CommandInfo>,
     aliases: BTreeMap<String, String>,

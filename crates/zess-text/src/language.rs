@@ -44,30 +44,80 @@ pub trait SyntaxProvider: Send + Sync {
     fn scopes(&self) -> Arc<Vec<String>>;
 }
 
-pub(crate) fn default_provider() -> Arc<dyn SyntaxProvider> {
+pub(crate) fn default_provider() -> Arc<HelixSyntaxProvider> {
     static PROVIDER: OnceLock<Arc<HelixSyntaxProvider>> = OnceLock::new();
     PROVIDER
         .get_or_init(|| Arc::new(HelixSyntaxProvider::default()))
         .clone()
 }
 
+struct SyntaxEdits {
+    old: Rope,
+    changes: Vec<ChangeSet>,
+}
+
+impl SyntaxEdits {
+    fn new(old: &Rope, changes: &ChangeSet) -> Self {
+        Self {
+            old: old.clone(),
+            changes: vec![changes.clone()],
+        }
+    }
+}
+
+enum ParseWork {
+    Full,
+    Incremental { syntax: Syntax, edits: SyntaxEdits },
+}
+
+impl ParseWork {
+    fn run(
+        self,
+        provider: &dyn SyntaxProvider,
+        language: Language,
+        rope: &Rope,
+    ) -> Result<Syntax, String> {
+        match self {
+            Self::Full => provider.parse(rope, language),
+            Self::Incremental { mut syntax, edits } => {
+                let changes = edits
+                    .changes
+                    .into_iter()
+                    .reduce(ChangeSet::compose)
+                    .unwrap();
+                provider.update(&mut syntax, &edits.old, rope, &changes)?;
+                Ok(syntax)
+            }
+        }
+    }
+}
+
 enum SyntaxState {
-    Pending,
-    BackgroundPending,
-    Background {
+    Dormant,
+    Pending(ParseWork),
+    Running {
         result: Receiver<Result<Syntax, String>>,
         _subscription: Arc<()>,
+        edits: Option<SyntaxEdits>,
     },
     Ready(Syntax),
-    BackgroundReady(Syntax),
     Unavailable(String),
-    BackgroundUnavailable(String),
+}
+
+impl From<Result<Syntax, String>> for SyntaxState {
+    fn from(result: Result<Syntax, String>) -> Self {
+        match result {
+            Ok(syntax) => Self::Ready(syntax),
+            Err(error) => Self::Unavailable(error),
+        }
+    }
 }
 
 struct ParseRequest {
     provider: Arc<dyn SyntaxProvider>,
     language: Language,
     rope: Rope,
+    work: ParseWork,
     result: mpsc::Sender<Result<Syntax, String>>,
     subscription: Weak<()>,
 }
@@ -78,17 +128,21 @@ fn parser() -> Result<&'static SyncSender<ParseRequest>, String> {
         .get_or_init(|| {
             let (sender, receiver) = mpsc::sync_channel::<ParseRequest>(4);
             thread::Builder::new()
-                .name("zess-preview-syntax".into())
+                .name("zess-syntax".into())
                 .spawn(move || {
                     for request in receiver {
                         if request.subscription.strong_count() == 0 {
                             continue;
                         }
-                        let syntax = request.provider.parse(&request.rope, request.language);
+                        let syntax = request.work.run(
+                            request.provider.as_ref(),
+                            request.language,
+                            &request.rope,
+                        );
                         let _ = request.result.send(syntax);
                     }
                 })
-                .map_err(|error| format!("cannot start preview parser: {error}"))?;
+                .map_err(|error| format!("cannot start syntax parser: {error}"))?;
             Ok(sender)
         })
         .as_ref()
@@ -107,7 +161,7 @@ impl LanguageAttachment {
         Self {
             provider,
             language,
-            syntax: SyntaxState::Pending,
+            syntax: SyntaxState::Dormant,
             outline: None,
         }
     }
@@ -131,98 +185,144 @@ impl LanguageAttachment {
 
     pub(crate) fn error(&self) -> Option<&str> {
         match &self.syntax {
-            SyntaxState::Unavailable(error) | SyntaxState::BackgroundUnavailable(error) => {
-                Some(error)
-            }
+            SyntaxState::Unavailable(error) => Some(error),
             _ => None,
         }
     }
 
-    pub(crate) fn start_background(&mut self, rope: &Rope) {
-        self.syntax = SyntaxState::BackgroundPending;
-        self.poll(rope);
+    pub(crate) fn request(&mut self) {
+        if matches!(self.syntax, SyntaxState::Dormant) {
+            self.syntax = SyntaxState::Pending(ParseWork::Full);
+        }
     }
 
-    pub(crate) fn poll(&mut self, rope: &Rope) -> bool {
-        if matches!(self.syntax, SyntaxState::BackgroundPending) {
-            let sender = match parser() {
-                Ok(sender) => sender,
-                Err(error) => {
-                    self.syntax = SyntaxState::BackgroundUnavailable(error);
-                    return true;
-                }
-            };
-            let (result, receiver) = mpsc::channel();
-            let subscription = Arc::new(());
-            match sender.try_send(ParseRequest {
-                provider: self.provider.clone(),
-                language: self.language,
-                rope: rope.clone(),
-                result,
-                subscription: Arc::downgrade(&subscription),
-            }) {
-                Ok(()) => {
-                    self.syntax = SyntaxState::Background {
-                        result: receiver,
-                        _subscription: subscription,
-                    };
-                }
-                Err(TrySendError::Full(_)) => return false,
-                Err(TrySendError::Disconnected(_)) => {
-                    self.syntax =
-                        SyntaxState::BackgroundUnavailable("preview parser stopped".into());
-                    return true;
-                }
-            }
-        }
-        let SyntaxState::Background { result, .. } = &self.syntax else {
+    pub(crate) fn finished(&self) -> bool {
+        matches!(
+            self.syntax,
+            SyntaxState::Ready(_) | SyntaxState::Unavailable(_)
+        )
+    }
+
+    fn receive(&mut self) -> bool {
+        let SyntaxState::Running { result, edits, .. } = &mut self.syntax else {
             return false;
         };
-        self.syntax = match result.try_recv() {
-            Ok(Ok(syntax)) => SyntaxState::BackgroundReady(syntax),
-            Ok(Err(error)) => SyntaxState::BackgroundUnavailable(error),
+        let result = match result.try_recv() {
+            Ok(result) => result,
             Err(TryRecvError::Empty) => return false,
-            Err(TryRecvError::Disconnected) => {
-                SyntaxState::BackgroundUnavailable("preview parser stopped without a result".into())
-            }
+            Err(TryRecvError::Disconnected) => Err("syntax parser stopped without a result".into()),
         };
-        self.outline = None;
+
+        if let Some(edits) = edits.take() {
+            self.syntax = SyntaxState::Pending(result.map_or(ParseWork::Full, |syntax| {
+                ParseWork::Incremental { syntax, edits }
+            }));
+            return false;
+        }
+
+        self.syntax = result.into();
         true
     }
 
-    pub(crate) fn syntax(&mut self, rope: &Rope) -> Option<&Syntax> {
-        self.poll(rope);
-        if matches!(self.syntax, SyntaxState::Pending) {
-            self.syntax = match self.provider.parse(rope, self.language) {
-                Ok(syntax) => SyntaxState::Ready(syntax),
-                Err(error) => SyntaxState::Unavailable(error),
-            };
+    pub(crate) fn poll(&mut self, rope: &Rope) -> bool {
+        if self.receive() {
+            return true;
         }
+        if !matches!(self.syntax, SyntaxState::Pending(_)) {
+            return false;
+        }
+
+        let sender = match parser() {
+            Ok(sender) => sender,
+            Err(error) => {
+                self.syntax = SyntaxState::Unavailable(error);
+                return true;
+            }
+        };
+        let SyntaxState::Pending(work) =
+            std::mem::replace(&mut self.syntax, SyntaxState::Pending(ParseWork::Full))
+        else {
+            unreachable!()
+        };
+        let (result, receiver) = mpsc::channel();
+        let subscription = Arc::new(());
+        match sender.try_send(ParseRequest {
+            provider: self.provider.clone(),
+            language: self.language,
+            rope: rope.clone(),
+            work,
+            result,
+            subscription: Arc::downgrade(&subscription),
+        }) {
+            Ok(()) => {
+                self.syntax = SyntaxState::Running {
+                    result: receiver,
+                    _subscription: subscription,
+                    edits: None,
+                };
+                false
+            }
+            Err(TrySendError::Full(request)) => {
+                self.syntax = SyntaxState::Pending(request.work);
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.syntax = SyntaxState::Unavailable("syntax parser stopped".into());
+                true
+            }
+        }
+    }
+
+    fn ready_syntax(&self) -> Option<&Syntax> {
         match &self.syntax {
-            SyntaxState::Ready(syntax) | SyntaxState::BackgroundReady(syntax) => Some(syntax),
+            SyntaxState::Ready(syntax) => Some(syntax),
             _ => None,
         }
     }
 
-    pub(crate) fn update(&mut self, old: &Rope, new: &Rope, changes: &ChangeSet) {
+    /// Explicit syntax-dependent commands need the current tree to finish the operation.
+    pub(crate) fn syntax_for_command(&mut self, rope: &Rope) -> Option<&Syntax> {
+        self.receive();
+        if !self.finished() {
+            let work =
+                match std::mem::replace(&mut self.syntax, SyntaxState::Pending(ParseWork::Full)) {
+                    SyntaxState::Pending(work) => work,
+                    SyntaxState::Dormant | SyntaxState::Running { .. } => ParseWork::Full,
+                    _ => unreachable!(),
+                };
+            self.syntax = work.run(self.provider.as_ref(), self.language, rope).into();
+        }
+        self.ready_syntax()
+    }
+
+    pub(crate) fn update(&mut self, old: &Rope, changes: &ChangeSet) {
         if changes.is_empty() {
             return;
         }
         self.outline = None;
-        if matches!(
-            self.syntax,
-            SyntaxState::BackgroundPending
-                | SyntaxState::Background { .. }
-                | SyntaxState::BackgroundReady(_)
-                | SyntaxState::BackgroundUnavailable(_)
-        ) {
-            self.start_background(new);
-            return;
-        }
-        if let SyntaxState::Ready(syntax) = &mut self.syntax
-            && let Err(error) = self.provider.update(syntax, old, new, changes)
-        {
-            self.syntax = SyntaxState::Unavailable(error.to_string());
+        match &mut self.syntax {
+            SyntaxState::Dormant | SyntaxState::Pending(ParseWork::Full) => {}
+            SyntaxState::Pending(ParseWork::Incremental { edits, .. }) => {
+                edits.changes.push(changes.clone());
+            }
+            SyntaxState::Running { edits, .. } => match edits {
+                Some(edits) => edits.changes.push(changes.clone()),
+                None => *edits = Some(SyntaxEdits::new(old, changes)),
+            },
+            SyntaxState::Ready(_) => {
+                let SyntaxState::Ready(syntax) =
+                    std::mem::replace(&mut self.syntax, SyntaxState::Pending(ParseWork::Full))
+                else {
+                    unreachable!()
+                };
+                self.syntax = SyntaxState::Pending(ParseWork::Incremental {
+                    syntax,
+                    edits: SyntaxEdits::new(old, changes),
+                });
+            }
+            SyntaxState::Unavailable(_) => {
+                self.syntax = SyntaxState::Pending(ParseWork::Full);
+            }
         }
     }
 
@@ -235,9 +335,10 @@ impl LanguageAttachment {
         rope: &Rope,
         range: Range<usize>,
     ) -> Vec<(Range<usize>, usize)> {
-        let provider = self.provider.clone();
-        self.syntax(rope)
-            .map_or_else(Vec::new, |syntax| provider.highlights(syntax, rope, range))
+        self.request();
+        self.ready_syntax().map_or_else(Vec::new, |syntax| {
+            self.provider.highlights(syntax, rope, range)
+        })
     }
 
     pub(crate) fn outline(&mut self, rope: &Rope) -> Vec<OutlineSymbol> {
@@ -246,7 +347,7 @@ impl LanguageAttachment {
         }
         let provider = self.provider.clone();
         let symbols = self
-            .syntax(rope)
+            .syntax_for_command(rope)
             .map_or_else(Vec::new, |syntax| provider.outline(syntax, rope));
         self.outline = Some(symbols.clone());
         symbols

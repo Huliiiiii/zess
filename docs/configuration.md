@@ -67,6 +67,6 @@ SSH 地址接受 `ssh://[USER@]HOST[:PORT]/WORKSPACE`，HOST 可以是 SSH 配�
 
 Zess 自动探测远端平台，并在远端用户缓存中准备与客户端 Build ID 匹配的服务端。发布产物由本机通过 HTTPS 下载，再通过 SSH 上传；已校验的远端缓存可直接复用。支持 Linux x86-64 和 Windows x86-64；客户端不会自动更新。
 
-本地和远端各自的用户目录、文件路径及外部程序属于各自主机。远端会话的编辑和文件操作发生在远端；剪贴板操作由本地客户端处理。SSH 的连接选项参见 [OpenSSH ssh 手册](https://man.openbsd.org/ssh) 和 [ssh_config 手册](https://man.openbsd.org/ssh_config)。
+在 SSH 会话中，输入、选区和剪贴板由本地客户端处理。文本修改同步到远端 Session，保存写入远端文件，Git 命令在远端工作区执行。SSH 的连接选项参见 [OpenSSH ssh 手册](https://man.openbsd.org/ssh) 和 [ssh_config 手册](https://man.openbsd.org/ssh_config)。
 
 Windows PowerShell 中路径含空格时请引用，例如 `zess --workspace "C:\Users\Alice\My Project"`。终端界面需要可交互终端。默认 `Ctrl-z` 从终端断开，`:q` 关闭当前 Buffer，最后只剩未修改的无名草稿时退出客户端。

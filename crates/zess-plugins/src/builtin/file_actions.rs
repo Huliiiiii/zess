@@ -129,31 +129,34 @@ impl Yanks {
 
     fn poll_next(&mut self, services: &Services) -> Option<PluginOutput> {
         let yank = self.0.front_mut()?;
-        let mut output = PluginOutput::default();
         let result = match yank.advance(services) {
-            Ok(Some(values)) => {
-                output.requests.push(HostRequest::Yank {
-                    values,
-                    register: Some(yank.register),
-                });
-                OperationResult::Completed
-            }
+            Ok(Some(values)) => Ok(values),
             Ok(None) => return None,
-            Err(error) => {
-                let message = format!("{error:#}");
-                output.requests.push(HostRequest::Message {
-                    text: message.clone(),
-                });
-                OperationResult::Failed { message }
-            }
+            Err(error) => Err(format!("{error:#}")),
         };
-        if let Some(operation_id) = yank.operation_id.take() {
+        let Yank {
+            operation_id,
+            register,
+            ..
+        } = self.0.pop_front().unwrap();
+        let mut output = PluginOutput::default();
+        if let Some(operation_id) = operation_id {
             output.completed_operations.push(OperationCompletion {
                 operation_id,
-                result,
+                result: match result {
+                    Ok(values) => OperationResult::Yanked { values, register },
+                    Err(message) => OperationResult::Failed { message },
+                },
+            });
+        } else {
+            output.requests.push(match result {
+                Ok(values) => HostRequest::Yank {
+                    values,
+                    register: Some(register),
+                },
+                Err(text) => HostRequest::Message { text },
             });
         }
-        self.0.pop_front();
         Some(output)
     }
 }
@@ -263,11 +266,7 @@ impl Yank {
                     values,
                 } => {
                     let value = match task.poll()? {
-                        Some(QueryResult::Text {
-                            text,
-                            truncated: false,
-                            ..
-                        }) => {
+                        Some(QueryResult::FileRead { text, .. }) => {
                             ensure!(!text.contains('\0'), "Cannot yank binary file contents");
                             text
                         }

@@ -31,10 +31,14 @@ pub(super) struct PendingDiffSource {
     line: usize,
 }
 
+pub(super) enum PatchTarget {
+    View { source: ViewId, buffer: BufferId },
+    Subscription { buffer: BufferId },
+}
+
 pub(super) struct PendingPatch {
     operation_id: Option<String>,
-    source: ViewId,
-    buffer: BufferId,
+    target: PatchTarget,
     task: zess_services::PatchTask,
 }
 
@@ -875,14 +879,8 @@ impl Session {
             target
         };
         // Input may arrive after an asynchronous preview replacement or resize,
-        // before its first frame. Measure this view instead of using stale geometry.
-        let rectangles = self.visible_rectangles();
-        if let Some((_, rect)) = rectangles
-            .into_iter()
-            .find(|(id, _)| *id == RenderTarget::View(target))
-        {
-            self.render_view(target, rect.width, rect.height);
-        }
+        // before the new viewport has been published.
+        self.layout_preview_view(target);
         let (horizontal, vertical) = match direction {
             ViewDirection::Left => (-1, 0),
             ViewDirection::Right => (1, 0),
@@ -954,7 +952,7 @@ impl Session {
                     slot: slot.into(),
                 })
         }) {
-            self.render_surface_content(page, slot, rect);
+            self.layout_preview_surface(page, slot, rect);
         }
     }
 
@@ -1166,11 +1164,36 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn apply_diff_selection(&mut self, origin: ViewId) -> Result<()> {
-        use zess_git::PatchRequest;
-        if self.git_patch.is_some() {
-            bail!("a Git index update is already running");
+    pub(super) fn start_git_patch(
+        &mut self,
+        target: PatchTarget,
+        request: zess_git::PatchRequest,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.git_patch.is_none(),
+            "a Git index update is already running"
+        );
+        let side = request.side;
+        // Reject unsupported or empty selections before starting an index operation.
+        zess_git::patch::RawPatch::parse(&request.raw)?.selection(side, &request.rows)?;
+        let task = self.services.borrow().start_patch(request)?;
+        self.git_patch = Some(PendingPatch {
+            operation_id: self.current_operation.clone(),
+            target,
+            task,
+        });
+        if let Some(operation_id) = &self.current_operation {
+            self.pending_operations.insert(operation_id.clone());
         }
+        self.message = match side {
+            zess_git::DiffSide::Staged => "Unstaging selected changes…",
+            zess_git::DiffSide::Unstaged => "Staging selected changes…",
+        }
+        .into();
+        Ok(())
+    }
+
+    pub(super) fn apply_diff_selection(&mut self, origin: ViewId) -> Result<()> {
         let source = self
             .preview_source(origin)
             .context("staging requires a Git changes preview")?;
@@ -1189,32 +1212,19 @@ impl Session {
             view.location.diff_presentation,
             &view.location.diff_selection,
         )?;
-        let raw = file.raw.clone();
-        // Validate before starting work so unsupported/binary patches and empty
-        // selections fail immediately without an index operation.
-        zess_git::patch::RawPatch::parse(&raw)?.selection(side, &rows)?;
-        let task = self.services.borrow().start_patch(PatchRequest {
-            path: file.target.path.clone(),
-            original_path: file.target.original_path.clone(),
-            side,
-            raw,
-            rows,
-        })?;
-        self.git_patch = Some(PendingPatch {
-            operation_id: self.current_operation.clone(),
-            source,
-            buffer: self.views[&source].location.buffer,
-            task,
-        });
-        if let Some(operation_id) = &self.current_operation {
-            self.pending_operations.insert(operation_id.clone());
-        }
-        self.message = match side {
-            zess_git::DiffSide::Staged => "Unstaging selected changes…",
-            zess_git::DiffSide::Unstaged => "Staging selected changes…",
-        }
-        .into();
-        Ok(())
+        self.start_git_patch(
+            PatchTarget::View {
+                source,
+                buffer: self.views[&source].location.buffer,
+            },
+            zess_git::PatchRequest {
+                path: file.target.path.clone(),
+                original_path: file.target.original_path.clone(),
+                side,
+                raw: file.raw.clone(),
+                rows,
+            },
+        )
     }
 
     pub(super) fn poll_git_patch(&mut self) -> bool {
@@ -1239,15 +1249,21 @@ impl Session {
             Ok(()) => "Git index updated".into(),
             Err(error) => error,
         };
-        if self
-            .views
-            .get(&pending.source)
-            .is_some_and(|view| view.location.buffer == pending.buffer)
-        {
-            if let Err(error) = self.dispatch(pending.source, "refresh", Value::Null) {
-                self.message = format!("{message}; refresh: {error:#}");
-                return true;
+        let refresh = match pending.target {
+            PatchTarget::View { source, buffer }
+                if self
+                    .views
+                    .get(&source)
+                    .is_some_and(|view| view.location.buffer == buffer) =>
+            {
+                self.dispatch(source, "refresh", Value::Null)
             }
+            PatchTarget::Subscription { buffer } => self.refresh_patch_page(buffer),
+            PatchTarget::View { .. } => Ok(()),
+        };
+        if let Err(error) = refresh {
+            self.message = format!("{message}; refresh: {error:#}");
+            return true;
         }
         self.message = message;
         true

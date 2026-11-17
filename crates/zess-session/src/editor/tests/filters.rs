@@ -55,7 +55,7 @@ fn file_filters_support_globs_and_regexes_without_changing_literal_case() {
             session.message
         );
         assert_eq!(session.views[&session.focus].item_ids(), expected);
-        assert_eq!(session.frame().prompt, prompt);
+        assert_eq!(prompt_text(&mut session), prompt);
         assert_eq!(session.views[&session.focus].location.display.header, "");
     }
 }
@@ -128,20 +128,9 @@ fn invalid_filters_preserve_the_last_results_and_view_position_until_corrected_o
             assert!(location.filter.query().kind == Regex);
             assert_eq!(location.filter.query().text, ".");
             assert!(session.prompt.as_ref().unwrap().error.is_some(), "{kind}");
-            let error_row = session
-                .frame()
-                .rows
-                .into_iter()
-                .find(|row| row.spans.iter().any(|span| span.style == "error"))
-                .unwrap();
-            assert!(error_row.spans.iter().all(|span| !span.text.contains('\n')));
-            assert!(
-                error_row
-                    .spans
-                    .iter()
-                    .any(|span| span.text.contains("unclosed")),
-                "{kind}"
-            );
+            let error = session.snapshot().prompt.unwrap().error.unwrap();
+            assert!(!error.contains('\n'));
+            assert!(error.contains("unclosed"), "{kind}: {error}");
         }
         query(&mut session, Regex, ".*");
         assert!(session.prompt.as_ref().unwrap().error.is_none());
@@ -246,20 +235,22 @@ fn configuration_reload_restores_the_outline_filter_and_selection_when_returning
     let mut session = fixture.session(&[path]);
     session.command("outline").unwrap();
     session.execute_command("data.filter", json!({})).unwrap();
-    query(&mut session, Plain, "brav");
+    session
+        .execute_command("prompt.insert-text", json!({"text":"brav"}))
+        .unwrap();
     session.execute_command("prompt.submit", json!({})).unwrap();
     session
         .execute_command("data.move-down", json!({}))
         .unwrap();
     let view = session.focus;
-    let before = &session.views[&view].location;
-    let buffer = before.buffer;
-    let selection = before.selection.clone();
-    let rows = &before.display.rows;
+    let before = view_snapshot(&mut session, view);
+    let rows = item_rows(&before.content);
     assert!(rows[0].text.ends_with("bravo"));
     assert!(rows[1].text.ends_with("bravura"));
-    assert_eq!(selection.primary.as_ref(), Some(&rows[1].id));
-    let rows = serde_json::to_value(rows).unwrap();
+    assert!(matches!(
+        &before.selection,
+        zess_protocol::ViewSelection::Items { primary: Some(id), .. } if id == &rows[1].id
+    ));
 
     session
         .navigate(
@@ -273,11 +264,11 @@ fn configuration_reload_restores_the_outline_filter_and_selection_when_returning
     session.command("config-reload").unwrap();
     session.navigate(view, Navigation::Back).unwrap();
 
-    let restored = &session.views[&view].location;
-    assert_eq!(restored.buffer, buffer);
-    assert_eq!(serde_json::to_value(&restored.display.rows).unwrap(), rows);
-    assert_eq!(restored.selection, selection);
-    assert_eq!(restored.display.header, "/brav");
+    let restored = view_snapshot(&mut session, view);
+    assert_eq!(restored.buffer_id, before.buffer_id);
+    assert_eq!(restored.content, before.content);
+    assert_eq!(restored.selection, before.selection);
+    assert_eq!(restored.header, "/brav");
 }
 
 #[test]

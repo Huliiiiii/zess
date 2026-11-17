@@ -1,11 +1,6 @@
 use super::ScrollMode;
 use super::*;
 
-pub(super) struct ItemJump {
-    pub targets: Vec<String>,
-    pub input: String,
-}
-
 impl View {
     pub(super) fn horizontal_scroll_limit(&self) -> usize {
         self.location
@@ -47,36 +42,9 @@ impl View {
     }
 
     pub(super) fn reconcile_selection(&mut self) {
-        let ids = self.item_ids();
-        let visible = ids.iter().collect::<HashSet<_>>();
-        let mut selected = HashSet::new();
         self.location
             .selection
-            .selected
-            .retain(|id| visible.contains(id) && selected.insert(id.clone()));
-        if !self
-            .location
-            .selection
-            .primary
-            .as_ref()
-            .is_some_and(|id| ids.contains(id))
-        {
-            self.location.selection.primary = ids.first().cloned();
-        }
-        if !self
-            .location
-            .selection
-            .anchor
-            .as_ref()
-            .is_some_and(|id| ids.contains(id))
-        {
-            self.location.selection.anchor = self.location.selection.primary.clone();
-        }
-        if let Some(primary) = &self.location.selection.primary
-            && !self.location.selection.selected.contains(primary)
-        {
-            self.location.selection.selected.push(primary.clone());
-        }
+            .reconcile(&self.location.display.rows);
     }
 
     fn select_primary(&mut self) {
@@ -253,47 +221,30 @@ impl Session {
     fn start_item_jump(&mut self) -> Result<()> {
         let view = self.views.get_mut(&self.focus).unwrap();
         view.count.clear();
-        let mut seen = HashSet::new();
-        let targets = view
-            .location
-            .display
-            .rows
-            .iter()
-            .skip(view.location.scroll)
-            .take(view.viewport_height)
-            .filter(|row| !row.id.is_empty() && seen.insert(row.id.clone()))
-            .take(26 * 26)
-            .map(|row| row.id.clone())
-            .collect::<Vec<_>>();
-        if !targets.is_empty() {
-            view.jump = Some(ItemJump {
-                targets,
-                input: String::new(),
-            });
-        }
+        view.jump = zess_ui::ItemJump::new(
+            view.location
+                .display
+                .rows
+                .iter()
+                .skip(view.location.scroll)
+                .take(view.viewport_height)
+                .map(|row| row.id.as_str()),
+        );
         Ok(())
     }
 
     pub(super) fn item_jump_input(&mut self, key: &str) -> Result<()> {
         let view = self.views.get_mut(&self.focus).unwrap();
-        let mut jump = view.jump.take().unwrap();
-        if key.len() != 1 || !key.as_bytes()[0].is_ascii_lowercase() {
-            return Ok(());
-        }
-        jump.input.push_str(key);
-        let outer = usize::from(jump.input.as_bytes()[0] - b'a') * 26;
-        if jump.input.len() == 1 {
-            if outer < jump.targets.len() {
+        let target = match view.jump.take().unwrap().input(key) {
+            zess_ui::JumpInput::Selected(target) => target,
+            zess_ui::JumpInput::Waiting(jump) => {
                 view.jump = Some(jump);
+                return Ok(());
             }
-            return Ok(());
-        }
-        let index = outer + usize::from(jump.input.as_bytes()[1] - b'a');
-        let Some(target) = jump.targets.get(index) else {
-            return Ok(());
+            zess_ui::JumpInput::Cancelled => return Ok(()),
         };
         let ids = view.item_ids();
-        let Some(target_index) = ids.iter().position(|id| id == target) else {
+        let Some(target_index) = ids.iter().position(|id| id == &target) else {
             return Ok(());
         };
         if view.location.mode == ViewMode::Select {

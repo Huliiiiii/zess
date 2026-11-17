@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{IdentityRegistry, KeyScopeId, ModeId};
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 #[cfg(test)]
@@ -52,9 +53,24 @@ struct KeyMapping {
     command: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NamedMapping {
+    scope: String,
+    mode: String,
+    keys: Vec<String>,
+    command: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct KeymapDefinition {
+    scopes: BTreeMap<String, String>,
+    mappings: Vec<NamedMapping>,
+}
+
 pub struct Keymap {
     identities: IdentityRegistry,
     scopes: BTreeMap<KeyScopeId, String>,
+    scope_revision: u64,
     bindings: Vec<KeyMapping>,
     revision: Rc<Cell<u64>>,
     compiled: RefCell<Vec<Rc<CompiledContext>>>,
@@ -71,6 +87,7 @@ impl Keymap {
         Self {
             identities,
             scopes: BTreeMap::new(),
+            scope_revision: 0,
             bindings: Vec::new(),
             revision: Rc::new(Cell::new(0)),
             compiled: RefCell::new(Vec::new()),
@@ -81,7 +98,32 @@ impl Keymap {
         &self.identities
     }
 
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.get() + self.scope_revision
+    }
+
+    pub(crate) fn definition(&self) -> KeymapDefinition {
+        KeymapDefinition {
+            scopes: self
+                .scopes
+                .iter()
+                .map(|(&id, label)| (self.identities.scope_name(id).to_string(), label.clone()))
+                .collect(),
+            mappings: self
+                .bindings
+                .iter()
+                .map(|mapping| NamedMapping {
+                    scope: self.identities.scope_name(mapping.scope).to_string(),
+                    mode: self.identities.mode_name(mapping.mode).to_string(),
+                    keys: mapping.keys.clone(),
+                    command: mapping.command.clone(),
+                })
+                .collect(),
+        }
+    }
+
     pub fn register_scope(&mut self, scope: &str, label: &str) {
+        self.scope_revision += 1;
         self.scopes
             .insert(self.identities.intern_scope(scope), label.to_owned());
     }
@@ -106,6 +148,22 @@ impl Keymap {
             keys,
             command,
         });
+    }
+
+    pub(crate) fn from_definition(definition: &KeymapDefinition) -> Self {
+        let mut keymap = Self::default();
+        for (scope, label) in &definition.scopes {
+            keymap.register_scope(scope, label);
+        }
+        for mapping in &definition.mappings {
+            keymap.map(
+                &mapping.scope,
+                &mapping.mode,
+                mapping.keys.clone(),
+                mapping.command.clone(),
+            );
+        }
+        keymap
     }
 
     pub fn effective_bindings<'a>(

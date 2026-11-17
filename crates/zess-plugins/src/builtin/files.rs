@@ -7,8 +7,8 @@ use zess_filter::{Case, Filter};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use zess_plugin::{
-    BufferId, HostRequest, ItemSelection, OperationCompletion, PluginInput, PluginOutput,
-    QueryWatch, ViewId,
+    BufferId, FileTree, FileTreeListing, HostRequest, ItemSelection, OperationCompletion,
+    PluginInput, PluginOutput, QueryWatch, ViewId, file_tree_disclosure, file_tree_parent,
 };
 use zess_ui::{Display, DisplayRow};
 
@@ -75,6 +75,22 @@ enum DirectoryRequest {
     NotRequested,
     Running(Task),
     Settled,
+    Failed,
+}
+
+impl FileView {
+    fn listing(&self, path: &str) -> FileTreeListing {
+        if !path.is_empty() && !self.expanded.contains(path) {
+            return FileTreeListing::Closed;
+        }
+        match self.directories.get(path) {
+            Some(DirectoryRequest::Settled) => FileTreeListing::Ready,
+            Some(DirectoryRequest::Failed) => FileTreeListing::Failed,
+            Some(DirectoryRequest::NotRequested | DirectoryRequest::Running(_)) | None => {
+                FileTreeListing::Loading
+            }
+        }
+    }
 }
 
 enum RenameSession {
@@ -337,7 +353,7 @@ impl BufferPlugin for Files {
             }
             Event::Find => {
                 view.target = None;
-                view.find = Some(FindSession::new(input.selection.clone()));
+                view.find = Some(FindSession::new(input.view_selection().clone()));
                 output.requests.push(HostRequest::SetMode {
                     mode: "find".into(),
                 });
@@ -345,6 +361,7 @@ impl BufferPlugin for Files {
                     purpose: "find".into(),
                     text: String::new(),
                     key_scope: Some("files.find".into()),
+                    confirmation: None,
                 });
             }
             Event::MiniBufferChanged if input.argument["purpose"] == "find" => {
@@ -417,6 +434,15 @@ impl BufferPlugin for Files {
                     {
                         destination(model, targets.front().unwrap())
                     } else {
+                        if let Some(path) = primary
+                            && current.is_none()
+                            && !model
+                                .pending
+                                .iter()
+                                .any(|operation| operation.path() == path)
+                        {
+                            bail!("Selected path is unavailable: {path}");
+                        }
                         let directory = current
                             .map(|(entry, _)| {
                                 if entry.kind == DirectoryEntryKind::Directory {
@@ -436,6 +462,7 @@ impl BufferPlugin for Files {
                         purpose: input.event.clone(),
                         text,
                         key_scope: None,
+                        confirmation: None,
                     });
                 }
             }
@@ -470,6 +497,7 @@ impl BufferPlugin for Files {
                                 purpose: "rename".into(),
                                 text: destination(model, targets.front().unwrap()),
                                 key_scope: None,
+                                confirmation: None,
                             });
                             view.rename = Some(next);
                         } else if let RenameSession::Ready { destinations } = next {
@@ -518,9 +546,10 @@ impl BufferPlugin for Files {
                     .borrow_mut()
                     .apply_file_operations(&model.pending)?;
                 model.pending = result.remaining;
-                output.requests.push(message(
-                    result.error.as_deref().unwrap_or("Saved file operations"),
-                ));
+                output.command_error = result.error;
+                if output.command_error.is_none() {
+                    output.requests.push(message("Saved file operations"));
+                }
             }
             _ => {}
         }
@@ -560,7 +589,8 @@ impl BufferPlugin for Files {
                     Ok(Some(_)) => bail!("directory query returned another kind of result"),
                     Ok(None) => {}
                     Err(error) => {
-                        *job = DirectoryRequest::Settled;
+                        model.directories.remove(path);
+                        *job = DirectoryRequest::Failed;
                         output.requests.push(message(&format!("{error:#}")));
                     }
                 }
@@ -612,6 +642,19 @@ impl BufferPlugin for Files {
                     0,
                 ));
             }
+        }
+        if view.find.is_none() && view.filter.is_empty() && model.pending.is_empty() {
+            let directories = std::iter::once("")
+                .chain(entries.iter().filter_map(|(entry, _)| {
+                    (entry.kind == DirectoryEntryKind::Directory).then_some(entry.path.as_str())
+                }))
+                .map(|path| (path.to_owned(), view.listing(path)))
+                .collect();
+            output.file_tree = Some(FileTree {
+                expanded: view.expanded.clone(),
+                directories,
+                show_ignored: view.show_ignored,
+            });
         }
         let rows = if let Some(find) = &mut view.find {
             find.advance(&self.services, model, view.show_ignored, &mut output)?;
@@ -685,19 +728,30 @@ impl BufferPlugin for Files {
             argument: json!({"path":path}),
         }));
         browser::reconcile(event, input, &mut output);
-        let query = output
+        let view_primary = output
             .selection
             .as_ref()
-            .and_then(|s| s.primary.as_ref())
-            .map(|path| PreviewQuery {
-                request: QueryRequest::Preview {
-                    path: path.clone(),
-                    show_ignored: view.show_ignored,
-                },
-                path: path.clone(),
-            });
+            .and_then(|selection| selection.primary.as_deref());
+        let (preview_event, path) = match (event, primary) {
+            (Event::Preview, Some(path)) => {
+                let rows = &output.display.as_ref().unwrap().rows;
+                if !rows.iter().any(|row| row.id == path) {
+                    bail!("Selected path is unavailable: {path}");
+                }
+                (event, Some(path))
+            }
+            (Event::Preview, None) => (Event::Unknown, view_primary),
+            _ => (event, view_primary),
+        };
+        let query = path.map(|path| PreviewQuery {
+            request: QueryRequest::Preview {
+                path: path.into(),
+                show_ignored: view.show_ignored,
+            },
+            path: path.into(),
+        });
         view.browser
-            .update_surface(&self.services, event, input, &mut output, query)?;
+            .update_surface(&self.services, preview_event, input, &mut output, query)?;
         view.yanks.advance(&self.services, event, &mut output);
         if loading {
             output.requests.push(HostRequest::Schedule { after_ms: 50 });
@@ -787,11 +841,7 @@ fn row(entry: Cow<'_, Entry>, depth: usize, model: &Model, view: &FileView) -> D
         None => (entry.name, if directory { "directory" } else { "" }),
     };
     let prefix = if directory {
-        if view.expanded.contains(&entry.path) {
-            "▾ "
-        } else {
-            "▸ "
-        }
+        file_tree_disclosure(view.expanded.contains(&entry.path))
     } else {
         "  "
     };
@@ -809,10 +859,7 @@ fn row(entry: Cow<'_, Entry>, depth: usize, model: &Model, view: &FileView) -> D
 }
 
 fn parent(path: &str) -> String {
-    path.rsplit_once('/')
-        .map(|(parent, _)| parent)
-        .unwrap_or("")
-        .into()
+    file_tree_parent(path).into()
 }
 fn message(text: &str) -> HostRequest {
     HostRequest::Message { text: text.into() }

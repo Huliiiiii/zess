@@ -78,9 +78,6 @@ zess-ipc.workspace = true
 zess-session.workspace = true
 zess-terminal.workspace = true
 zess-text.workspace = true
-zess-services.workspace = true
-zess-script.workspace = true
-zess-git.workspace = true
 
 [dev-dependencies]
 fnv.workspace = true

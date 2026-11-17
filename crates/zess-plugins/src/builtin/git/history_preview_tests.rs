@@ -22,6 +22,7 @@ fn input() -> PluginInput {
         options: serde_json::Value::Null,
         mode: "normal".into(),
         selection: ItemSelection::default(),
+        view_selection: None,
         register: None,
         context: PluginContext::default(),
     }
@@ -425,7 +426,7 @@ fn an_empty_completed_source_clears_the_previous_commit() {
 
     assert!(preview.published.is_none());
     assert_eq!(
-        preview.totals.status(),
+        preview.totals.status(false),
         json!({"git": {
             "state": "ready",
             "additions": 0,

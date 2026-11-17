@@ -39,6 +39,7 @@ impl Fixture {
             options: serde_json::Value::Null,
             mode: "normal".into(),
             selection: ItemSelection::default(),
+            view_selection: None,
             register: None,
             context: PluginContext::default(),
         };
@@ -185,27 +186,17 @@ fn an_invalid_file_prevents_a_partial_content_yank() {
     let mut output = plugin.update(&input).unwrap();
     assert_eq!(output.pending_operations, ["binary-content"]);
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        assert!(
-            !output
-                .requests
-                .iter()
-                .any(|request| matches!(request, HostRequest::Yank { .. }))
-        );
-        if output.requests.iter().any(
-            |request| matches!(request, HostRequest::Message { text } if text.contains("binary")),
-        ) {
-            assert!(matches!(
-                output.completed_operations.as_slice(),
-                [zess_plugin::OperationCompletion { operation_id, result: zess_plugin::OperationResult::Failed { message } }]
-                    if operation_id == "binary-content" && message.contains("binary")
-            ));
-            break;
-        }
+    while output.completed_operations.is_empty() {
         assert!(Instant::now() < deadline);
         output = plugin.poll_operations().pop().unwrap_or_default();
         std::thread::yield_now();
     }
+    assert!(matches!(
+        output.completed_operations.as_slice(),
+        [zess_plugin::OperationCompletion { operation_id, result: zess_plugin::OperationResult::Failed { message } }]
+            if operation_id == "binary-content" && message.contains("binary")
+    ));
+    assert!(values(output).is_empty());
 }
 
 #[test]
@@ -215,6 +206,7 @@ fn content_yanks_complete_without_further_view_updates() {
     let (mut plugin, mut input) = fixture.plugin();
     select(&mut input, &["a.txt"]);
     input.event = "yank-content".into();
+    input.register = Some('a');
     input.context.operation_id = Some("read-content".into());
     let mut output = plugin.update(&input).unwrap();
     assert_eq!(output.pending_operations, ["read-content"]);
@@ -227,10 +219,12 @@ fn content_yanks_complete_without_further_view_updates() {
     }
     assert!(matches!(
         output.completed_operations.as_slice(),
-        [zess_plugin::OperationCompletion { operation_id, result: zess_plugin::OperationResult::Completed }]
-            if operation_id == "read-content"
+        [zess_plugin::OperationCompletion {
+            operation_id,
+            result: zess_plugin::OperationResult::Yanked { values, register: 'a' },
+        }] if operation_id == "read-content" && values == &["copied contents\n"]
     ));
-    assert_eq!(values(output), [vec!["copied contents\n".to_owned()]]);
+    assert!(output.requests.is_empty());
     assert!(plugin.poll_operations().is_empty());
 }
 
@@ -269,10 +263,12 @@ fn a_failed_yank_does_not_share_its_output_with_a_successful_yank() {
     assert!(values(failure).is_empty());
     assert!(matches!(
         success.completed_operations.as_slice(),
-        [zess_plugin::OperationCompletion { operation_id, result: zess_plugin::OperationResult::Completed }]
-            if operation_id == "text-content"
+        [zess_plugin::OperationCompletion {
+            operation_id,
+            result: zess_plugin::OperationResult::Yanked { values, register: '+' },
+        }] if operation_id == "text-content" && values == &["copied contents\n"]
     ));
-    assert_eq!(values(success), [vec!["copied contents\n".to_owned()]]);
+    assert!(success.requests.is_empty());
 }
 
 #[test]

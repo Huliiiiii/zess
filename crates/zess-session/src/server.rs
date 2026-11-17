@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{ErrorKind, Read, Write},
     thread,
     time::{Duration, Instant},
@@ -11,19 +11,14 @@ use zess_platform::{NativePlatform, Platform};
 use zess_protocol::{
     ClientMessage, CommandAction, CommandOutcome, MAX_INPUT_BYTES, MAX_MESSAGE_BYTES,
     OperationResult, RequestId, ServerInstanceId, ServerMessage, SessionDelta, SessionId,
-    SessionSnapshot,
+    SessionSnapshot, resource::ResourceCacheInvalidation,
 };
 
 use crate::Session;
-use zess_ui::Frame;
 
+mod documents;
 #[cfg(all(test, unix))]
 mod tests;
-
-struct PendingMessage {
-    bytes: Vec<u8>,
-    update: bool,
-}
 
 enum ConnectionRole {
     AwaitHello {
@@ -35,6 +30,9 @@ enum ConnectionRole {
     Attached {
         client: String,
     },
+    ConfirmingAttach {
+        client: String,
+    },
     Closing {
         client: Option<String>,
         deadline: Instant,
@@ -44,7 +42,7 @@ enum ConnectionRole {
 impl ConnectionRole {
     fn client(&self) -> Option<&String> {
         match self {
-            Self::Attached { client } => Some(client),
+            Self::Attached { client } | Self::ConfirmingAttach { client } => Some(client),
             Self::Closing { client, .. } => client.as_ref(),
             Self::Unidentified { .. } | Self::AwaitHello { .. } => None,
         }
@@ -72,13 +70,18 @@ impl ServerState {
 }
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const FIRST_ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct Connection {
     stream: Stream,
     input: framing::Decoder,
-    output: VecDeque<PendingMessage>,
+    message_stream: zess_protocol::chunks::MessageStream,
+    output: VecDeque<Vec<u8>>,
     written: usize,
     role: ConnectionRole,
+    claimed_pending_session: bool,
+    subscribed_documents: HashMap<u64, documents::DocumentState>,
+    document_stream: zess_protocol::document::DocumentStream,
     eof: bool,
     exit_disposition: Option<zess_protocol::ClientExitDisposition>,
 }
@@ -89,21 +92,44 @@ impl Connection {
         Ok(Self {
             stream,
             input: framing::Decoder::default(),
+            message_stream: Default::default(),
             output: VecDeque::new(),
             written: 0,
             role: ConnectionRole::AwaitHello {
                 accepted: Instant::now(),
             },
+            claimed_pending_session: false,
+            subscribed_documents: HashMap::new(),
+            document_stream: Default::default(),
             eof: false,
             exit_disposition: None,
         })
     }
 
-    fn disconnect(self, session: &mut Session, active: &mut Option<String>) {
+    fn disconnect(
+        self,
+        session: &mut Session,
+        active: &mut Option<String>,
+        workspace_view: Option<&zess_protocol::workspace_view::WorkspaceView>,
+        awaiting_delivery: impl Fn(u64) -> bool,
+    ) {
         if self.role.client().is_some() {
-            session.invalidate_mouse();
+            session.detach_resources(workspace_view, |id| {
+                self.owns_page_document(id, workspace_view) || awaiting_delivery(id)
+            });
             *active = None;
         }
+    }
+
+    fn owns_page_document(
+        &self,
+        id: u64,
+        workspace_view: Option<&zess_protocol::workspace_view::WorkspaceView>,
+    ) -> bool {
+        self.subscribed_documents.contains_key(&id)
+            || workspace_view
+                .and_then(|view| view.page_document)
+                .is_some_and(|layer| layer.buffer_id == id)
     }
 
     fn close_after_flush(&mut self) {
@@ -125,13 +151,18 @@ impl Connection {
                 MAX_MESSAGE_BYTES
             );
         }
-        let update = matches!(message, ServerMessage::Update { .. });
-        // Preserve the first message in case it has been partially written, and
-        // coalesce only adjacent frames so one-time effects keep their order.
-        if update && self.output.len() > 1 && self.output.back().unwrap().update {
-            self.output.pop_back();
+        if bytes.len() > MAX_MESSAGE_BYTES && message.can_chunk() {
+            let json = std::str::from_utf8(&bytes)?;
+            for (part, last) in zess_protocol::chunks::json_parts(json, MAX_MESSAGE_BYTES) {
+                self.output
+                    .push_back(framing::encode(&ServerMessage::Chunk {
+                        json: part.to_owned(),
+                        last,
+                    })?);
+            }
+        } else {
+            self.output.push_back(bytes);
         }
-        self.output.push_back(PendingMessage { bytes, update });
         Ok(())
     }
 
@@ -146,13 +177,15 @@ impl Connection {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
-        while let Some(message) = self.output.front() {
-            match self.stream.write(&message.bytes[self.written..]) {
+    fn flush(&mut self) -> Result<bool> {
+        let mut advanced = false;
+        while let Some(bytes) = self.output.front() {
+            match self.stream.write(&bytes[self.written..]) {
                 Ok(0) => bail!("client closed"),
                 Ok(count) => {
+                    advanced = true;
                     self.written += count;
-                    if self.written == message.bytes.len() {
+                    if self.written == bytes.len() {
                         self.output.pop_front();
                         self.written = 0;
                     }
@@ -162,7 +195,7 @@ impl Connection {
                 Err(error) => return Err(error.into()),
             }
         }
-        Ok(())
+        Ok(advanced)
     }
 
     fn receive(&mut self) -> Result<Vec<ClientMessage>> {
@@ -178,11 +211,24 @@ impl Connection {
                     for fragment in bytes[..count].split_inclusive(|byte| *byte == b'\n') {
                         self.input.push(fragment, MAX_INPUT_BYTES)?;
                         if fragment.last() == Some(&b'\n') {
-                            messages.push(
-                                self.input
-                                    .decode_next()?
-                                    .expect("fragment completes a message"),
-                            );
+                            let message = self
+                                .input
+                                .decode_next()?
+                                .expect("fragment completes a message");
+                            if let ClientMessage::Document(request) = message {
+                                if let Some(request) = self.document_stream.request(request)? {
+                                    anyhow::ensure!(
+                                        !matches!(
+                                            request,
+                                            zess_protocol::document::DocumentRequest::Chunk { .. }
+                                        ),
+                                        "nested document message"
+                                    );
+                                    messages.push(ClientMessage::Document(request));
+                                }
+                            } else {
+                                messages.push(message);
+                            }
                         }
                     }
                 }
@@ -195,56 +241,75 @@ impl Connection {
     }
 }
 
+fn publish_resources(session: &mut Session, connection: Option<&mut Connection>) -> Result<()> {
+    let updates = session.take_resource_updates();
+    let invalidated = session.take_resource_invalidations();
+    if let Some(connection) = connection {
+        for update in updates {
+            connection.send(&ServerMessage::Resource { update })?;
+        }
+        let mut changed = Vec::new();
+        let mut evicted = Vec::new();
+        for (reason, entry) in invalidated {
+            match reason {
+                ResourceCacheInvalidation::Changed => changed.push(entry),
+                ResourceCacheInvalidation::Evicted => evicted.push(entry),
+            }
+        }
+        for (reason, entries) in [
+            (ResourceCacheInvalidation::Changed, changed),
+            (ResourceCacheInvalidation::Evicted, evicted),
+        ] {
+            if !entries.is_empty() {
+                connection.send(&ServerMessage::ResourceCacheInvalidated { entries, reason })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 struct PublishedState {
     session_id: SessionId,
     server_instance: ServerInstanceId,
     revision: u64,
     semantic: SessionSnapshot,
-    frame: Frame,
 }
 
 impl PublishedState {
     fn new(session: &mut Session, server_instance: ServerInstanceId) -> Self {
-        let frame = session.frame();
-        let semantic = session.snapshot_with_frame(&frame);
         Self {
             session_id: SessionId(format!("session-{}", server_instance.0)),
             server_instance,
             revision: 1,
-            semantic,
-            frame,
+            semantic: session.snapshot(),
         }
     }
 
-    fn snapshot(&self) -> ServerMessage {
+    fn snapshot(&self, session: &Session) -> ServerMessage {
         ServerMessage::Snapshot {
             session_id: self.session_id.clone(),
             server_instance: self.server_instance.clone(),
             state_revision: self.revision,
             state: self.semantic.clone(),
-            frame: self.frame.clone(),
+            bindings: session.binding_catalog(),
         }
     }
 
     fn refresh(&mut self, session: &mut Session) -> Option<ServerMessage> {
-        let frame = session.frame();
-        let semantic = session.snapshot_with_frame(&frame);
-        if self.semantic == semantic && self.frame == frame {
+        let semantic = session.snapshot();
+        if self.semantic == semantic {
             return None;
         }
         let base_revision = self.revision;
         self.revision += 1;
         let delta = SessionDelta::between(&self.semantic, &semantic);
-        let frame_delta = (self.frame != frame).then(|| frame.clone());
         self.semantic = semantic;
-        self.frame = frame;
         Some(ServerMessage::Delta {
             session_id: self.session_id.clone(),
             server_instance: self.server_instance.clone(),
             base_revision,
             state_revision: self.revision,
             delta,
-            frame: frame_delta,
         })
     }
 
@@ -256,18 +321,8 @@ impl PublishedState {
     }
 }
 
-#[derive(PartialEq)]
-enum OperationAction {
-    Command(CommandAction),
-    Input {
-        sequence: u64,
-        key: String,
-        context_epoch: u64,
-    },
-}
-
 struct Operation {
-    action: OperationAction,
+    action: CommandAction,
     completed: Option<OperationCompletion>,
 }
 
@@ -281,16 +336,29 @@ impl Operation {
             None => OperationResult::Pending,
         }
     }
+
+    fn fullscreen_document(&self) -> Option<u64> {
+        let completion = self.completed.as_ref()?;
+        match &completion.outcome {
+            CommandOutcome::PageApplied {
+                document: Some(document),
+                ..
+            } if document.fullscreen => Some(document.buffer_id),
+            _ => None,
+        }
+    }
 }
 
 struct OperationCompletion {
     outcome: CommandOutcome,
     state_revision: u64,
+    sequence: u64,
 }
 
 #[derive(Default)]
 struct ClientOperations {
     last_started: u64,
+    last_completed: u64,
     unacknowledged: BTreeMap<RequestId, Operation>,
 }
 
@@ -304,7 +372,7 @@ impl OperationTable {
         &mut self,
         client: &str,
         request_id: RequestId,
-        action: OperationAction,
+        action: CommandAction,
         session: &mut Session,
         published: &mut PublishedState,
     ) -> (OperationResult, Option<ServerMessage>) {
@@ -331,16 +399,17 @@ impl OperationTable {
         }
         operations.last_started = request_id.0;
         let token = format!("{client}:{}", request_id.0);
-        let outcome = match &action {
-            OperationAction::Command(action) => session.begin_operation(&token, action),
-            OperationAction::Input { key, .. } => session.tracked_input(&token, key),
-        };
+        let outcome = session.begin_operation(&token, &action);
         let delta = published.refresh(session);
         let operation = Operation {
             action,
-            completed: outcome.map(|outcome| OperationCompletion {
-                outcome,
-                state_revision: published.revision,
+            completed: outcome.map(|outcome| {
+                operations.last_completed += 1;
+                OperationCompletion {
+                    outcome,
+                    state_revision: published.revision,
+                    sequence: operations.last_completed,
+                }
             }),
         };
         let result = operation.result();
@@ -356,17 +425,16 @@ impl OperationTable {
     ) -> Option<(&'token str, RequestId, OperationResult)> {
         let (client, request_id) = token.rsplit_once(':')?;
         let request_id = RequestId(request_id.parse().ok()?);
-        let operation = self
-            .clients
-            .get_mut(client)?
-            .unacknowledged
-            .get_mut(&request_id)?;
+        let operations = self.clients.get_mut(client)?;
+        let operation = operations.unacknowledged.get_mut(&request_id)?;
         if operation.completed.is_some() {
             return None;
         }
+        operations.last_completed += 1;
         operation.completed = Some(OperationCompletion {
             outcome,
             state_revision: revision,
+            sequence: operations.last_completed,
         });
         Some((client, request_id, operation.result()))
     }
@@ -379,15 +447,26 @@ impl OperationTable {
             .unwrap_or(OperationResult::Unknown)
     }
 
-    fn acknowledge(&mut self, client: &str, request_id: RequestId) {
-        if let Some(operations) = self.clients.get_mut(client)
-            && operations
+    fn acknowledge(&mut self, client: &str, request_id: RequestId) -> Option<u64> {
+        let operations = self.clients.get_mut(client)?;
+        operations
+            .unacknowledged
+            .get(&request_id)?
+            .completed
+            .as_ref()?;
+        operations
+            .unacknowledged
+            .remove(&request_id)?
+            .fullscreen_document()
+    }
+
+    fn retains_page_document(&self, buffer_id: u64) -> bool {
+        self.clients.values().any(|operations| {
+            operations
                 .unacknowledged
-                .get(&request_id)
-                .is_some_and(|operation| operation.completed.is_some())
-        {
-            operations.unacknowledged.remove(&request_id);
-        }
+                .values()
+                .any(|operation| operation.fullscreen_document() == Some(buffer_id))
+        })
     }
 
     fn resend(
@@ -397,7 +476,17 @@ impl OperationTable {
         connection: &mut Connection,
     ) -> Result<()> {
         if let Some(operations) = self.clients.get(client) {
-            for (&request_id, operation) in &operations.unacknowledged {
+            let mut replay = operations.unacknowledged.iter().collect::<Vec<_>>();
+            replay.sort_by_key(|(request_id, operation)| {
+                (
+                    operation
+                        .completed
+                        .as_ref()
+                        .map_or(u64::MAX, |completion| completion.sequence),
+                    **request_id,
+                )
+            });
+            for (&request_id, operation) in replay {
                 connection.send(&ServerMessage::CommandResult {
                     request_id,
                     server_instance: instance.clone(),
@@ -409,24 +498,49 @@ impl OperationTable {
     }
 }
 
-/// Serve a single active terminal while retaining all session state on detach.
-pub fn serve(ipc: &dyn LocalIpc, socket: &SocketPath, session: Session) -> Result<()> {
-    serve_with_platform(ipc, socket, session, &NativePlatform)
+pub enum SessionLifetime {
+    Retained,
+    Pending,
 }
 
-/// Serves with caller-supplied IPC and host identity facts.
+struct PendingSession {
+    deadline: Instant,
+    claimed: bool,
+}
+
+/// Serve a single active terminal while retaining all session state on detach.
+pub fn serve(ipc: &dyn LocalIpc, socket: &SocketPath, session: Session) -> Result<()> {
+    serve_with_platform(
+        ipc,
+        socket,
+        session,
+        &NativePlatform,
+        SessionLifetime::Retained,
+    )
+}
+
+/// Serves with caller-supplied IPC, host identity facts, and initial session lifetime.
 pub fn serve_with_platform(
     ipc: &dyn LocalIpc,
     socket: &SocketPath,
     mut session: Session,
     platform: &dyn Platform,
+    lifetime: SessionLifetime,
 ) -> Result<()> {
     let listener = ipc.bind(socket)?;
     listener.set_nonblocking(true)?;
+    let mut pending = match lifetime {
+        SessionLifetime::Retained => None,
+        SessionLifetime::Pending => Some(PendingSession {
+            deadline: Instant::now() + FIRST_ATTACH_TIMEOUT,
+            claimed: false,
+        }),
+    };
     let mut connections = Vec::<Connection>::new();
     let mut active = None::<String>;
-    let mut acknowledged = HashMap::<String, u64>::new();
+    let mut clients_with_open_paths = HashSet::new();
     let mut previous_client = None::<String>;
+    let mut workspace_view = None;
     let mut state = ServerState::Running;
     let process_id = platform.process_id();
     let server_instance = ServerInstanceId(format!(
@@ -438,7 +552,9 @@ pub fn serve_with_platform(
             .as_nanos()
     ));
     let mut published = PublishedState::new(&mut session, server_instance.clone());
+    let mut binding_revision = session.binding_revision();
     let mut operations = OperationTable::default();
+    let mut document_operations = documents::DocumentOperations::default();
     let mut context_epoch = platform
         .system_time()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -453,6 +569,12 @@ pub fn serve_with_platform(
         if matches!(state, ServerState::Stopped) {
             break;
         }
+        if pending
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.deadline)
+        {
+            break;
+        }
         loop {
             match listener.accept() {
                 Ok(stream) => connections.push(Connection::new(stream)?),
@@ -464,7 +586,10 @@ pub fn serve_with_platform(
         let mut index = 0;
         while index < connections.len() {
             let connection = &mut connections[index];
-            let messages = if matches!(connection.role, ConnectionRole::Closing { .. }) {
+            let messages = if matches!(
+                connection.role,
+                ConnectionRole::Closing { .. } | ConnectionRole::ConfirmingAttach { .. }
+            ) {
                 Ok(Vec::new())
             } else {
                 connection.receive()
@@ -472,8 +597,28 @@ pub fn serve_with_platform(
             let mut disconnected = messages.is_err();
             if let Ok(messages) = messages {
                 for message in messages {
+                    let message = match message {
+                        ClientMessage::Chunk { json, last }
+                            if matches!(connection.role, ConnectionRole::Attached { .. }) =>
+                        {
+                            match connection.message_stream.client(json, last) {
+                                Ok(Some(message)) => message,
+                                Ok(None) => continue,
+                                Err(_) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        message => message,
+                    };
                     if matches!(connection.role, ConnectionRole::AwaitHello { .. })
-                        && !matches!(message, ClientMessage::Hello { .. } | ClientMessage::Status)
+                        && !matches!(
+                            message,
+                            ClientMessage::Hello { .. }
+                                | ClientMessage::Status
+                                | ClientMessage::ClaimPendingSession { .. }
+                        )
                     {
                         connection.send(&ServerMessage::Rejected {
                             reason:
@@ -482,6 +627,25 @@ pub fn serve_with_platform(
                         })?;
                         connection.close_after_flush();
                         break;
+                    }
+                    if pending.is_some() {
+                        let allowed = match &message {
+                            ClientMessage::Hello { .. }
+                            | ClientMessage::Status
+                            | ClientMessage::ClaimPendingSession { .. }
+                            | ClientMessage::Detach => true,
+                            ClientMessage::Attach { .. }
+                            | ClientMessage::Resync { .. }
+                            | ClientMessage::ConfirmAttach => connection.claimed_pending_session,
+                            _ => false,
+                        };
+                        if !allowed {
+                            connection.send(&ServerMessage::Rejected {
+                                reason: "session is awaiting its first terminal attachment".into(),
+                            })?;
+                            connection.close_after_flush();
+                            break;
+                        }
                     }
                     match message {
                         ClientMessage::Hello { build_id }
@@ -498,13 +662,35 @@ pub fn serve_with_platform(
                                 accepted: Instant::now(),
                             };
                         }
-                        ClientMessage::Status
+                        message @ (ClientMessage::Status
+                        | ClientMessage::ClaimPendingSession { .. })
                             if matches!(
                                 connection.role,
                                 ConnectionRole::Unidentified { .. }
                                     | ConnectionRole::AwaitHello { .. }
                             ) =>
                         {
+                            let claim = if let ClientMessage::ClaimPendingSession { pid } = message
+                            {
+                                if let Some(pending) = pending.as_mut()
+                                    && !pending.claimed
+                                    && pid == process_id
+                                    && matches!(connection.role, ConnectionRole::AwaitHello { .. })
+                                {
+                                    pending.claimed = true;
+                                    connection.claimed_pending_session = true;
+                                    true
+                                } else {
+                                    connection.send(&ServerMessage::Rejected {
+                                        reason: "session is unavailable for first attachment"
+                                            .into(),
+                                    })?;
+                                    connection.close_after_flush();
+                                    break;
+                                }
+                            } else {
+                                false
+                            };
                             connection.send(&ServerMessage::Status {
                                 build_id: zess_build::BUILD_ID.to_owned(),
                                 session_id: published.session_id.clone(),
@@ -515,9 +701,12 @@ pub fn serve_with_platform(
                                 workspace: session.workspace().to_string_lossy().into_owned(),
                                 attached: active.is_some(),
                                 modified: session.modified(),
+                                pending: pending.is_some(),
                             })?;
-                            connection.close_after_flush();
-                            break;
+                            if !claim {
+                                connection.close_after_flush();
+                                break;
+                            }
                         }
                         ClientMessage::Stop { force }
                             if matches!(connection.role, ConnectionRole::Unidentified { .. }) =>
@@ -540,7 +729,6 @@ pub fn serve_with_platform(
                             width,
                             height,
                             files,
-                            context_epoch: previous_epoch,
                         } if matches!(connection.role, ConnectionRole::Unidentified { .. }) => {
                             if expected_session
                                 .as_ref()
@@ -577,186 +765,75 @@ pub fn serve_with_platform(
                                     client: client_id.clone(),
                                 };
                                 session.resize(width, height);
-                                if !acknowledged.contains_key(&client_id) {
+                                if !files.is_empty()
+                                    && clients_with_open_paths.insert(client_id.clone())
+                                {
                                     session.open_paths(&files);
                                 }
-                                let client_id_for_resend = client_id.clone();
+                                if pending.is_some() {
+                                    connection.send(&ServerMessage::AttachPending)?;
+                                }
                                 connection.send(&ServerMessage::Attached {
                                     server_instance: server_instance.clone(),
-                                    acknowledged: *acknowledged.entry(client_id).or_default(),
                                     context_epoch,
-                                    replay_allowed: previous_epoch
-                                        .is_none_or(|epoch| epoch == context_epoch),
-                                    frame: session.frame(),
+                                    workspace_view: workspace_view.clone(),
                                 })?;
                                 published.refresh(&mut session);
-                                connection.send(&published.snapshot())?;
-                                operations.resend(
-                                    &client_id_for_resend,
-                                    &server_instance,
-                                    connection,
-                                )?;
-                                if let Some((id, primary)) = session.clipboard_request() {
+                                connection.send(&published.snapshot(&session))?;
+                                operations.resend(&client_id, &server_instance, connection)?;
+                                if pending.is_none()
+                                    && let Some((id, primary)) = session.clipboard_request()
+                                {
                                     connection
                                         .send(&ServerMessage::ClipboardRead { id, primary })?;
                                 }
                             }
                         }
-                        ClientMessage::Input {
-                            sequence,
-                            key,
-                            context_epoch: input_epoch,
-                        } if matches!(connection.role, ConnectionRole::Attached { .. }) => {
-                            if input_epoch != context_epoch {
-                                connection.send(&ServerMessage::Rejected {
-                                    reason: "input context changed; reconnect before replaying queued input".into(),
-                                })?;
-                                connection.close_after_flush();
-                                break;
-                            }
-                            let client = connection.role.client().unwrap();
-                            let watermark = acknowledged.get_mut(client).unwrap();
-                            if sequence == *watermark + 1 {
-                                session.input(&key);
-                                *watermark = sequence;
-                            } else if sequence > *watermark + 1 {
-                                connection.send(&ServerMessage::Rejected {
-                                    reason: "input sequence gap; reconnect to retry unacknowledged input".into(),
-                                })?;
-                                connection.close_after_flush();
-                                break;
-                            }
-                            connection.send_clipboard_effects(&mut session)?;
-                            connection.send(&ServerMessage::Ack {
-                                acknowledged: *watermark,
-                                context_epoch,
-                            })?;
-                            published.publish(&mut session, connection)?;
-                        }
-                        ClientMessage::TrackedInput {
-                            request_id,
-                            server_instance: expected,
-                            sequence,
-                            key,
-                            context_epoch: input_epoch,
-                        } if matches!(connection.role, ConnectionRole::Attached { .. }) => {
-                            if expected != server_instance {
-                                connection.send(&ServerMessage::CommandResult {
-                                    request_id,
-                                    server_instance: server_instance.clone(),
-                                    result: OperationResult::Unknown,
-                                })?;
-                                continue;
-                            }
-                            if input_epoch != context_epoch {
-                                connection.send(&ServerMessage::Rejected { reason: "input context changed; reconnect before replaying queued input".into() })?;
-                                connection.close_after_flush();
-                                break;
-                            }
-                            let client = connection.role.client().unwrap().clone();
-                            let watermark = acknowledged.get_mut(&client).unwrap();
-                            let result = if sequence == *watermark + 1 {
-                                let (result, delta) = operations.execute(
-                                    &client,
-                                    request_id,
-                                    OperationAction::Input {
-                                        sequence,
-                                        key,
-                                        context_epoch: input_epoch,
-                                    },
-                                    &mut session,
-                                    &mut published,
-                                );
-                                *watermark = sequence;
-                                if let Some(delta) = delta {
-                                    connection.send(&delta)?;
-                                }
-                                result
-                            } else if sequence <= *watermark {
-                                operations.result(&client, request_id)
-                            } else {
-                                connection.send(&ServerMessage::Rejected { reason: "input sequence gap; reconnect to retry unacknowledged input".into() })?;
-                                connection.close_after_flush();
-                                break;
-                            };
-                            connection.send_clipboard_effects(&mut session)?;
-                            published.publish(&mut session, connection)?;
-                            connection.send(&ServerMessage::Ack {
-                                acknowledged: *watermark,
-                                context_epoch,
-                            })?;
-                            connection.send(&ServerMessage::CommandResult {
-                                request_id,
-                                server_instance: server_instance.clone(),
-                                result,
-                            })?;
-                        }
-                        ClientMessage::Mouse {
-                            sequence,
-                            context_epoch: input_epoch,
-                            mouse_context,
-                            event,
-                        } if matches!(connection.role, ConnectionRole::Attached { .. }) => {
-                            if input_epoch != context_epoch {
-                                connection.send(&ServerMessage::Rejected { reason: "input context changed; reconnect before sending mouse input".into() })?;
-                                connection.close_after_flush();
-                                break;
-                            }
-                            let watermark = acknowledged
-                                .get_mut(connection.role.client().unwrap())
-                                .unwrap();
-                            if sequence == *watermark + 1 {
-                                session.mouse(mouse_context, event);
-                                *watermark = sequence;
-                            } else if sequence > *watermark + 1 {
-                                connection.send(&ServerMessage::Rejected { reason: "input sequence gap; reconnect to retry unacknowledged input".into() })?;
-                                connection.close_after_flush();
-                                break;
-                            }
-                            connection.send_clipboard_effects(&mut session)?;
-                            connection.send(&ServerMessage::Ack {
-                                acknowledged: *watermark,
-                                context_epoch,
-                            })?;
-                            published.publish(&mut session, connection)?;
-                        }
-                        ClientMessage::Skip {
-                            through,
-                            context_epoch: input_epoch,
-                        } if matches!(connection.role, ConnectionRole::Attached { .. })
-                            && input_epoch == context_epoch =>
+                        ClientMessage::ConfirmAttach
+                            if connection.claimed_pending_session
+                                && matches!(connection.role, ConnectionRole::Attached { .. })
+                                && !connection.eof
+                                && pending
+                                    .as_ref()
+                                    .is_some_and(|pending| Instant::now() < pending.deadline) =>
                         {
-                            let watermark = acknowledged
-                                .get_mut(connection.role.client().unwrap())
-                                .unwrap();
-                            *watermark = (*watermark).max(through);
-                            connection.send(&ServerMessage::Ack {
-                                acknowledged: *watermark,
-                                context_epoch,
-                            })?;
+                            connection.send(&ServerMessage::AttachConfirmed)?;
+                            connection.role = ConnectionRole::ConfirmingAttach {
+                                client: connection.role.client().unwrap().clone(),
+                            };
+                            break;
+                        }
+                        ClientMessage::Document(request)
+                            if matches!(connection.role, ConnectionRole::Attached { .. }) =>
+                        {
+                            document_operations.request(&mut session, connection, request)?;
                             published.publish(&mut session, connection)?;
+                        }
+                        ClientMessage::FormatStatusline { id, name, context }
+                            if matches!(connection.role, ConnectionRole::Attached { .. }) =>
+                        {
+                            let result = session
+                                .format_client_statusline(&name, &context)
+                                .map_err(|error| format!("{error:#}"));
+                            connection.send(&ServerMessage::FormattedStatusline { id, result })?;
+                        }
+                        ClientMessage::SaveWorkspaceView { view }
+                            if matches!(connection.role, ConnectionRole::Attached { .. }) =>
+                        {
+                            workspace_view = Some(view);
+                            connection.send(&ServerMessage::WorkspaceViewSaved)?;
                         }
                         ClientMessage::Resize { width, height }
                             if matches!(connection.role, ConnectionRole::Attached { .. }) =>
                         {
                             session.resize(width, height);
-                            let watermark = acknowledged[connection.role.client().unwrap()];
-                            connection.send(&ServerMessage::Ack {
-                                acknowledged: watermark,
-                                context_epoch,
-                            })?;
                             published.publish(&mut session, connection)?;
                         }
                         ClientMessage::ClipboardResponse { id, text, error }
                             if matches!(connection.role, ConnectionRole::Attached { .. }) =>
                         {
                             session.complete_clipboard_read(id, text, error);
-                            let watermark = acknowledged[connection.role.client().unwrap()];
                             connection.send_clipboard_effects(&mut session)?;
-                            connection.send(&ServerMessage::Ack {
-                                acknowledged: watermark,
-                                context_epoch,
-                            })?;
                             published.publish(&mut session, connection)?;
                         }
                         ClientMessage::Resync { session_id, .. }
@@ -766,10 +843,21 @@ pub fn serve_with_platform(
                                 connection.send(&ServerMessage::Rejected {
                                     reason: "session identity changed".into(),
                                 })?;
+                                if pending.is_some() {
+                                    connection.close_after_flush();
+                                    break;
+                                }
                             } else {
                                 published.refresh(&mut session);
-                                connection.send(&published.snapshot())?;
+                                connection.send(&published.snapshot(&session))?;
+                                let client = connection.role.client().unwrap().clone();
+                                operations.resend(&client, &server_instance, connection)?;
                             }
+                        }
+                        ClientMessage::Resource { request }
+                            if matches!(connection.role, ConnectionRole::Attached { .. }) =>
+                        {
+                            session.handle_resource(request);
                         }
                         ClientMessage::Command {
                             request_id,
@@ -785,7 +873,7 @@ pub fn serve_with_platform(
                                 let (result, delta) = operations.execute(
                                     &client,
                                     request_id,
-                                    OperationAction::Command(action),
+                                    action,
                                     &mut session,
                                     &mut published,
                                 );
@@ -796,6 +884,15 @@ pub fn serve_with_platform(
                             };
                             connection.send_clipboard_effects(&mut session)?;
                             published.publish(&mut session, connection)?;
+                            if matches!(
+                                &result,
+                                OperationResult::Completed {
+                                    outcome: CommandOutcome::PageApplied { .. },
+                                    ..
+                                }
+                            ) {
+                                publish_resources(&mut session, Some(connection))?;
+                            }
                             let exited = client_exit
                                 && matches!(
                                     &result,
@@ -843,10 +940,25 @@ pub fn serve_with_platform(
                             request_id,
                             server_instance: expected,
                         } if matches!(connection.role, ConnectionRole::Attached { .. }) => {
-                            if expected == server_instance {
-                                operations
-                                    .acknowledge(connection.role.client().unwrap(), request_id);
+                            if expected == server_instance
+                                && let Some(id) = operations
+                                    .acknowledge(connection.role.client().unwrap(), request_id)
+                                && !connection.owns_page_document(id, workspace_view.as_ref())
+                                && !operations.retains_page_document(id)
+                            {
+                                let _ = session.close_page_document(id, false);
+                                published.publish(&mut session, connection)?;
                             }
+                        }
+                        ClientMessage::Detach
+                            if pending.is_none()
+                                && matches!(connection.role, ConnectionRole::Attached { .. }) =>
+                        {
+                            connection.send(&ServerMessage::Detached {
+                                disposition: zess_protocol::ClientExitDisposition::Retained,
+                            })?;
+                            connection.close_after_flush();
+                            break;
                         }
                         ClientMessage::Detach => {
                             disconnected = true;
@@ -857,7 +969,9 @@ pub fn serve_with_platform(
                             break;
                         }
                     }
-                    if matches!(connection.role, ConnectionRole::Attached { .. }) {
+                    if pending.is_none()
+                        && matches!(connection.role, ConnectionRole::Attached { .. })
+                    {
                         let copied = session.flush_clipboard_writes(|text| {
                             connection.send(&ServerMessage::ClipboardWrite { text })
                         });
@@ -867,18 +981,40 @@ pub fn serve_with_platform(
                         if copied || primary_copied {
                             published.publish(&mut session, connection)?;
                         }
+                        connection.publish_documents(&mut session)?;
                     }
                     if session.exiting() || matches!(state, ServerState::Draining { .. }) {
                         break;
                     }
                 }
             }
-            let flush_failed = connection.flush().is_err();
-            if flush_failed {
-                disconnected = true;
+            match connection.flush() {
+                Ok(advanced) => {
+                    if advanced
+                        && connection.claimed_pending_session
+                        && matches!(connection.role, ConnectionRole::Attached { .. })
+                        && let Some(pending) = &mut pending
+                    {
+                        pending.deadline = Instant::now() + FIRST_ATTACH_TIMEOUT;
+                    }
+                }
+                Err(_) => disconnected = true,
             }
             if connection.eof {
                 disconnected = true;
+            }
+            if !disconnected
+                && connection.output.is_empty()
+                && let ConnectionRole::ConfirmingAttach { client } = &connection.role
+            {
+                pending = None;
+                connection.claimed_pending_session = false;
+                connection.role = ConnectionRole::Attached {
+                    client: client.clone(),
+                };
+                if let Some((id, primary)) = session.clipboard_request() {
+                    connection.send(&ServerMessage::ClipboardRead { id, primary })?;
+                }
             }
             if matches!(connection.role, ConnectionRole::Closing { .. })
                 && connection.output.is_empty()
@@ -898,11 +1034,17 @@ pub fn serve_with_platform(
                 _ => {}
             }
             if disconnected {
+                if pending.is_some() && connection.claimed_pending_session {
+                    return Ok(());
+                }
                 let stopping = connection.exit_disposition
                     == Some(zess_protocol::ClientExitDisposition::Stopping);
-                connections
-                    .remove(index)
-                    .disconnect(&mut session, &mut active);
+                connections.remove(index).disconnect(
+                    &mut session,
+                    &mut active,
+                    workspace_view.as_ref(),
+                    |id| operations.retains_page_document(id),
+                );
                 if stopping {
                     state = ServerState::Draining {
                         deadline: Instant::now() + DRAIN_TIMEOUT,
@@ -930,7 +1072,25 @@ pub fn serve_with_platform(
             };
             continue;
         }
+        if pending.is_some() {
+            thread::sleep(Duration::from_millis(8));
+            continue;
+        }
         let changed = session.tick();
+        let revision = session.binding_revision();
+        if revision != binding_revision {
+            binding_revision = revision;
+            if let Some(connection) = connections
+                .iter_mut()
+                .find(|connection| matches!(connection.role, ConnectionRole::Attached { .. }))
+            {
+                connection.send(&ServerMessage::Bindings(session.binding_catalog()))?;
+            }
+        }
+        let attached = connections
+            .iter_mut()
+            .find(|connection| matches!(connection.role, ConnectionRole::Attached { .. }));
+        publish_resources(&mut session, attached)?;
         let completed = session.take_operation_completions();
         let has_attached = connections
             .iter()
@@ -957,43 +1117,44 @@ pub fn serve_with_platform(
             });
         if changed || copied || primary_copied || !completed.is_empty() {
             let delta = published.refresh(&mut session);
-            let mut index = 0;
-            while index < connections.len() {
-                let connection = &mut connections[index];
-                if let ConnectionRole::Attached { client } = &connection.role {
-                    let watermark = acknowledged[client];
-                    connection.send(&ServerMessage::Ack {
-                        acknowledged: watermark,
-                        context_epoch,
-                    })?;
+            for connection in &mut connections {
+                if matches!(connection.role, ConnectionRole::Attached { .. }) {
                     if let Some(delta) = &delta {
                         connection.send(delta)?;
                     }
-                }
-                if connection.flush().is_err() {
-                    connections
-                        .remove(index)
-                        .disconnect(&mut session, &mut active);
-                } else {
-                    index += 1;
+                    connection.publish_documents(&mut session)?;
                 }
             }
-        }
-        for (token, outcome) in completed {
-            if let Some((client, request_id, result)) =
-                operations.complete(&token, outcome, published.revision)
-            {
-                if let Some(connection) = connections.iter_mut().find(|connection| {
-                    connection
-                        .role
-                        .client()
-                        .is_some_and(|owner| owner == client)
-                }) {
+            for (token, outcome) in completed {
+                if let Some((client, request_id, result)) =
+                    operations.complete(&token, outcome, published.revision)
+                    && let Some(connection) = connections.iter_mut().find(|connection| {
+                        connection
+                            .role
+                            .client()
+                            .is_some_and(|owner| owner == client)
+                    })
+                {
                     connection.send(&ServerMessage::CommandResult {
                         request_id,
                         server_instance: server_instance.clone(),
                         result,
                     })?;
+                }
+            }
+            // A failed flush can detach the terminal and reclaim fullscreen documents.
+            let mut index = 0;
+            while index < connections.len() {
+                let connection = &mut connections[index];
+                if connection.flush().is_err() {
+                    connections.remove(index).disconnect(
+                        &mut session,
+                        &mut active,
+                        workspace_view.as_ref(),
+                        |id| operations.retains_page_document(id),
+                    );
+                } else {
+                    index += 1;
                 }
             }
         }

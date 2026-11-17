@@ -1,5 +1,5 @@
 use super::*;
-use zess_protocol::ViewContent;
+use zess_protocol::{CommandTarget, ViewContent};
 
 struct Server {
     root: std::path::PathBuf,
@@ -9,6 +9,10 @@ struct Server {
 
 impl Server {
     fn start() -> Self {
+        Self::start_with_workspace(|_| {})
+    }
+
+    fn start_with_workspace(prepare: impl FnOnce(&std::path::Path)) -> Self {
         let root = std::env::temp_dir().join(format!(
             "zess-clipboard-owner-{}-{}",
             std::process::id(),
@@ -20,13 +24,17 @@ impl Server {
         fs::create_dir(&root).unwrap();
         let file = root.join("note.txt");
         fs::write(&file, "original\n").unwrap();
+        prepare(&root);
         let socket = root.join("server.sock");
         let (workspace, endpoint) = (root.clone(), socket.clone());
         let thread = thread::spawn(move || {
+            let mut session = Session::new(workspace, &[file], None)?;
+            session.input("\"");
+            session.input("+");
             serve(
                 &zess_ipc::NativeLocalIpc,
                 &SocketPath::from(endpoint),
-                Session::new(workspace, &[file], None)?,
+                session,
             )
         });
         let server = Self {
@@ -71,14 +79,11 @@ struct Client {
     instance: ServerInstanceId,
     session: SessionId,
     epoch: u64,
+    target: CommandTarget,
 }
 
 impl Client {
-    fn attach(
-        server: &Server,
-        client_id: &str,
-        previous_epoch: Option<u64>,
-    ) -> (Self, SessionSnapshot) {
+    fn attach(server: &Server, client_id: &str) -> (Self, SessionSnapshot) {
         let mut stream = UnixStream::connect(&server.socket).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -105,7 +110,6 @@ impl Client {
                 width: 80,
                 height: 24,
                 files: Vec::new(),
-                context_epoch: previous_epoch,
             },
         )
         .unwrap();
@@ -114,15 +118,11 @@ impl Client {
         let ServerMessage::Attached {
             server_instance,
             context_epoch,
-            replay_allowed,
             ..
         } = serde_json::from_str(&line).unwrap()
         else {
             panic!("client did not attach")
         };
-        if let Some(epoch) = previous_epoch {
-            assert_eq!(replay_allowed, epoch == context_epoch);
-        }
         line.clear();
         assert!(reader.read_line(&mut line).unwrap() > 0);
         let ServerMessage::Snapshot {
@@ -131,6 +131,15 @@ impl Client {
         else {
             panic!("client did not receive a semantic snapshot")
         };
+        let view = state
+            .views
+            .iter()
+            .find(|view| Some(view.view_id) == state.focused_view)
+            .unwrap();
+        let target = CommandTarget::View {
+            view_id: view.view_id,
+            buffer_id: view.buffer_id,
+        };
         (
             Self {
                 stream,
@@ -138,9 +147,22 @@ impl Client {
                 instance: server_instance,
                 session: session_id,
                 epoch: context_epoch,
+                target,
             },
             state,
         )
+    }
+
+    fn command(&self, request_id: RequestId, name: &str) -> ClientMessage {
+        ClientMessage::Command {
+            request_id,
+            server_instance: self.instance.clone(),
+            action: CommandAction::Invoke {
+                target: self.target.clone(),
+                name: name.into(),
+                argument: serde_json::json!({}),
+            },
+        }
     }
 
     fn send(&mut self, message: ClientMessage) {
@@ -209,21 +231,8 @@ fn document(state: &SessionSnapshot) -> &ViewContent {
 #[test]
 fn changing_clients_cancels_a_clipboard_read_while_the_same_client_can_resume_it() {
     let server = Server::start();
-    let (mut first, original) = Client::attach(&server, "A", None);
-    for (sequence, key) in [(1, "\""), (2, "+")] {
-        first.send(ClientMessage::Input {
-            sequence,
-            key: key.into(),
-            context_epoch: first.epoch,
-        });
-    }
-    first.send(ClientMessage::TrackedInput {
-        request_id: RequestId(1),
-        server_instance: first.instance.clone(),
-        sequence: 3,
-        key: "p".into(),
-        context_epoch: first.epoch,
-    });
+    let (mut first, original) = Client::attach(&server, "A");
+    first.send(first.command(RequestId(1), "text.paste-after"));
     let read_id = loop {
         if let ServerMessage::ClipboardRead { id, .. } = first.receive() {
             break id;
@@ -231,7 +240,7 @@ fn changing_clients_cancels_a_clipboard_read_while_the_same_client_can_resume_it
     };
     let first_epoch = first.epoch;
     first.detach();
-    let (mut resumed, state) = Client::attach(&server, "A", Some(first_epoch));
+    let (mut resumed, state) = Client::attach(&server, "A");
     assert_eq!(resumed.epoch, first_epoch);
     assert_eq!(document(&state), document(&original));
     loop {
@@ -241,7 +250,7 @@ fn changing_clients_cancels_a_clipboard_read_while_the_same_client_can_resume_it
         }
     }
     resumed.detach();
-    let (mut second, _) = Client::attach(&server, "B", None);
+    let (mut second, _) = Client::attach(&server, "B");
     assert_ne!(second.epoch, first_epoch);
     second.snapshot_without_device_requests();
     second.send(ClientMessage::ClipboardResponse {
@@ -253,20 +262,13 @@ fn changing_clients_cancels_a_clipboard_read_while_the_same_client_can_resume_it
         request_id: RequestId(1),
         server_instance: second.instance.clone(),
     });
-    second.send(ClientMessage::Command {
-        request_id: RequestId(1),
-        server_instance: second.instance.clone(),
-        action: CommandAction::Command {
-            name: "text.move-left".into(),
-            argument: serde_json::json!({}),
-        },
-    });
+    second.send(second.command(RequestId(1), "text.move-left"));
     assert_eq!(second.result(RequestId(1)), CommandOutcome::Applied);
     let state = second.snapshot_without_device_requests();
     assert_eq!(document(&state), document(&original));
     assert!(!state.modified);
     second.detach();
-    let (mut first, _) = Client::attach(&server, "A", Some(first_epoch));
+    let (mut first, _) = Client::attach(&server, "A");
     assert!(
         matches!(first.result(RequestId(1)), CommandOutcome::Failed { message } if message.contains("another client attached"))
     );
@@ -276,25 +278,10 @@ fn changing_clients_cancels_a_clipboard_read_while_the_same_client_can_resume_it
 fn a_pending_clipboard_command_survives_early_acknowledgment_and_replay() {
     let server = Server::start();
     let client_id = "clipboard:resume";
-    let (mut client, _) = Client::attach(&server, client_id, None);
-    for (sequence, key) in [(1, "\""), (2, "+")] {
-        client.send(ClientMessage::Input {
-            sequence,
-            key: key.into(),
-            context_epoch: client.epoch,
-        });
-    }
+    let (mut client, _) = Client::attach(&server, client_id);
     let request_id = RequestId(1);
     let instance = client.instance.clone();
-    let paste = || ClientMessage::Command {
-        request_id,
-        server_instance: instance.clone(),
-        action: CommandAction::Command {
-            name: "text.paste-after".into(),
-            argument: serde_json::json!({}),
-        },
-    };
-    client.send(paste());
+    client.send(client.command(request_id, "text.paste-after"));
     let read_id = loop {
         if let ServerMessage::ClipboardRead { id, .. } = client.receive() {
             break id;
@@ -304,16 +291,15 @@ fn a_pending_clipboard_command_survives_early_acknowledgment_and_replay() {
         request_id,
         server_instance: instance.clone(),
     });
-    let epoch = client.epoch;
     client.detach();
 
-    let (mut client, _) = Client::attach(&server, client_id, Some(epoch));
+    let (mut client, _) = Client::attach(&server, client_id);
     assert!(matches!(client.receive(), ServerMessage::CommandResult {
         request_id: received, result: OperationResult::Pending, ..
     } if received == request_id));
     assert!(matches!(client.receive(), ServerMessage::ClipboardRead { id, .. } if id == read_id));
 
-    client.send(paste());
+    client.send(client.command(request_id, "text.paste-after"));
     assert!(matches!(client.receive(), ServerMessage::ClipboardRead { id, .. } if id == read_id));
     assert!(matches!(client.receive(), ServerMessage::CommandResult {
         request_id: received, result: OperationResult::Pending, ..
@@ -327,74 +313,208 @@ fn a_pending_clipboard_command_survives_early_acknowledgment_and_replay() {
 }
 
 #[test]
-fn clipboard_effects_arrive_before_the_input_or_command_result() {
-    for tracked in [false, true] {
-        for read in [false, true] {
-            let server = Server::start();
-            let (mut client, _) = Client::attach(&server, "device-order", None);
-            for (sequence, key) in [(1, "\""), (2, "+")] {
-                client.send(ClientMessage::Input {
-                    sequence,
-                    key: key.into(),
-                    context_epoch: client.epoch,
-                });
-            }
-            loop {
-                if matches!(
-                    client.receive(),
-                    ServerMessage::Ack {
-                        acknowledged: 2,
-                        ..
-                    }
-                ) {
+fn clipboard_effects_arrive_before_the_command_result() {
+    for (command, read) in [
+        ("text.paste-after", true),
+        ("text.yank-to-clipboard", false),
+    ] {
+        let server = Server::start();
+        let (mut client, _) = Client::attach(&server, "device-order");
+        client.send(client.command(RequestId(1), command));
+        let mut effect_received = false;
+        loop {
+            match client.receive() {
+                ServerMessage::ClipboardRead { .. } if read => effect_received = true,
+                ServerMessage::ClipboardWrite { .. } if !read => effect_received = true,
+                ServerMessage::CommandResult {
+                    request_id: RequestId(1),
+                    ..
+                } => {
+                    assert!(
+                        effect_received,
+                        "the command result must follow its clipboard effect"
+                    );
                     break;
                 }
-            }
-            let key = if read { "p" } else { "y" }.to_owned();
-            client.send(if tracked {
-                ClientMessage::TrackedInput {
-                    request_id: RequestId(1),
-                    server_instance: client.instance.clone(),
-                    sequence: 3,
-                    key,
-                    context_epoch: client.epoch,
-                }
-            } else {
-                ClientMessage::Input {
-                    sequence: 3,
-                    key,
-                    context_epoch: client.epoch,
-                }
-            });
-            let mut effect_received = false;
-            loop {
-                match client.receive() {
-                    ServerMessage::ClipboardRead { .. } if read => effect_received = true,
-                    ServerMessage::ClipboardWrite { .. } if !read => effect_received = true,
-                    ServerMessage::Ack {
-                        acknowledged: 3, ..
-                    } => {
-                        assert!(
-                            effect_received,
-                            "the prefix ACK must follow its clipboard effect"
-                        );
-                        if !tracked {
-                            break;
-                        }
-                    }
-                    ServerMessage::CommandResult {
-                        request_id: RequestId(1),
-                        ..
-                    } => {
-                        assert!(
-                            effect_received,
-                            "the tracked result must follow its clipboard effect"
-                        );
-                        break;
-                    }
-                    _ => {}
-                }
+                _ => {}
             }
         }
+    }
+}
+
+#[test]
+fn files_and_git_yanks_deliver_the_copied_values_to_the_requesting_client() {
+    use zess_plugin::{HostRequest, ItemNavigation, ItemSelection};
+    use zess_protocol::resource::{
+        PageCommandInput, PageInput, PageSource, ResourceEvent, ResourceRequest,
+    };
+
+    let server = Server::start_with_workspace(|root| {
+        for arguments in [
+            &["init", "--quiet"][..],
+            &["add", "note.txt"],
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::write(root.join("note.txt"), "working\n").unwrap();
+        fs::write(root.join("other.txt"), "other\n").unwrap();
+    });
+    let client_id = "page-yank";
+    let (mut client, _) = Client::attach(&server, client_id);
+    let mut completed = Vec::new();
+    for (id, kind, command, path, register) in [
+        (1, "files", "files.yank-content", "note.txt", '+'),
+        (2, "git", "git.yank-diff", "file:note.txt", 'a'),
+    ] {
+        let mut input = PageInput {
+            generation: 1,
+            selection: ItemSelection::default(),
+            mode: "normal".into(),
+            filter: None,
+            register: None,
+            source_buffer: None,
+            width: 40,
+            active: true,
+            preview_width: 39,
+            preview_height: 22,
+        };
+        client.send(ClientMessage::Resource {
+            request: ResourceRequest::Subscribe {
+                subscription_id: id,
+                page_id: zess_protocol::resource::PageId {
+                    context_epoch: 0,
+                    sequence: id,
+                },
+                clone_from: None,
+                source: PageSource {
+                    kind: kind.into(),
+                    argument: serde_json::json!({}),
+                },
+                input: input.clone(),
+            },
+        });
+        loop {
+            let ServerMessage::Resource { update } = client.receive() else {
+                continue;
+            };
+            if update.subscription_id == id
+                && update
+                    .output
+                    .display
+                    .is_some_and(|display| display.rows.iter().any(|row| row.id == path))
+            {
+                break;
+            }
+        }
+        let command_input = PageCommandInput {
+            generation: input.generation,
+            selection: ItemSelection {
+                primary: Some(path.into()),
+                anchor: Some(path.into()),
+                selected: vec![path.into()],
+            },
+            register: Some(register),
+        };
+        let other = if kind == "files" {
+            "other.txt"
+        } else {
+            "file:other.txt"
+        };
+        input.generation += 1;
+        input.selection = ItemSelection {
+            primary: Some(other.into()),
+            anchor: Some(other.into()),
+            selected: vec![other.into()],
+        };
+        input.register = Some('b');
+        client.send(ClientMessage::Resource {
+            request: ResourceRequest::Update {
+                subscription_id: id,
+                input,
+                event: ResourceEvent::Select {
+                    navigation: ItemNavigation::Step,
+                },
+            },
+        });
+        let request_id = RequestId(id);
+        client.send(ClientMessage::Command {
+            request_id,
+            server_instance: client.instance.clone(),
+            action: CommandAction::Invoke {
+                target: CommandTarget::Page {
+                    subscription_id: id,
+                    input: command_input,
+                },
+                name: command.into(),
+                argument: serde_json::json!({}),
+            },
+        });
+        let outcome = loop {
+            match client.receive() {
+                ServerMessage::CommandResult {
+                    request_id: received,
+                    result: OperationResult::Completed { outcome, .. },
+                    ..
+                } if received == request_id => break outcome,
+                ServerMessage::ClipboardWrite { .. }
+                | ServerMessage::ClipboardWritePrimary { .. } => {
+                    panic!("page yank emitted a separate clipboard write")
+                }
+                ServerMessage::Resource { update } => assert!(
+                    !update
+                        .output
+                        .requests
+                        .iter()
+                        .any(|request| matches!(request, HostRequest::Yank { .. }))
+                ),
+                _ => {}
+            }
+        };
+        let CommandOutcome::Yanked {
+            values,
+            register: destination,
+        } = &outcome
+        else {
+            panic!("missing yank values in {outcome:?}");
+        };
+        assert_eq!(*destination, register);
+        let [value] = values.as_slice() else {
+            panic!("expected one copied value, got {values:?}");
+        };
+        if kind == "files" {
+            assert_eq!(value, "working\n");
+        } else {
+            assert!(
+                value.contains("diff --git a/note.txt b/note.txt"),
+                "{value}"
+            );
+            assert!(value.contains("\n-original\n+working\n"), "{value}");
+        }
+        completed.push((request_id, outcome));
+    }
+
+    client.detach();
+    let (mut client, _) = Client::attach(&server, client_id);
+    for (request_id, outcome) in completed {
+        assert_eq!(client.result(request_id), outcome);
     }
 }

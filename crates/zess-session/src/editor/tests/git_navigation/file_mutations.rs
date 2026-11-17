@@ -127,7 +127,7 @@ fn discard_confirmation_can_be_cancelled_before_restoring_the_staged_copy() {
     settle(&mut session);
     session.execute_command("git.discard", json!({})).unwrap();
     assert_eq!(
-        session.frame().prompt,
+        prompt_text(&mut session),
         "Restore working tree from index: \"note.txt\". Type yes to confirm: "
     );
     session.input("Esc");

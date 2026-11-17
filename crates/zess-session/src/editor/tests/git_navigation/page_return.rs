@@ -176,9 +176,9 @@ register-command "pair" "Show paired previews"
                     session.views.page_id(slot.view().unwrap().id) == session.views.page_id(source)
                 );
             }
-            session.frame();
+            session.snapshot();
             session.input("j");
-            session.frame();
+            session.snapshot();
             session.command("q").unwrap();
             assert!(!session.exiting());
             assert_eq!(session.focus, source);
@@ -226,12 +226,12 @@ fn help_returns_to_the_page_when_its_original_diff_pane_is_retired() {
         wait_until(&mut session, |session| !session.views.contains_key(&staged));
 
         assert_eq!(session.focus, help);
-        session.frame();
+        session.snapshot();
         session.input("Esc");
         assert_eq!(session.focus, source);
         assert!(!session.views.contains_key(&help));
         assert_eq!(selected_row(&session, source).id, "file:note.txt");
-        session.frame();
+        session.snapshot();
         session.command("q").unwrap();
         assert_eq!(session.views[&source].location.buffer, origin);
         assert!(!session.exiting());

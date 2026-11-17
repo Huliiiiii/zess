@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::DiffSide;
 
 /// Zero-based row in the exact raw patch shown to the user.
-#[derive(Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct PatchRow(pub usize);
 
 #[derive(Clone, Copy, PartialEq)]

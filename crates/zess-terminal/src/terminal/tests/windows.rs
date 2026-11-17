@@ -6,8 +6,9 @@ use std::process::Command;
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows_sys::Win32::System::Console::{
     AllocConsole, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
-    ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE,
-    STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
+    ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, GetConsoleMode, GetStdHandle, INPUT_RECORD,
+    KEY_EVENT, KEY_EVENT_RECORD, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
+    WriteConsoleInputW,
 };
 use windows_sys::Win32::System::Threading::DETACHED_PROCESS;
 
@@ -112,14 +113,43 @@ fn connection_failure_restores_console_modes_before_returning() {
         || {
             struct Unavailable;
             impl crate::ConnectionFactory for Unavailable {
-                fn connect(&mut self) -> Result<Box<dyn crate::ConnectionStream>> {
+                fn connect(
+                    &mut self,
+                    _: &crate::ConnectionContext,
+                ) -> Result<Box<dyn crate::ConnectionStream>> {
+                    // The failed connection remains in the UI until the user exits.
+                    let console = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open("CONIN$")
+                        .unwrap();
+                    let mut event = INPUT_RECORD {
+                        EventType: KEY_EVENT as u16,
+                        Event: unsafe { std::mem::zeroed() },
+                    };
+                    event.Event.KeyEvent = KEY_EVENT_RECORD {
+                        bKeyDown: 1,
+                        wRepeatCount: 1,
+                        wVirtualKeyCode: 0x1b,
+                        wVirtualScanCode: 0,
+                        uChar: unsafe { std::mem::zeroed() },
+                        dwControlKeyState: 0,
+                    };
+                    event.Event.KeyEvent.uChar.UnicodeChar = 0x1b;
+                    let mut written = 0;
+                    assert_ne!(
+                        unsafe {
+                            WriteConsoleInputW(console.as_raw_handle(), &event, 1, &mut written)
+                        },
+                        0
+                    );
+                    assert_eq!(written, 1);
                     anyhow::bail!("connection unavailable")
                 }
             }
             enable_selection();
             let original = modes();
-            let error = crate::run_connection(&mut Unavailable, &[]).unwrap_err();
-            assert!(error.to_string().contains("connection unavailable"));
+            crate::run_connection(Unavailable, &[]).unwrap();
             assert_eq!(modes(), original);
         },
     );

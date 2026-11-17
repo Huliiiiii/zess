@@ -2,9 +2,10 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+use zess_protocol::{SemanticRow, SurfaceSnapshot, ViewContent, ViewSnapshot, VisibleTextLine};
+
 use super::*;
 
-mod browser_layout;
 mod count_input;
 mod file_reload;
 mod file_yank;
@@ -16,13 +17,14 @@ mod input;
 mod item_scroll;
 mod language;
 mod mode_labels;
-mod mouse;
 mod native_plugins;
 mod outline;
 mod preview_config;
 mod preview_surfaces;
 mod prompt_lifecycle;
 mod regex_input;
+mod resource_documents;
+mod resource_reload;
 mod simulation;
 mod status;
 mod sync_state;
@@ -92,29 +94,41 @@ fn wait_until(session: &mut Session, condition: impl Fn(&mut Session) -> bool) {
             return;
         }
         if Instant::now() >= deadline {
-            let frame = rendered(session);
-            panic!(
-                "timed out waiting for an update: {}\n{frame}",
-                session.message
-            );
+            panic!("timed out waiting for an update: {}", session.message);
         }
         thread::sleep(Duration::from_millis(5));
     }
 }
 
-fn rendered(session: &mut Session) -> String {
+fn view_snapshot(session: &mut Session, view: ViewId) -> ViewSnapshot {
     session
-        .frame()
-        .rows
-        .iter()
-        .map(|row| {
-            row.spans
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .snapshot()
+        .views
+        .into_iter()
+        .find(|current| current.view_id == view)
+        .unwrap()
+}
+
+fn item_rows(content: &ViewContent) -> &[SemanticRow] {
+    let ViewContent::Items { rows } = content else {
+        panic!("expected item rows")
+    };
+    rows
+}
+
+fn text_lines(content: &ViewContent) -> &[VisibleTextLine] {
+    let ViewContent::Text { lines } = content else {
+        panic!("expected text lines")
+    };
+    lines
+}
+
+fn prompt_text(session: &mut Session) -> String {
+    let prompt = session
+        .snapshot()
+        .prompt
+        .expect("expected an active prompt");
+    format!("{}{}", prompt.label, prompt.text)
 }
 
 fn selected_row(session: &Session, id: ViewId) -> &DisplayRow {
@@ -153,24 +167,17 @@ fn preview_text(session: &Session, source: ViewId) -> String {
     text.text()
 }
 
-fn view_rows(session: &mut Session, view: ViewId) -> Vec<String> {
-    let (_, _, _, width, height) = panes(session)
-        .into_iter()
-        .find(|(id, ..)| *id == view)
-        .unwrap();
+fn preview_surface_snapshot(session: &mut Session, source: ViewId) -> SurfaceSnapshot {
+    let RenderTarget::Surface { page, slot } = session.active_preview(source).unwrap() else {
+        panic!("expected a passive preview")
+    };
+    let page_id = session.views.main(page);
     session
-        .render_view(view, width, height)
-        .0
-        .iter()
-        .map(|row| {
-            row.spans
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<String>()
-                .trim_end()
-                .to_owned()
-        })
-        .collect()
+        .snapshot()
+        .surfaces
+        .into_iter()
+        .find(|surface| surface.page_id == page_id && surface.slot_id == slot)
+        .unwrap()
 }
 
 fn preview_groups(session: &Session) -> impl Iterator<Item = &pages::PreviewSlots> {
@@ -231,12 +238,6 @@ fn system_copy_uses_the_same_command_for_default_and_custom_bindings() {
                 !session.flush_clipboard_writes(|_| panic!("ordinary yank copied to clipboard"))
             );
             session.input("space");
-            let frame = session.frame();
-            assert!(frame.rows.iter().flat_map(|row| &row.spans).any(|span| {
-                span.style == "popup"
-                    && span.text.split_whitespace().collect::<Vec<_>>().join(" ")
-                        == "y Copy selections to the system clipboard"
-            }));
             let (scopes, mode) = session.key_context();
             session.scripts.as_ref().unwrap().with_keymap(|keymap| {
                 let binding = keymap
@@ -246,6 +247,16 @@ fn system_copy_uses_the_same_command_for_default_and_custom_bindings() {
                     .unwrap();
                 assert_eq!(binding.command, "text.yank-to-clipboard");
             });
+            session.scripts.as_ref().unwrap().with_commands(|catalog| {
+                let command = catalog
+                    .iter()
+                    .find(|command| command.id == "text.yank-to-clipboard")
+                    .unwrap();
+                assert_eq!(
+                    command.description,
+                    "Copy selections to the system clipboard"
+                );
+            });
         }
         session.input("y");
         let mut copies = Vec::new();
@@ -254,9 +265,12 @@ fn system_copy_uses_the_same_command_for_default_and_custom_bindings() {
             Ok(())
         });
         assert_eq!(copies, [content]);
-        session.frame();
-        session.frame();
-        assert!(!session.flush_clipboard_writes(|_| panic!("redraw repeated clipboard write")));
+        session.snapshot();
+        session.snapshot();
+        assert!(
+            !session
+                .flush_clipboard_writes(|_| panic!("publishing state repeated clipboard write"))
+        );
         assert!(!session.modified());
     }
 }
@@ -431,13 +445,11 @@ fn rejected_buffer_switches_do_not_create_buffers_inside_file_layers() {
     settle(&mut session);
     session.input("e");
     let layer = session.focus;
-    session.command("buffers").unwrap();
-    let buffers = session.frame().status;
+    let buffers = session.snapshot().buffers;
     for command in ["new", "edit other.txt"] {
         assert!(session.command(command).is_err());
         assert_eq!(session.focus, layer);
-        session.command("buffers").unwrap();
-        assert_eq!(session.frame().status, buffers);
+        assert_eq!(session.snapshot().buffers, buffers);
     }
     assert!(
         session
@@ -451,8 +463,7 @@ fn rejected_buffer_switches_do_not_create_buffers_inside_file_layers() {
             .is_err()
     );
     assert_eq!(session.focus, layer);
-    session.command("buffers").unwrap();
-    assert_eq!(session.frame().status, buffers);
+    assert_eq!(session.snapshot().buffers, buffers);
 }
 
 #[test]
@@ -471,13 +482,11 @@ fn draft_layers_reject_plugin_buffer_switches() {
         )
         .unwrap();
     let layer = session.focus;
-    session.command("buffers").unwrap();
-    let buffers = session.frame().status;
+    let buffers = session.snapshot().buffers;
     for command in ["files", "git", "outline"] {
         assert!(session.command(command).is_err());
         assert_eq!(session.focus, layer);
-        session.command("buffers").unwrap();
-        assert_eq!(session.frame().status, buffers);
+        assert_eq!(session.snapshot().buffers, buffers);
     }
 }
 
@@ -689,52 +698,37 @@ fn refreshing_files_keeps_an_open_outline_unchanged() {
             .collect::<Vec<_>>(),
         ["  function_item alpha"]
     );
-    let outline_rows = view_rows(&mut session, outline);
+    let outline_content = view_snapshot(&mut session, outline).content;
     session.input("R");
     settle(&mut session);
     assert_eq!(
         serde_json::to_value(&session.views[&outline].location.display).unwrap(),
         display
     );
-    assert_eq!(view_rows(&mut session, outline), outline_rows);
-}
-
-#[test]
-fn starting_with_a_directory_opens_its_file_tree() {
-    let fixture = Fixture::new();
-    let path = fixture.0.join("note.txt");
-    fs::write(&path, "source\n").unwrap();
-    let mut session = fixture.session(&[PathBuf::from(".")]);
-    settle(&mut session);
-    let view = &session.views[&session.focus];
-    assert!(matches!(
-        &session.buffers[&view.location.buffer],
-        Buffer::Data { kind, .. } if kind == "files"
-    ));
-    assert_eq!(selected_row(&session, session.focus).id, "note.txt");
-    let source = session.focus;
-    assert_eq!(preview_text(&session, source), "source\n");
-
-    session.input("Enter");
-    let buffer = session.views[&session.focus].location.buffer;
-    let Buffer::Text(text) = &session.buffers[&buffer] else {
-        panic!("{}", session.message)
-    };
-    assert_eq!(text.path(), Some(path.as_path()));
     assert_eq!(
-        session
-            .buffers
-            .get_mut(&buffer)
-            .unwrap()
-            .text()
-            .unwrap()
-            .text(),
-        "source\n"
+        view_snapshot(&mut session, outline).content,
+        outline_content
     );
 }
 
 #[test]
-fn attaching_with_a_directory_opens_the_tree_at_that_directory() {
+fn starting_with_a_directory_requests_its_file_tree() {
+    let fixture = Fixture::new();
+    let mut session = fixture.session(&[PathBuf::from(".")]);
+    assert!(
+        session
+            .snapshot()
+            .client_actions
+            .iter()
+            .any(|action| matches!(
+                &action.kind, zess_protocol::ClientActionKind::OpenPage { source }
+                    if source.kind == "files" && source.argument == json!({"path": ""})
+            ))
+    );
+}
+
+#[test]
+fn attaching_with_a_directory_requests_its_tree_and_keeps_the_open_document() {
     let fixture = Fixture::new();
     let path = fixture.0.join("note.txt");
     fs::write(&path, "source\n").unwrap();
@@ -743,14 +737,16 @@ fn attaching_with_a_directory_opens_the_tree_at_that_directory() {
     let mut session = fixture.session(&[path.clone()]);
 
     session.open_paths(&[directory.to_string_lossy().into_owned()]);
-    settle(&mut session);
-    let view = &session.views[&session.focus];
-    assert!(matches!(
-        &session.buffers[&view.location.buffer],
-        Buffer::Data { kind, .. } if kind == "files"
-    ));
-    assert_eq!(selected_row(&session, session.focus).id, "folder");
-    session.command("quit").unwrap();
+    assert!(
+        session
+            .snapshot()
+            .client_actions
+            .iter()
+            .any(|action| matches!(
+                &action.kind, zess_protocol::ClientActionKind::OpenPage { source }
+                    if source.kind == "files" && source.argument == json!({"path": "folder"})
+            ))
+    );
     let buffer = session.views[&session.focus].location.buffer;
     let Buffer::Text(text) = &session.buffers[&buffer] else {
         panic!("{}", session.message)
@@ -866,28 +862,6 @@ fn leaving_a_browser_closes_its_preview_and_preserves_other_editors() {
     }
 }
 
-fn preview_rows(session: &mut Session, source: ViewId) -> Vec<FrameRow> {
-    let target = session.active_preview(source).unwrap();
-    let (_, rect) = session
-        .visible_rectangles()
-        .into_iter()
-        .find(|(current, _)| current == &target)
-        .unwrap();
-    match target {
-        RenderTarget::View(id) => session.render_view(id, rect.width, rect.height).0,
-        RenderTarget::Surface { page, slot } => session.render_surface(page, &slot, rect),
-    }
-}
-
-fn preview_row(session: &mut Session) -> String {
-    let source = session.focus;
-    preview_rows(session, source)[0]
-        .spans
-        .iter()
-        .map(|span| span.text.as_str())
-        .collect()
-}
-
 #[test]
 fn preview_horizontal_scroll_stops_at_the_content_edges() {
     let fixture = Fixture::new();
@@ -902,37 +876,45 @@ fn preview_horizontal_scroll_stops_at_the_content_edges() {
     let mut session = Session::new(fixture.0.clone(), &[], Some(config)).unwrap();
     session.command("files").unwrap();
     settle(&mut session);
-    let initial = preview_row(&mut session);
-    session.input("L");
-    assert_eq!(preview_row(&mut session), initial);
-    session.input("H");
-    assert_eq!(preview_row(&mut session), initial);
+    let source = session.focus;
+    for key in ["L", "H"] {
+        session.input(key);
+        let surface = preview_surface_snapshot(&mut session, source);
+        assert_eq!(surface.horizontal_scroll, 0);
+        assert_eq!(text_lines(&surface.content)[0].text.trim_end(), "short");
+    }
     let text = format!("\t中文{}END\n", "0123456789".repeat(6));
     fs::write(fixture.0.join("note.txt"), &text).unwrap();
     session.input("R");
     settle(&mut session);
-    let initial = preview_row(&mut session);
+    let initial = preview_surface_snapshot(&mut session, source);
     session.input("L");
-    assert_ne!(preview_row(&mut session), initial);
+    assert_eq!(
+        preview_surface_snapshot(&mut session, source).horizontal_scroll,
+        1
+    );
     for _ in 0..100 {
         session.input("L");
     }
-    let end = preview_row(&mut session);
-    assert!(end.ends_with("END"), "{end:?}");
+    let end = preview_surface_snapshot(&mut session, source);
+    let line = &text_lines(&end.content)[0];
+    assert_ne!(line.text, text_lines(&initial.content)[0].text);
+    assert!(line.text.trim_end().ends_with("END"), "{line:?}");
     session.input("L");
-    assert_eq!(preview_row(&mut session), end);
+    assert_eq!(preview_surface_snapshot(&mut session, source), end);
     session.resize(200, 24);
-    assert_eq!(
-        preview_row(&mut session).trim_end(),
-        format!("    中文{}END", "0123456789".repeat(6))
-    );
+    let surface = preview_surface_snapshot(&mut session, source);
+    assert_eq!(surface.horizontal_scroll, 0);
+    assert_eq!(text_lines(&surface.content)[0].text, text);
     session.resize(80, 24);
-    session.frame();
+    session.snapshot();
     session.input("L");
     fs::write(fixture.0.join("note.txt"), "short\n").unwrap();
     session.input("R");
     settle(&mut session);
-    assert_eq!(preview_row(&mut session).trim_end(), "short");
+    let surface = preview_surface_snapshot(&mut session, source);
+    assert_eq!(surface.horizontal_scroll, 0);
+    assert_eq!(text_lines(&surface.content)[0].text.trim_end(), "short");
 }
 
 #[test]
@@ -942,9 +924,12 @@ fn directory_preview_horizontal_scroll_stops_at_the_content_edges() {
     let mut session = fixture.session(&[]);
     session.command("files").unwrap();
     settle(&mut session);
-    let initial = preview_row(&mut session);
+    let source = session.focus;
     session.input("L");
-    assert_eq!(preview_row(&mut session), initial);
+    assert_eq!(
+        preview_surface_snapshot(&mut session, source).horizontal_scroll,
+        0
+    );
     let name = format!("{}END", "x".repeat(50));
     fs::write(fixture.0.join("folder").join(&name), "").unwrap();
     session.input("R");
@@ -952,146 +937,29 @@ fn directory_preview_horizontal_scroll_stops_at_the_content_edges() {
     for _ in 0..100 {
         session.input("L");
     }
-    let end = preview_row(&mut session);
-    assert!(end.ends_with("END"), "{end:?}");
+    let end = preview_surface_snapshot(&mut session, source);
+    let snapshot = session.snapshot();
+    let area = snapshot
+        .layout
+        .iter()
+        .find(|area| {
+            area.page_id == Some(end.page_id) && area.slot_id.as_ref() == Some(&end.slot_id)
+        })
+        .unwrap();
+    assert_eq!(end.horizontal_scroll, name.len() - area.width);
+    assert_eq!(item_rows(&end.content)[0].text, name);
     session.input("L");
-    assert_eq!(preview_row(&mut session), end);
+    assert_eq!(preview_surface_snapshot(&mut session, source), end);
     session.input("H");
-    assert_ne!(preview_row(&mut session), end);
+    assert_eq!(
+        preview_surface_snapshot(&mut session, source).horizontal_scroll,
+        end.horizontal_scroll - 1
+    );
     session.resize(200, 24);
-    assert_eq!(preview_row(&mut session).trim_end(), name);
-}
-
-#[test]
-fn narrow_panes_keep_mode_labels_whole_across_buffer_types() {
-    let fixture = Fixture::new();
-    for kind in ["text", "files", "git"] {
-        let mut session = fixture.session(&[]);
-        let source = session.focus;
-        if kind != "text" {
-            session.command(kind).unwrap();
-            settle(&mut session);
-            session
-                .close_preview(session.views.page_id(source))
-                .unwrap();
-        }
-        session.command("vsplit").unwrap();
-        session.focus_view(source).unwrap();
-        for (width, pane_width, normal, select) in [
-            (10, 4, "NOR", "SEL"),
-            (11, 5, " NOR ", " SEL "),
-            (80, 39, " NOR ", " SEL "),
-        ] {
-            session.resize(width, 24);
-            assert_eq!(session.focus, source);
-            assert_eq!(
-                panes(&session)
-                    .into_iter()
-                    .find(|(id, ..)| *id == source)
-                    .unwrap()
-                    .3,
-                pane_width
-            );
-            let frame = session.frame();
-            let label = frame
-                .rows
-                .last()
-                .unwrap()
-                .spans
-                .iter()
-                .find(|span| span.style == "status.normal")
-                .unwrap();
-            assert_eq!(label.text, normal, "{kind}: width {width}");
-            session.input("v");
-            let frame = session.frame();
-            let label = frame
-                .rows
-                .last()
-                .unwrap()
-                .spans
-                .iter()
-                .find(|span| span.style == "status.select")
-                .unwrap();
-            assert_eq!(label.text, select, "{kind}: width {width}");
-            session.input("Esc");
-        }
-    }
-}
-
-#[test]
-fn repeated_vertical_splits_keep_mode_labels_visible_across_buffer_types() {
-    let fixture = Fixture::new();
-    for kind in ["text", "files", "git"] {
-        let mut session = fixture.session(&[]);
-        if kind != "text" {
-            session.command(kind).unwrap();
-            settle(&mut session);
-        }
-        for _ in 0..5 {
-            session.command("vsplit").unwrap();
-        }
-        for width in [80, 60] {
-            session.resize(width, 24);
-            let frame = session.frame();
-            let label = frame
-                .rows
-                .last()
-                .unwrap()
-                .spans
-                .iter()
-                .find(|span| span.style == "status.normal")
-                .unwrap();
-            assert_eq!(label.text.trim(), "NOR", "{kind}: width {width}");
-        }
-    }
-}
-
-#[test]
-fn previews_omit_filenames_and_readonly_labels_from_the_statusline() {
-    let fixture = Fixture::new();
-    let mut session = fixture.session(&[]);
-    let source = session.focus;
-    for (content, mode_label) in [
-        (
-            PreviewContent::Text {
-                text: "preview content".into(),
-            },
-            " NOR ",
-        ),
-        (
-            PreviewContent::Diff {
-                text: "@@ -1 +1 @@\n-before\n+after\n".into(),
-            },
-            " HUN ",
-        ),
-    ] {
-        session.focus_view(source).unwrap();
-        session
-            .show_preview(
-                session.views.page_id(source),
-                "selected-file.txt".into(),
-                content,
-                true,
-            )
-            .unwrap();
-        session.frame();
-        let target = session.focus;
-        let (_, _, _, width, height) = panes(&session)
-            .into_iter()
-            .find(|(id, ..)| *id == target)
-            .unwrap();
-        let (rows, _) = session.render_view(target, width, height);
-        let status = rows
-            .last()
-            .unwrap()
-            .spans
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<String>();
-        assert_eq!(rows.last().unwrap().spans[0].text, mode_label);
-        assert!(!status.contains("selected-file.txt"), "{status:?}");
-        assert!(!status.contains("readonly"), "{status:?}");
-    }
+    assert_eq!(
+        preview_surface_snapshot(&mut session, source).horizontal_scroll,
+        0
+    );
 }
 
 #[test]
@@ -1106,20 +974,17 @@ fn directory_previews_show_contents_without_browser_selection_or_status() {
     session.command("files").unwrap();
     settle(&mut session);
     let source = session.focus;
-    assert_eq!(preview_row(&mut session).trim_end(), "00.txt");
+    let surface = preview_surface_snapshot(&mut session, source);
+    assert_eq!(surface.scroll, 0);
+    assert_eq!(item_rows(&surface.content)[0].text, "00.txt");
     session.command("files.preview").unwrap();
     assert_eq!(session.focus, source);
     session.input("J");
-    let rows = preview_rows(&mut session, source);
-    assert_eq!(rows[0].spans[0].text.trim_end(), "01.txt");
-    assert_eq!(rows.last().unwrap().spans[0].text.trim_end(), "23.txt");
-    for row in rows {
-        for span in row.spans {
-            assert!(!span.style.starts_with("selection"));
-            assert!(!span.style.starts_with("status"));
-            assert!(!span.style.starts_with("linenr"));
-        }
-    }
+    let surface = preview_surface_snapshot(&mut session, source);
+    let rows = item_rows(&surface.content);
+    assert_eq!(surface.scroll, 1);
+    assert_eq!(rows[surface.scroll].text, "01.txt");
+    assert_eq!(rows.len(), 30);
     let (scopes, _) = session.key_context();
     assert!(scopes.contains(&"files"));
 }
@@ -1140,45 +1005,18 @@ fn diff_previews_show_one_source_line_number_per_row() {
         )
         .unwrap();
     let target = session.preview_target(source).unwrap();
-    let (_, _, _, width, height) = panes(&session)
-        .into_iter()
-        .find(|(id, ..)| *id == target)
-        .unwrap();
-    let (rows, _) = session.render_view(target, width, height);
-    let lines = rows
-        .iter()
-        .take(4)
-        .map(|row| {
-            row.spans
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<String>()
-                .trim_end()
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
+    let view = view_snapshot(&mut session, target);
+    let rows = item_rows(&view.content);
     assert_eq!(
-        lines,
-        ["  @@ -5,2 +8,2 @@", "8  context", "6 -before", "9 +after"]
-    );
-    assert!(
         rows.iter()
-            .flat_map(|row| &row.spans)
-            .all(|span| { !span.style.starts_with("selection") && span.style != "linenr.current" })
-    );
-    session.focus_preview(session.focus).unwrap();
-    let (rows, _) = session.render_view(target, width, height);
-    assert!(
-        rows[2]
-            .spans
-            .iter()
-            .any(|span| span.style == "selection.git.deleted")
-    );
-    assert!(
-        rows[3]
-            .spans
-            .iter()
-            .any(|span| span.style == "selection.git.added")
+            .map(|row| (row.line_number, row.text.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (None, "@@ -5,2 +8,2 @@"),
+            (Some(8), " context"),
+            (Some(6), "-before"),
+            (Some(9), "+after"),
+        ]
     );
 }
 
@@ -1206,7 +1044,7 @@ fn cloned_directory_previews_keep_scroll_on_refresh_and_reset_for_a_new_path() {
         )
         .unwrap();
     let target = session.preview_target(source).unwrap();
-    session.frame();
+    session.snapshot();
     for _ in 0..8 {
         session
             .execute_command("preview.move-down", serde_json::json!({}))
@@ -1216,14 +1054,8 @@ fn cloned_directory_previews_keep_scroll_on_refresh_and_reset_for_a_new_path() {
     session.command("vsplit").unwrap();
     let clone = session.focus;
     let first_line = |session: &mut Session, id| {
-        let (_, _, _, width, height) = panes(session)
-            .into_iter()
-            .find(|(view, ..)| *view == id)
-            .unwrap();
-        session.render_view(id, width, height).0[0].spans[0]
-            .text
-            .trim_end()
-            .to_owned()
+        let view = view_snapshot(session, id);
+        item_rows(&view.content)[view.scroll].text.clone()
     };
     session
         .show_preview(
@@ -1273,7 +1105,7 @@ fn directory_preview_does_not_scroll_past_the_last_visible_row() {
             false,
         )
         .unwrap();
-    session.frame();
+    session.snapshot();
     let target = session.preview_target(source).unwrap();
     for _ in 0..20 {
         session
@@ -1288,7 +1120,7 @@ fn directory_preview_does_not_scroll_past_the_last_visible_row() {
 }
 
 #[test]
-fn git_file_status_colors_survive_selection() {
+fn git_publishes_file_status_styles_alongside_the_selection() {
     let fixture = Fixture::new();
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
@@ -1325,28 +1157,22 @@ fn git_file_status_colors_survive_selection() {
     settle(&mut session);
     session.input("%");
     let source = session.focus;
-    let (_, _, _, width, height) = panes(&session)
-        .into_iter()
-        .find(|(id, ..)| *id == source)
-        .unwrap();
-    let (rows, _) = session.render_view(source, width, height);
+    let view = view_snapshot(&mut session, source);
+    let zess_protocol::ViewSelection::Items { ids, .. } = &view.selection else {
+        panic!("expected a file selection");
+    };
+    let rows = item_rows(&view.content);
     for (name, style) in [
-        ("added.txt", "selection.git.added"),
-        ("untracked.txt", "selection.git.added"),
-        ("modified.txt", "selection.modified"),
-        ("renamed.txt", "selection.modified"),
-        ("deleted.txt", "selection.git.deleted"),
+        ("added.txt", "git.added"),
+        ("untracked.txt", "git.added"),
+        ("modified.txt", "modified"),
+        ("renamed.txt", "modified"),
+        ("deleted.txt", "git.deleted"),
     ] {
-        let index = session.views[&source]
-            .location
-            .display
-            .rows
-            .iter()
-            .position(|row| row.id == format!("file:{name}"))
-            .unwrap();
-        let row = &session.views[&source].location.display.rows[index];
-        assert_eq!(rows[index + 1].spans[0].text.trim_end(), row.text);
-        assert_eq!(rows[index + 1].spans[0].style, style, "{name}");
+        let id = format!("file:{name}");
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert!(ids.contains(&id), "{name}");
+        assert_eq!(row.style, style, "{name}");
     }
 }
 
@@ -1379,13 +1205,19 @@ fn saving_a_fullscreen_file_layer_keeps_it_open_until_explicitly_closed() {
             .text(),
         original
     );
-    assert!(
-        session
-            .frame()
-            .rows
-            .iter()
-            .flat_map(|row| &row.spans)
-            .all(|span| span.style != "window")
+    let snapshot = session.snapshot();
+    assert_eq!(
+        snapshot.layout,
+        [zess_protocol::ViewArea {
+            view_id: Some(layer),
+            page_id: None,
+            slot_id: None,
+            buffer_id: buffer,
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 23,
+        }],
     );
     session.input("C-w");
     session.input("l");
@@ -1421,8 +1253,10 @@ fn saving_a_fullscreen_file_layer_keeps_it_open_until_explicitly_closed() {
     );
     assert!(!session.views.contains_key(&layer));
     assert!(session.views[&source].count.is_empty());
-    settle(&mut session);
-    assert_eq!(preview_text(&session, source), format!("!{original}"));
+    let saved = format!("!{original}");
+    wait_until(&mut session, |session| {
+        preview_text(session, source) == saved
+    });
 }
 
 #[test]
