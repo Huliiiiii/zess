@@ -4,8 +4,8 @@ use anyhow::{Context, Result, bail};
 use zess_ipc::platform::NativeDaemonControl;
 use zess_ipc::{LocalIpc, NativeLocalIpc, SocketPath};
 use zess_platform::{
-    CancellationToken, FileSystem, NativeFileSystem, NativePlatform, NativeWatchBackend, Platform,
-    ProcessRunner, SystemProcessRunner, WatchBackend,
+    FileSystem, NativeFileSystem, NativePlatform, NativeWatchBackend, Platform, ProcessRunner,
+    SystemProcessRunner, WatchBackend,
 };
 use zess_remote::SshTarget;
 use zess_session::Session;
@@ -33,7 +33,14 @@ struct SessionConnectionFactory {
 }
 
 impl zess_terminal::ConnectionFactory for SessionConnectionFactory {
-    fn connect(&mut self) -> Result<Box<dyn zess_terminal::ConnectionStream>> {
+    fn connect(
+        &mut self,
+        context: &zess_terminal::ConnectionContext,
+    ) -> Result<Box<dyn zess_terminal::ConnectionStream>> {
+        self.manager = self
+            .manager
+            .clone()
+            .with_cancellation(context.cancellation().clone());
         let stream = self.manager.connect(&self.endpoint)?;
         let process = self.manager.watch(&stream)?;
         Ok(Box::new(
@@ -41,18 +48,24 @@ impl zess_terminal::ConnectionFactory for SessionConnectionFactory {
                 .with_session_id(self.session_id.clone()),
         ))
     }
-
-    fn connect_with_cancellation(
-        &mut self,
-        cancellation: &CancellationToken,
-    ) -> Result<Box<dyn zess_terminal::ConnectionStream>> {
-        self.manager = self.manager.clone().with_cancellation(cancellation.clone());
-        self.connect()
-    }
 }
 
 pub fn run() -> Result<()> {
     let initial = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(endpoint) = std::env::var_os("ZESS_SSH_ASKPASS_ENDPOINT") {
+        let hint = std::env::var("SSH_ASKPASS_PROMPT").ok();
+        let answer = zess_remote::run_askpass(
+            &NativeLocalIpc,
+            &SocketPath::from(PathBuf::from(endpoint)),
+            initial.first().cloned().unwrap_or_default(),
+            hint.as_deref(),
+        )?;
+        if let Some(answer) = answer {
+            println!("{answer}");
+            return Ok(());
+        }
+        std::process::exit(1);
+    }
     let filesystem: Arc<dyn FileSystem> = Arc::new(NativeFileSystem);
     let host: Arc<dyn Platform> = Arc::new(NativePlatform);
     let ipc: Arc<dyn LocalIpc> = Arc::new(NativeLocalIpc);
@@ -379,38 +392,17 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 Ok(())
             }
             Mode::Edit | Mode::Attach => {
-                if let Some(id) = session_id {
-                    let session = remote
-                        .sessions()?
-                        .into_iter()
-                        .find(|entry| {
-                            entry.id == id
-                                || entry.session_id.0 == id
-                                || entry.name.as_deref() == Some(id.as_str())
-                        })
-                        .with_context(|| format!("remote session {id} was not found"))?;
-                    zess_protocol::check_build_id(&session.build_id)?;
-                    let mut factory = remote.session_factory(session.session_id.0)?;
-                    zess_terminal::run_connection_with_platform(&mut factory, &files, host.as_ref())
+                let selection = if let Some(id) = session_id {
+                    remote::RemoteSelection::Session(id)
                 } else {
-                    let sessions = remote.workspace_sessions(workspace.clone())?;
-                    if mode == Mode::Attach || sessions.len() > 1 {
-                        let selected = match sessions.as_slice() {
-                            [] => bail!("no session exists for the remote workspace"),
-                            [session] => session,
-                            _ => select_session(&sessions)?,
-                        };
-                        zess_protocol::check_build_id(&selected.build_id)?;
-                        let mut factory = remote.session_factory(selected.session_id.0.clone())?;
-                        return zess_terminal::run_connection_with_platform(
-                            &mut factory,
-                            &files,
-                            host.as_ref(),
-                        );
+                    remote::RemoteSelection::Workspace {
+                        workspace,
+                        config,
+                        attach_only: mode == Mode::Attach,
                     }
-                    let mut factory = remote.factory(workspace, Vec::new(), config)?;
-                    zess_terminal::run_connection_with_platform(&mut factory, &files, host.as_ref())
-                }
+                };
+                let factory = remote.connection_factory(selection, ipc, host.current_exe()?);
+                zess_terminal::run_connection_with_platform(factory, &files, host.as_ref())
             }
             Mode::Grammar(_) => unreachable!(),
         };
@@ -667,7 +659,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         })
         .collect::<Vec<_>>();
     zess_terminal::run_connection_with_platform(
-        &mut SessionConnectionFactory {
+        SessionConnectionFactory {
             manager,
             endpoint: socket,
             session_id,

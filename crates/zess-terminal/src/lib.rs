@@ -29,6 +29,7 @@ mod clipboard;
 mod clipboard_actions;
 mod clipboard_helper;
 mod clipboard_write;
+mod connection;
 mod state;
 mod style;
 mod terminal;
@@ -37,6 +38,12 @@ mod terminal;
 mod tests;
 
 use clipboard_actions::ClipboardActions;
+use connection::{ConnectionPage, ConnectionTask};
+
+pub use connection::{
+    AuthenticationKind, AuthenticationPrompt, ByteProgress, ConnectionContext, ConnectionProgress,
+    SessionCandidate,
+};
 
 pub use clipboard::{
     Clipboard, ClipboardJob, ClipboardReadJob, ClipboardWrite, ClipboardWriteJob, NativeClipboard,
@@ -61,24 +68,20 @@ pub fn run(socket: &SocketPath) -> Result<()> {
 
 /// Run the terminal client and open the requested files on the first attach.
 pub fn run_files(socket: &SocketPath, files: &[PathBuf]) -> Result<()> {
-    run_connection(&mut LocalConnectionFactory(socket.clone()), files)
+    run_connection(LocalConnectionFactory(socket.clone()), files)
 }
 
 /// Creates a fresh transport for the first connection and each reconnect.
-pub trait ConnectionFactory {
-    fn connect(&mut self) -> Result<Box<dyn ConnectionStream>>;
+pub trait ConnectionFactory: Send {
+    fn connect(&mut self, context: &ConnectionContext) -> Result<Box<dyn ConnectionStream>>;
 
-    fn connect_with_cancellation(
-        &mut self,
-        cancellation: &zess_platform::CancellationToken,
-    ) -> Result<Box<dyn ConnectionStream>> {
-        cancellation.check()?;
-        self.connect()
+    fn display_target(&self) -> &str {
+        "zess"
     }
 }
 
 /// Nonblocking byte transport consumed by the terminal event loop.
-pub trait ConnectionStream: Read + Write {
+pub trait ConnectionStream: Read + Write + Send {
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
     fn wait_for_server_exit(&mut self, timeout: Duration) -> Result<bool>;
     fn session_id(&self) -> Option<&zess_protocol::SessionId> {
@@ -142,7 +145,8 @@ impl ConnectionStream for LocalConnection {
 pub struct LocalConnectionFactory(pub SocketPath);
 
 impl ConnectionFactory for LocalConnectionFactory {
-    fn connect(&mut self) -> Result<Box<dyn ConnectionStream>> {
+    fn connect(&mut self, context: &ConnectionContext) -> Result<Box<dyn ConnectionStream>> {
+        context.cancellation().check()?;
         let stream = Stream::connect(&self.0)
             .with_context(|| format!("connect to zess socket {}", self.0.display()))?;
         let process = NativeDaemonControl.watch(&stream)?;
@@ -151,13 +155,13 @@ impl ConnectionFactory for LocalConnectionFactory {
 }
 
 /// Runs a terminal client over a reconnectable local or remote transport.
-pub fn run_connection(factory: &mut impl ConnectionFactory, files: &[PathBuf]) -> Result<()> {
+pub fn run_connection(factory: impl ConnectionFactory + 'static, files: &[PathBuf]) -> Result<()> {
     run_connection_with_platform(factory, files, &NativePlatform)
 }
 
 /// Runs a terminal client with host identity facts supplied by the launcher.
 pub fn run_connection_with_platform(
-    factory: &mut impl ConnectionFactory,
+    factory: impl ConnectionFactory + 'static,
     files: &[PathBuf],
     platform: &dyn Platform,
 ) -> Result<()> {
@@ -175,7 +179,7 @@ pub fn run_connection_with_platform(
 
 /// Runs with caller-owned terminal and clipboard devices.
 pub fn run_connection_with_devices(
-    factory: &mut impl ConnectionFactory,
+    factory: impl ConnectionFactory + 'static,
     files: &[PathBuf],
     terminal: &mut impl TerminalIo,
     clipboard: &mut impl Clipboard,
@@ -185,7 +189,7 @@ pub fn run_connection_with_devices(
 
 /// Runs the terminal client with host identity facts supplied by the launcher.
 pub fn run_connection_with_devices_and_platform(
-    factory: &mut impl ConnectionFactory,
+    factory: impl ConnectionFactory + 'static,
     files: &[PathBuf],
     terminal: &mut impl TerminalIo,
     clipboard: &mut impl Clipboard,
@@ -227,7 +231,7 @@ struct Connection {
 
 impl Connection {
     fn connect(
-        factory: &mut impl ConnectionFactory,
+        stream: Box<dyn ConnectionStream>,
         client_id: &str,
         files: &[String],
         context_epoch: Option<u64>,
@@ -235,7 +239,6 @@ impl Connection {
         width: u16,
         height: u16,
     ) -> Result<Self> {
-        let stream = factory.connect()?;
         let expected_session = expected_session
             .cloned()
             .or_else(|| stream.session_id().cloned());
@@ -345,6 +348,11 @@ enum ClientConnection {
         retry_at: Instant,
         attempts: u8,
     },
+    Connecting {
+        task: ConnectionTask,
+        attempts: u8,
+    },
+    Failed,
     Attaching {
         connection: Connection,
         deadline: Instant,
@@ -357,7 +365,7 @@ impl ClientConnection {
     fn active_mut(&mut self) -> Option<&mut Connection> {
         match self {
             Self::Attaching { connection, .. } | Self::Attached(connection) => Some(connection),
-            Self::Disconnected { .. } => None,
+            Self::Disconnected { .. } | Self::Connecting { .. } | Self::Failed => None,
         }
     }
 
@@ -367,8 +375,10 @@ impl ClientConnection {
 
     fn disconnect(&mut self) {
         let attempts = match self {
-            Self::Disconnected { attempts, .. } | Self::Attaching { attempts, .. } => *attempts,
-            Self::Attached(_) => 0,
+            Self::Disconnected { attempts, .. }
+            | Self::Connecting { attempts, .. }
+            | Self::Attaching { attempts, .. } => *attempts,
+            Self::Attached(_) | Self::Failed => 0,
         };
         *self = Self::Disconnected {
             retry_at: Instant::now() + RECONNECT_INTERVAL,
@@ -595,13 +605,18 @@ struct ClientUiState {
 }
 
 fn run_client<C: Clipboard>(
-    factory: &mut impl ConnectionFactory,
+    factory: impl ConnectionFactory + 'static,
     client_id: String,
     files: Vec<String>,
     terminal: &mut impl TerminalIo,
     provider: &mut C,
 ) -> Result<()> {
     let (mut width, mut height) = terminal.size().unwrap_or((80, 24));
+    let mut page = ConnectionPage::new(factory.display_target().to_owned());
+    let mut factory: Option<Box<dyn ConnectionFactory>> = Some(Box::new(factory));
+    let initial = page.frame(width, height, None);
+    terminal.set_mouse_capture(false)?;
+    render(terminal.writer(), &initial, width, height, None)?;
     let mut connection = ClientConnection::Disconnected {
         retry_at: Instant::now(),
         attempts: 0,
@@ -616,7 +631,9 @@ fn run_client<C: Clipboard>(
     let mut client_workspace = zess_protocol::ClientWorkspace::default();
     let mut context_epoch = None;
     let mut expected_session = None;
+    let mut failure = None;
     let mut remote_state: Option<RemoteStateCache> = None;
+    let mut has_frame = false;
     let mut attach_metadata = None;
     let mut resync_deadline = None;
     let mut recovery = InputRecovery::Ready;
@@ -629,32 +646,37 @@ fn run_client<C: Clipboard>(
     };
 
     loop {
-        if let ClientConnection::Disconnected { retry_at, attempts } = &connection {
-            if *attempts >= MAX_CONNECT_ATTEMPTS {
-                anyhow::bail!(
-                    "could not attach to zess after {MAX_CONNECT_ATTEMPTS} attempts: {}",
-                    ui.notice.as_deref().unwrap_or("connection lost")
-                );
-            }
-            if Instant::now() >= *retry_at {
-                let attempts = attempts + 1;
-                terminal.suspend()?;
-                let attempt = Connection::connect(
-                    factory,
-                    &client_id,
-                    &files,
-                    context_epoch,
-                    expected_session.as_ref(),
-                    width,
-                    height,
-                );
-                terminal.resume()?;
+        if let ClientConnection::Connecting { task, attempts } = &mut connection {
+            task.update(&mut page);
+            if let Some(finished) = task.finish() {
+                let attempts = *attempts;
+                let (returned_factory, result) = finished?;
+                factory = Some(returned_factory);
+                if page.cancelling {
+                    drop(result);
+                    return Ok(());
+                }
+                let attempt = result.and_then(|stream| {
+                    Connection::connect(
+                        stream,
+                        &client_id,
+                        &files,
+                        context_epoch,
+                        expected_session.as_ref(),
+                        width,
+                        height,
+                    )
+                });
                 connection = match attempt {
                     Ok(connection) => {
                         if expected_session.is_none() {
                             expected_session = connection.stream.session_id().cloned();
                         }
-                        ui.notice = Some("Connected; attaching...".into());
+                        page.progress = ConnectionProgress {
+                            message: "Connected; attaching…".into(),
+                            bytes: None,
+                        };
+                        ui.notice = None;
                         ClientConnection::Attaching {
                             connection,
                             deadline: Instant::now() + ATTACH_TIMEOUT,
@@ -662,12 +684,41 @@ fn run_client<C: Clipboard>(
                         }
                     }
                     Err(error) => {
+                        page.progress = ConnectionProgress {
+                            message: format!("Connection failed: {error:#}"),
+                            bytes: None,
+                        };
                         ui.notice = Some(format!("Connection failed: {error:#}"));
-                        ClientConnection::Disconnected {
-                            retry_at: Instant::now() + RECONNECT_INTERVAL,
-                            attempts,
+                        failure = Some(error);
+                        if attempts >= MAX_CONNECT_ATTEMPTS {
+                            page.failed = true;
+                            ClientConnection::Failed
+                        } else {
+                            ClientConnection::Disconnected {
+                                retry_at: Instant::now() + RECONNECT_INTERVAL,
+                                attempts,
+                            }
                         }
                     }
+                };
+                ui.dirty = true;
+            }
+        }
+        if let ClientConnection::Disconnected { retry_at, attempts } = &connection {
+            if *attempts >= MAX_CONNECT_ATTEMPTS {
+                page.failed = true;
+                connection = ClientConnection::Failed;
+                ui.dirty = true;
+            } else if Instant::now() >= *retry_at {
+                let attempts = attempts + 1;
+                page.reset();
+                connection = ClientConnection::Connecting {
+                    task: ConnectionTask::start(
+                        factory
+                            .take()
+                            .context("connection factory is unavailable")?,
+                    )?,
+                    attempts,
                 };
                 ui.dirty = true;
             }
@@ -785,12 +836,21 @@ fn run_client<C: Clipboard>(
                     .downcast_ref::<zess_protocol::BuildMismatch>()
                     .is_some()
                 {
-                    return Err(error);
+                    page.progress = ConnectionProgress {
+                        message: format!("{error:#}"),
+                        bytes: None,
+                    };
+                    page.failed = true;
+                    failure = Some(error);
+                    connection = ClientConnection::Failed;
+                    ui.dirty = true;
+                    Vec::new()
+                } else {
+                    ui.notice = Some(format!("Disconnected; reconnecting: {error}"));
+                    connection.disconnect();
+                    ui.dirty = true;
+                    Vec::new()
                 }
-                ui.notice = Some(format!("Disconnected; reconnecting: {error}"));
-                connection.disconnect();
-                ui.dirty = true;
-                Vec::new()
             }
         };
         for message in messages {
@@ -804,13 +864,23 @@ fn run_client<C: Clipboard>(
                     replay_allowed,
                     frame: _,
                 } => {
-                    anyhow::ensure!(
-                        ledger
-                            .server_instance
-                            .as_ref()
-                            .is_none_or(|expected| expected == &server_instance),
-                        "the original zess server is no longer available"
-                    );
+                    if ledger
+                        .server_instance
+                        .as_ref()
+                        .is_some_and(|expected| expected != &server_instance)
+                    {
+                        let error =
+                            anyhow::anyhow!("the original zess server is no longer available");
+                        page.progress = ConnectionProgress {
+                            message: error.to_string(),
+                            bytes: None,
+                        };
+                        page.failed = true;
+                        failure = Some(error);
+                        connection = ClientConnection::Failed;
+                        ui.dirty = true;
+                        break;
+                    }
                     attach_metadata = Some((server_instance, acknowledged, epoch, replay_allowed));
                     remote_state = None;
                     ui.dirty = true;
@@ -822,18 +892,30 @@ fn run_client<C: Clipboard>(
                     state,
                     frame: _,
                 } => {
-                    anyhow::ensure!(
-                        expected_session
-                            .as_ref()
-                            .is_none_or(|expected| expected == &session_id),
-                        "the original zess session is no longer available"
-                    );
                     let expected_server = attach_metadata
                         .as_ref()
                         .map(|(instance, _, _, _)| instance)
                         .or(ledger.server_instance.as_ref());
-                    if expected_server.is_some_and(|expected| expected != &server_instance) {
-                        anyhow::bail!("the original zess server is no longer available");
+                    let error = if expected_session
+                        .as_ref()
+                        .is_some_and(|expected| expected != &session_id)
+                    {
+                        Some("the original zess session is no longer available")
+                    } else if expected_server.is_some_and(|expected| expected != &server_instance) {
+                        Some("the original zess server is no longer available")
+                    } else {
+                        None
+                    };
+                    if let Some(error) = error {
+                        page.progress = ConnectionProgress {
+                            message: error.into(),
+                            bytes: None,
+                        };
+                        page.failed = true;
+                        failure = Some(anyhow::anyhow!(error));
+                        connection = ClientConnection::Failed;
+                        ui.dirty = true;
+                        break;
                     }
                     let next_state = RemoteStateCache {
                         session_id,
@@ -844,6 +926,7 @@ fn run_client<C: Clipboard>(
                     match zess_protocol::render_snapshot(&next_state.state) {
                         Ok(next_frame) => {
                             frame = next_frame;
+                            has_frame = true;
                             remote_state = Some(next_state);
                         }
                         Err(error) => {
@@ -1057,7 +1140,17 @@ fn run_client<C: Clipboard>(
                     }
                 }
                 ServerMessage::Rejected { reason } => {
-                    anyhow::bail!("zess server rejected the client: {}", sanitize(&reason));
+                    let error =
+                        anyhow::anyhow!("zess server rejected the client: {}", sanitize(&reason));
+                    page.progress = ConnectionProgress {
+                        message: error.to_string(),
+                        bytes: None,
+                    };
+                    page.failed = true;
+                    failure = Some(error);
+                    connection = ClientConnection::Failed;
+                    ui.dirty = true;
+                    break;
                 }
                 ServerMessage::Exited => {
                     connection
@@ -1090,7 +1183,7 @@ fn run_client<C: Clipboard>(
         let synchronized =
             connection.attached() && remote_state.is_some() && resync_deadline.is_none();
         let ready = synchronized && matches!(recovery, InputRecovery::Ready);
-        if ui.dirty {
+        if ui.dirty || !connection.attached() {
             terminal.set_mouse_capture(
                 frame.mouse_enabled
                     && connection.attached()
@@ -1123,12 +1216,63 @@ fn run_client<C: Clipboard>(
                 }
             });
             let (width, height) = terminal.size().unwrap_or((frame.width, frame.height));
-            render(terminal.writer(), &frame, width, height, notice.as_deref())?;
+            if connection.attached() {
+                render(terminal.writer(), &frame, width, height, notice.as_deref())?;
+            } else {
+                if matches!(connection, ClientConnection::Disconnected { .. })
+                    && let Some(message) = &ui.notice
+                {
+                    page.progress = ConnectionProgress {
+                        message: message.clone(),
+                        bytes: None,
+                    };
+                }
+                let panel = page.frame(width, height, has_frame.then_some(&frame));
+                render(terminal.writer(), &panel, width, height, None)?;
+            }
             ui.dirty = false;
         }
         let Some(event) = terminal.poll_event(EVENT_POLL_INTERVAL)? else {
             continue;
         };
+        if !connection.attached() {
+            let cancel = matches!(&event, Event::Key(key)
+                if key.kind != KeyEventKind::Release && (key.code == KeyCode::Esc
+                    || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+                    || (key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL))));
+            if cancel {
+                if let ClientConnection::Connecting { task, .. } = &connection {
+                    page.cancel();
+                    task.cancel();
+                    ui.dirty = true;
+                } else {
+                    return if page.failed {
+                        failure.map_or(Ok(()), Err)
+                    } else {
+                        Ok(())
+                    };
+                }
+                continue;
+            }
+            if page.cancelling {
+                continue;
+            }
+            if matches!(connection, ClientConnection::Failed)
+                && matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && key.code == KeyCode::Char('r'))
+            {
+                page.reset();
+                failure = None;
+                connection = ClientConnection::Disconnected {
+                    retry_at: Instant::now(),
+                    attempts: 0,
+                };
+                continue;
+            }
+            if page.event(&event) {
+                ui.dirty = true;
+                continue;
+            }
+        }
         let new_input = match &event {
             Event::Paste(_) => true,
             Event::Key(key) => key.kind != KeyEventKind::Release,

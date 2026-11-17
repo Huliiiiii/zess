@@ -8,12 +8,17 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use zess_ipc::{SocketPath, Stream};
-use zess_platform::{CancellationToken, FileSystem, Platform, SystemProcessRunner};
+use zess_ipc::{LocalIpc, SocketPath, Stream};
+use zess_platform::{Cancellation, FileSystem, Platform, SystemProcessRunner};
 use zess_remote::{
-    Connector, ProxyHandshake, ProxyOperation, ProxyRequest, SshConnection, SshConnector, SshTarget,
+    AskpassBroker, Connector, ProgressReporter, ProxyHandshake, ProxyOperation, ProxyRequest,
+    RemoteProgress, RemoteStage, SshConnection, SshConnector, SshPrompt, SshPromptHandler,
+    SshPromptKind, SshTarget,
 };
-use zess_terminal::{ConnectionFactory, ConnectionStream};
+use zess_terminal::{
+    AuthenticationKind, AuthenticationPrompt, ByteProgress, ConnectionContext, ConnectionFactory,
+    ConnectionProgress, ConnectionStream, SessionCandidate,
+};
 
 use crate::server::{SessionInfo, SessionManager};
 
@@ -87,9 +92,79 @@ impl<'a> SshAddress<'a> {
 
 type ConnectorImpl = SshConnector<SystemProcessRunner, ProxyRequest>;
 
+pub enum RemoteSelection {
+    Workspace {
+        workspace: String,
+        config: Option<String>,
+        attach_only: bool,
+    },
+    Session(String),
+}
+
 pub struct RemoteConnectionFactory {
-    connector: ConnectorImpl,
+    options: RemoteOptions,
+    selection: RemoteSelection,
     session_id: Option<zess_protocol::SessionId>,
+    ipc: Arc<dyn LocalIpc>,
+    program: PathBuf,
+    display: String,
+}
+
+struct ConnectionObserver(ConnectionContext);
+
+impl ProgressReporter for ConnectionObserver {
+    fn report(&self, event: RemoteProgress) {
+        let (stage, bytes) = match event {
+            RemoteProgress::Stage(stage) => (stage, None),
+            RemoteProgress::Transfer {
+                stage,
+                completed,
+                total,
+            } => (stage, Some(ByteProgress { completed, total })),
+            RemoteProgress::Diagnostic(message) => {
+                self.0.progress(ConnectionProgress {
+                    message,
+                    bytes: None,
+                });
+                return;
+            }
+        };
+        let message = match stage {
+            RemoteStage::DetectingPlatform => "Detecting remote platform…",
+            RemoteStage::CheckingCache => "Checking for a matching server…",
+            RemoteStage::Downloading => "Downloading matching server…",
+            RemoteStage::Uploading => "Uploading server…",
+            RemoteStage::Installing => "Installing server…",
+            RemoteStage::Connecting => "Connecting to remote server…",
+            RemoteStage::Ready => "Attaching to session…",
+        };
+        self.0.progress(ConnectionProgress {
+            message: message.into(),
+            bytes,
+        });
+    }
+}
+
+impl SshPromptHandler for ConnectionObserver {
+    fn authenticate(
+        &self,
+        prompt: SshPrompt,
+        cancellation: &dyn Cancellation,
+    ) -> Result<Option<String>> {
+        let kind = match prompt.kind {
+            SshPromptKind::Secret => AuthenticationKind::Secret,
+            SshPromptKind::Visible => AuthenticationKind::Visible,
+            SshPromptKind::Confirmation => AuthenticationKind::Confirmation,
+            SshPromptKind::Information => AuthenticationKind::Information,
+        };
+        self.0.authenticate_with_cancellation(
+            AuthenticationPrompt {
+                message: prompt.message,
+                kind,
+            },
+            cancellation,
+        )
+    }
 }
 
 struct RemoteStream {
@@ -128,37 +203,115 @@ impl ConnectionStream for RemoteStream {
 }
 
 impl ConnectionFactory for RemoteConnectionFactory {
-    fn connect(&mut self) -> Result<Box<dyn ConnectionStream>> {
-        let connection = self.connector.connect()?;
-        let session_id = Some(zess_protocol::SessionId(
+    fn display_target(&self) -> &str {
+        &self.display
+    }
+
+    fn connect(&mut self, context: &ConnectionContext) -> Result<Box<dyn ConnectionStream>> {
+        context.cancellation().check()?;
+        let observer = Arc::new(ConnectionObserver(context.clone()));
+        let broker = AskpassBroker::start(
+            self.ipc.clone(),
+            self.program.clone(),
+            context.cancellation().clone(),
+            observer.clone(),
+        )?;
+        let mut options = self.options.clone();
+        options.target.cancellation = Some(context.cancellation().clone());
+        options.target.progress = Some(observer);
+        options.target.askpass = Some(broker.config().clone());
+        if self.session_id.is_none() {
+            let sessions = match &self.selection {
+                RemoteSelection::Session(id) => vec![
+                    options
+                        .sessions()?
+                        .into_iter()
+                        .find(|entry| {
+                            entry.id == *id
+                                || entry.session_id.0 == *id
+                                || entry.name.as_deref() == Some(id.as_str())
+                        })
+                        .with_context(|| format!("remote session {id} was not found"))?,
+                ],
+                RemoteSelection::Workspace { workspace, .. } => {
+                    options.workspace_sessions(workspace.clone())?
+                }
+            };
+            let selected = match sessions.as_slice() {
+                [] => {
+                    if matches!(
+                        &self.selection,
+                        RemoteSelection::Workspace {
+                            attach_only: true,
+                            ..
+                        }
+                    ) {
+                        bail!("no session exists for the remote workspace");
+                    }
+                    None
+                }
+                [session] => Some(session),
+                _ => {
+                    let candidates = sessions
+                        .iter()
+                        .map(|session| SessionCandidate {
+                            id: session.session_id.clone(),
+                            display: session.name.clone().unwrap_or_else(|| session.id.clone()),
+                            workspace: session.workspace.clone(),
+                        })
+                        .collect();
+                    let id = context
+                        .choose_session(candidates)?
+                        .context("session selection cancelled")?;
+                    Some(
+                        sessions
+                            .iter()
+                            .find(|session| session.session_id == id)
+                            .context("selected session is no longer available")?,
+                    )
+                }
+            };
+            if let Some(session) = selected {
+                zess_protocol::check_build_id(&session.build_id)?;
+                self.session_id = Some(session.session_id.clone());
+            }
+        }
+        let operation = if let Some(id) = &self.session_id {
+            ProxyOperation::AttachSession {
+                session_id: id.0.clone(),
+            }
+        } else {
+            let RemoteSelection::Workspace {
+                workspace, config, ..
+            } = &self.selection
+            else {
+                unreachable!("a selected session has an identity")
+            };
+            ProxyOperation::Attach {
+                workspace: workspace.clone(),
+                files: Vec::new(),
+                config: config.clone(),
+            }
+        };
+        let connection = options.connector(operation)?.connect()?;
+        let id = zess_protocol::SessionId(
             connection
                 .session_id()
                 .context("remote proxy did not identify the session")?
                 .to_owned(),
-        ));
+        );
         if let Some(pinned) = &self.session_id {
             anyhow::ensure!(
-                session_id.as_ref() == Some(pinned),
+                id == *pinned,
                 "the original zess session is no longer available"
             );
-        } else if let Some(id) = &session_id {
-            self.connector.request = ProxyRequest::new(ProxyOperation::AttachSession {
-                session_id: id.0.clone(),
-            });
-            self.session_id = session_id.clone();
         }
+        self.session_id = Some(id.clone());
+        context.cancellation().check()?;
         Ok(Box::new(RemoteStream {
             connection,
-            session_id,
+            session_id: Some(id),
         }))
-    }
-
-    fn connect_with_cancellation(
-        &mut self,
-        cancellation: &CancellationToken,
-    ) -> Result<Box<dyn ConnectionStream>> {
-        self.connector.target.cancellation = Some(cancellation.clone());
-        self.connect()
     }
 }
 
@@ -172,27 +325,26 @@ impl RemoteOptions {
         })
     }
 
-    pub fn factory(
-        &self,
-        workspace: String,
-        files: Vec<String>,
-        config: Option<String>,
-    ) -> Result<RemoteConnectionFactory> {
-        Ok(RemoteConnectionFactory {
-            connector: self.connector(ProxyOperation::Attach {
-                workspace,
-                files,
-                config,
-            })?,
+    pub fn connection_factory(
+        self,
+        selection: RemoteSelection,
+        ipc: Arc<dyn LocalIpc>,
+        program: PathBuf,
+    ) -> RemoteConnectionFactory {
+        let display = match &selection {
+            RemoteSelection::Workspace { workspace, .. } => {
+                format!("{}:{workspace}", self.target.host)
+            }
+            RemoteSelection::Session(id) => format!("{} (session {id})", self.target.host),
+        };
+        RemoteConnectionFactory {
+            options: self,
+            selection,
+            ipc,
+            program,
+            display,
             session_id: None,
-        })
-    }
-
-    pub fn session_factory(&self, session_id: String) -> Result<RemoteConnectionFactory> {
-        Ok(RemoteConnectionFactory {
-            connector: self.connector(ProxyOperation::AttachSession { session_id })?,
-            session_id: None,
-        })
+        }
     }
 
     pub fn request(&self, operation: ProxyOperation) -> Result<ProxyResponse> {

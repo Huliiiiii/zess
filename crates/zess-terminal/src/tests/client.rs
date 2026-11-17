@@ -1,13 +1,28 @@
 mod clipboard_order;
 
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use zess_protocol::{OperationResult, SessionId, SessionSnapshot};
 
 use super::*;
+
+#[derive(Default)]
+struct Phase {
+    value: AtomicUsize,
+    transport_ready: AtomicBool,
+}
+
+impl Phase {
+    fn load(&self, ordering: Ordering) -> usize {
+        self.value.load(ordering)
+    }
+    fn store(&self, value: usize, ordering: Ordering) {
+        self.value.store(value, ordering);
+    }
+}
 
 struct IdentityPlatform;
 
@@ -36,20 +51,21 @@ impl Platform for IdentityPlatform {
 }
 
 struct ScriptedStream {
-    phase: Rc<Cell<usize>>,
+    phase: Arc<Phase>,
     batches: VecDeque<(usize, VecDeque<u8>)>,
-    output: Rc<RefCell<Vec<u8>>>,
+    output: Arc<Mutex<Vec<u8>>>,
     close_at: Option<usize>,
     fence_probes: std::collections::HashSet<RequestId>,
     fence_reply_after: usize,
-    waited: Rc<Cell<usize>>,
+    waited: Arc<Phase>,
     exit_result: bool,
     session_id: Option<SessionId>,
+    cancellation: zess_platform::CancellationToken,
 }
 
 impl ScriptedStream {
     fn new(
-        phase: Rc<Cell<usize>>,
+        phase: Arc<Phase>,
         messages: Vec<(usize, Vec<ServerMessage>)>,
         close_at: Option<usize>,
     ) -> Self {
@@ -71,21 +87,23 @@ impl ScriptedStream {
         Self {
             phase,
             batches,
-            output: Rc::default(),
+            output: Arc::default(),
             close_at,
             fence_probes: std::collections::HashSet::new(),
             fence_reply_after: 0,
-            waited: Rc::default(),
+            waited: Arc::default(),
             exit_result: true,
             session_id: None,
+            cancellation: zess_platform::CancellationToken::new(),
         }
     }
 }
 
 impl Read for ScriptedStream {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.cancellation.check().map_err(io::Error::other)?;
         if let Some((phase, batch)) = self.batches.front_mut()
-            && *phase <= self.phase.get()
+            && *phase <= self.phase.load(Ordering::SeqCst)
         {
             let count = batch.len().min(bytes.len());
             for byte in &mut bytes[..count] {
@@ -96,7 +114,11 @@ impl Read for ScriptedStream {
             }
             return Ok(count);
         }
-        if self.close_at.is_some_and(|phase| self.phase.get() >= phase) {
+        if self
+            .close_at
+            .is_some_and(|phase| self.phase.load(Ordering::SeqCst) >= phase)
+        {
+            self.phase.transport_ready.store(false, Ordering::SeqCst);
             Ok(0)
         } else {
             Err(io::ErrorKind::WouldBlock.into())
@@ -106,10 +128,12 @@ impl Read for ScriptedStream {
 
 impl Write for ScriptedStream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.output.borrow_mut().extend_from_slice(bytes);
+        self.cancellation.check().map_err(io::Error::other)?;
+        self.output.lock().unwrap().extend_from_slice(bytes);
         let probes = self
             .output
-            .borrow()
+            .lock()
+            .unwrap()
             .split_inclusive(|byte| *byte == b'\n')
             .filter_map(|line| serde_json::from_slice::<ClientMessage>(line).ok())
             .filter_map(|message| match message {
@@ -124,7 +148,10 @@ impl Write for ScriptedStream {
             .collect::<Vec<_>>();
         for (request_id, server_instance) in probes {
             if self.fence_probes.insert(request_id.clone()) {
-                let phase = self.phase.get().max(self.fence_reply_after);
+                let phase = self
+                    .phase
+                    .load(Ordering::SeqCst)
+                    .max(self.fence_reply_after);
                 let index = self
                     .batches
                     .iter()
@@ -157,10 +184,12 @@ impl ConnectionStream for ScriptedStream {
         self.session_id.as_ref()
     }
     fn wait_for_server_exit(&mut self, _: Duration) -> Result<bool> {
-        self.waited.set(self.waited.get() + 1);
+        self.waited
+            .store(self.waited.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
         Ok(self.exit_result)
     }
     fn set_nonblocking(&self, _: bool) -> io::Result<()> {
+        self.phase.transport_ready.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -168,15 +197,15 @@ impl ConnectionStream for ScriptedStream {
 struct ScriptedFactory(VecDeque<ScriptedStream>);
 
 impl ConnectionFactory for ScriptedFactory {
-    fn connect(&mut self) -> Result<Box<dyn ConnectionStream>> {
-        Ok(Box::new(
-            self.0.pop_front().context("unexpected reconnect")?,
-        ))
+    fn connect(&mut self, context: &ConnectionContext) -> Result<Box<dyn ConnectionStream>> {
+        let mut stream = self.0.pop_front().context("unexpected reconnect")?;
+        stream.cancellation = context.cancellation().clone();
+        Ok(Box::new(stream))
     }
 }
 
 struct ScriptedTerminal {
-    phase: Rc<Cell<usize>>,
+    phase: Arc<Phase>,
     events: VecDeque<Option<Event>>,
     wait_at: Option<usize>,
     output: Vec<u8>,
@@ -198,11 +227,19 @@ impl TerminalIo for ScriptedTerminal {
         self.mouse = enabled;
         Ok(())
     }
-    fn poll_event(&mut self, _: Duration) -> Result<Option<Event>> {
-        if self.wait_at == Some(self.phase.get()) {
+    fn poll_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
+        std::thread::sleep(timeout);
+        if self.events.is_empty() && String::from_utf8_lossy(&self.output).contains("r retry") {
+            return Ok(key(KeyCode::Esc));
+        }
+        if !self.phase.transport_ready.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if self.wait_at == Some(self.phase.load(Ordering::SeqCst)) {
             std::thread::sleep(RECONNECT_INTERVAL + Duration::from_millis(20));
         }
-        self.phase.set(self.phase.get() + 1);
+        self.phase
+            .store(self.phase.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
         self.events
             .pop_front()
             .context("client did not finish within the scripted interaction")
@@ -257,9 +294,10 @@ fn key(code: KeyCode) -> Option<Event> {
     Some(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
 }
 
-fn messages(output: &Rc<RefCell<Vec<u8>>>) -> Vec<ClientMessage> {
+fn messages(output: &Arc<Mutex<Vec<u8>>>) -> Vec<ClientMessage> {
     output
-        .borrow()
+        .lock()
+        .unwrap()
         .split_inclusive(|byte| *byte == b'\n')
         .map(|bytes| serde_json::from_slice(bytes).unwrap())
         .collect()
@@ -267,7 +305,7 @@ fn messages(output: &Rc<RefCell<Vec<u8>>>) -> Vec<ClientMessage> {
 
 #[test]
 fn quitting_the_only_clean_scratch_exits_the_client() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let state = SessionSnapshot {
         buffers: vec![zess_protocol::BufferSummary {
             id: 7,
@@ -296,7 +334,7 @@ fn quitting_the_only_clean_scratch_exits_the_client() {
         None,
     );
     let output = stream.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([None, None]),
@@ -304,7 +342,7 @@ fn quitting_the_only_clean_scratch_exits_the_client() {
         output: Vec::new(),
         mouse: false,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
     assert!(messages(&output).iter().any(|message| matches!(
         message,
         ClientMessage::Command {
@@ -319,7 +357,7 @@ fn quitting_the_only_clean_scratch_exits_the_client() {
 
 #[test]
 fn quitting_a_file_requests_a_replacement_scratch() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let state = SessionSnapshot {
         buffers: vec![zess_protocol::BufferSummary {
             id: 7,
@@ -350,7 +388,7 @@ fn quitting_a_file_requests_a_replacement_scratch() {
         None,
     );
     let output = stream.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([None, None]),
@@ -358,7 +396,7 @@ fn quitting_a_file_requests_a_replacement_scratch() {
         output: Vec::new(),
         mouse: false,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
     assert!(messages(&output).iter().any(|message| matches!(
         message,
         ClientMessage::Command {
@@ -375,7 +413,7 @@ fn quitting_a_file_requests_a_replacement_scratch() {
 
 #[test]
 fn workspace_events_change_the_client_quit_decision() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let state = SessionSnapshot {
         buffers: vec![
             zess_protocol::BufferSummary {
@@ -430,7 +468,7 @@ fn workspace_events_change_the_client_quit_decision() {
         None,
     );
     let output = stream.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([const { None }; 5]),
@@ -439,7 +477,7 @@ fn workspace_events_change_the_client_quit_decision() {
         mouse: false,
     };
     run_client(
-        &mut factory,
+        factory,
         "client".into(),
         Vec::new(),
         &mut terminal,
@@ -462,7 +500,7 @@ fn workspace_events_change_the_client_quit_decision() {
 
 #[test]
 fn an_unknown_workspace_action_is_submitted_again() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let state = SessionSnapshot {
         buffers: vec![zess_protocol::BufferSummary {
             id: 7,
@@ -499,7 +537,7 @@ fn an_unknown_workspace_action_is_submitted_again() {
         None,
     );
     let output = stream.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([const { None }; 5]),
@@ -508,7 +546,7 @@ fn an_unknown_workspace_action_is_submitted_again() {
         mouse: false,
     };
     run_client(
-        &mut factory,
+        factory,
         "client".into(),
         Vec::new(),
         &mut terminal,
@@ -532,7 +570,7 @@ fn an_unknown_workspace_action_is_submitted_again() {
 
 #[test]
 fn resynchronization_restores_the_workspace_before_quitting() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let initial = SessionSnapshot {
         workspace: zess_protocol::ClientWorkspace {
             buffers: vec![7],
@@ -581,7 +619,7 @@ fn resynchronization_restores_the_workspace_before_quitting() {
         None,
     );
     let output = stream.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([const { None }; 5]),
@@ -590,7 +628,7 @@ fn resynchronization_restores_the_workspace_before_quitting() {
         mouse: false,
     };
     run_client(
-        &mut factory,
+        factory,
         "client".into(),
         Vec::new(),
         &mut terminal,
@@ -611,7 +649,7 @@ fn resynchronization_restores_the_workspace_before_quitting() {
 
 #[test]
 fn input_waits_for_the_snapshot_and_pauses_until_a_revision_gap_is_resynchronized() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let stream = ScriptedStream::new(
         phase.clone(),
         vec![
@@ -637,7 +675,7 @@ fn input_waits_for_the_snapshot_and_pauses_until_a_revision_gap_is_resynchronize
         None,
     );
     let output = stream.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([
@@ -650,7 +688,7 @@ fn input_waits_for_the_snapshot_and_pauses_until_a_revision_gap_is_resynchronize
         output: Vec::new(),
         mouse: false,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
     let messages = messages(&output);
     let keys = messages
         .iter()
@@ -665,7 +703,7 @@ fn input_waits_for_the_snapshot_and_pauses_until_a_revision_gap_is_resynchronize
 
 #[test]
 fn reconnect_queries_an_acknowledged_command_instead_of_executing_it_again() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let state = SessionSnapshot::default();
     let first = ScriptedStream::new(
         phase.clone(),
@@ -683,15 +721,15 @@ fn reconnect_queries_an_acknowledged_command_instead_of_executing_it_again() {
     );
     let first_output = first.output.clone();
     // The second stream derives the request ID from the actual first request.
-    let second_output = Rc::<RefCell<Vec<u8>>>::default();
+    let second_output = Arc::<Mutex<Vec<u8>>>::default();
     struct ReconnectFactory {
         first: Option<ScriptedStream>,
-        phase: Rc<Cell<usize>>,
-        first_output: Rc<RefCell<Vec<u8>>>,
-        second_output: Rc<RefCell<Vec<u8>>>,
+        phase: Arc<Phase>,
+        first_output: Arc<Mutex<Vec<u8>>>,
+        second_output: Arc<Mutex<Vec<u8>>>,
     }
     impl ConnectionFactory for ReconnectFactory {
-        fn connect(&mut self) -> Result<Box<dyn ConnectionStream>> {
+        fn connect(&mut self, _: &ConnectionContext) -> Result<Box<dyn ConnectionStream>> {
             if let Some(first) = self.first.take() {
                 return Ok(Box::new(first));
             }
@@ -732,7 +770,7 @@ fn reconnect_queries_an_acknowledged_command_instead_of_executing_it_again() {
             Ok(Box::new(stream))
         }
     }
-    let mut factory = ReconnectFactory {
+    let factory = ReconnectFactory {
         first: Some(first),
         phase: phase.clone(),
         first_output: first_output.clone(),
@@ -746,7 +784,7 @@ fn reconnect_queries_an_acknowledged_command_instead_of_executing_it_again() {
         mouse: false,
     };
     run_connection_with_devices_and_platform(
-        &mut factory,
+        factory,
         &[],
         &mut terminal,
         &mut UnusedClipboard,
@@ -782,7 +820,7 @@ fn reconnect_queries_an_acknowledged_command_instead_of_executing_it_again() {
 
 #[test]
 fn the_display_resolves_text_from_the_cached_snapshot_and_delta() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let mut state = SessionSnapshot {
         surfaces: vec![zess_protocol::SurfaceSnapshot {
             page_id: 1,
@@ -858,7 +896,7 @@ fn the_display_resolves_text_from_the_cached_snapshot_and_delta() {
         ],
         None,
     );
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([None, None]),
@@ -866,7 +904,7 @@ fn the_display_resolves_text_from_the_cached_snapshot_and_delta() {
         output: Vec::new(),
         mouse: false,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
     let display = String::from_utf8(terminal.output).unwrap();
     assert!(display.contains("cached-one"));
     assert!(display.contains("cached-two"));
@@ -875,7 +913,7 @@ fn the_display_resolves_text_from_the_cached_snapshot_and_delta() {
 
 #[test]
 fn pasted_text_is_submitted_as_one_paste_operation() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let stream = ScriptedStream::new(
         phase.clone(),
         vec![
@@ -885,7 +923,7 @@ fn pasted_text_is_submitted_as_one_paste_operation() {
         None,
     );
     let output = stream.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([Some(Event::Paste("hello\n:q".into()))]),
@@ -893,7 +931,7 @@ fn pasted_text_is_submitted_as_one_paste_operation() {
         output: Vec::new(),
         mouse: false,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
     let messages = messages(&output);
     assert_eq!(messages.iter().filter(|message| matches!(message, ClientMessage::Command { action: zess_protocol::CommandAction::Paste { text }, .. } if text == "hello\n:q")).count(), 1);
     assert!(!messages.iter().any(|message| matches!(
@@ -904,7 +942,7 @@ fn pasted_text_is_submitted_as_one_paste_operation() {
 
 #[test]
 fn oversized_paste_is_rejected_without_losing_the_connection() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let stream = ScriptedStream::new(
         phase.clone(),
         vec![
@@ -914,7 +952,7 @@ fn oversized_paste_is_rejected_without_losing_the_connection() {
         None,
     );
     let output = stream.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([
@@ -925,7 +963,7 @@ fn oversized_paste_is_rejected_without_losing_the_connection() {
         output: Vec::new(),
         mouse: false,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
     let messages = messages(&output);
     assert!(
         !messages
@@ -946,7 +984,7 @@ fn oversized_paste_is_rejected_without_losing_the_connection() {
 
 #[test]
 fn a_missing_render_source_requests_a_snapshot_before_accepting_more_input() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let mut invalid = SessionSnapshot::default();
     invalid.render_plan.rows = vec![zess_ui::RenderRow {
         spans: vec![zess_ui::RenderSpan {
@@ -981,7 +1019,7 @@ fn a_missing_render_source_requests_a_snapshot_before_accepting_more_input() {
         None,
     );
     let output = stream.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([
@@ -993,7 +1031,7 @@ fn a_missing_render_source_requests_a_snapshot_before_accepting_more_input() {
         output: Vec::new(),
         mouse: false,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
     let messages = messages(&output);
     let keys = messages
         .iter()
@@ -1014,22 +1052,22 @@ fn a_missing_render_source_requests_a_snapshot_before_accepting_more_input() {
 
 #[test]
 fn an_unknown_command_result_is_not_retried_automatically() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let first = ScriptedStream::new(
         phase.clone(),
         vec![(0, vec![attached(), snapshot(1, SessionSnapshot::default())])],
         Some(2),
     );
     let first_output = first.output.clone();
-    let second_output = Rc::<RefCell<Vec<u8>>>::default();
+    let second_output = Arc::<Mutex<Vec<u8>>>::default();
     struct ReconnectFactory {
         first: Option<ScriptedStream>,
-        phase: Rc<Cell<usize>>,
-        first_output: Rc<RefCell<Vec<u8>>>,
-        second_output: Rc<RefCell<Vec<u8>>>,
+        phase: Arc<Phase>,
+        first_output: Arc<Mutex<Vec<u8>>>,
+        second_output: Arc<Mutex<Vec<u8>>>,
     }
     impl ConnectionFactory for ReconnectFactory {
-        fn connect(&mut self) -> Result<Box<dyn ConnectionStream>> {
+        fn connect(&mut self, _: &ConnectionContext) -> Result<Box<dyn ConnectionStream>> {
             if let Some(first) = self.first.take() {
                 return Ok(Box::new(first));
             }
@@ -1069,7 +1107,7 @@ fn an_unknown_command_result_is_not_retried_automatically() {
             Ok(Box::new(stream))
         }
     }
-    let mut factory = ReconnectFactory {
+    let factory = ReconnectFactory {
         first: Some(first),
         phase: phase.clone(),
         first_output: first_output.clone(),
@@ -1088,7 +1126,7 @@ fn an_unknown_command_result_is_not_retried_automatically() {
         output: Vec::new(),
         mouse: false,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
     let first_messages = messages(&first_output);
     let request_id = first_messages
         .iter()
@@ -1114,7 +1152,7 @@ fn an_unknown_command_result_is_not_retried_automatically() {
 #[test]
 fn paste_received_before_synchronization_is_not_replayed_later() {
     {
-        let phase = Rc::new(Cell::new(0));
+        let phase = Arc::new(Phase::default());
         let gap = ServerMessage::Delta {
             session_id: SessionId("session".into()),
             server_instance: ServerInstanceId("server".into()),
@@ -1138,7 +1176,7 @@ fn paste_received_before_synchronization_is_not_replayed_later() {
             None,
         );
         let output = stream.output.clone();
-        let mut factory = ScriptedFactory(VecDeque::from([stream]));
+        let factory = ScriptedFactory(VecDeque::from([stream]));
         let events = ["before", "ready", "gap", "restored"]
             .into_iter()
             .map(|text| Some(Event::Paste(text.into())))
@@ -1150,8 +1188,7 @@ fn paste_received_before_synchronization_is_not_replayed_later() {
             output: Vec::new(),
             mouse: false,
         };
-        run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard)
-            .unwrap();
+        run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
         let messages = messages(&output);
         let commands = messages
             .iter()
@@ -1171,11 +1208,11 @@ fn paste_received_before_synchronization_is_not_replayed_later() {
 }
 
 #[test]
-fn every_connection_attempt_suspends_the_terminal_and_restores_it_even_when_connecting_fails() {
+fn connection_retries_keep_the_terminal_active() {
     struct LifecycleTerminal {
         inner: ScriptedTerminal,
-        suspended: Rc<Cell<bool>>,
-        events: Rc<RefCell<Vec<&'static str>>>,
+        suspended: Arc<AtomicBool>,
+        events: Arc<Mutex<Vec<&'static str>>>,
     }
     impl TerminalIo for LifecycleTerminal {
         type Writer = Vec<u8>;
@@ -1192,30 +1229,30 @@ fn every_connection_attempt_suspends_the_terminal_and_restores_it_even_when_conn
             TerminalIo::set_mouse_capture(&mut self.inner, enabled)
         }
         fn poll_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
-            assert!(!self.suspended.get());
+            assert!(!self.suspended.load(Ordering::SeqCst));
             TerminalIo::poll_event(&mut self.inner, timeout)
         }
         fn suspend(&mut self) -> Result<()> {
-            assert!(!self.suspended.replace(true));
-            self.events.borrow_mut().push("suspend");
+            assert!(!self.suspended.swap(true, Ordering::SeqCst));
+            self.events.lock().unwrap().push("suspend");
             Ok(())
         }
         fn resume(&mut self) -> Result<()> {
-            assert!(self.suspended.replace(false));
-            self.events.borrow_mut().push("resume");
+            assert!(self.suspended.swap(false, Ordering::SeqCst));
+            self.events.lock().unwrap().push("resume");
             Ok(())
         }
     }
     struct LifecycleFactory {
         calls: usize,
-        suspended: Rc<Cell<bool>>,
-        events: Rc<RefCell<Vec<&'static str>>>,
-        phase: Rc<Cell<usize>>,
+        suspended: Arc<AtomicBool>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        phase: Arc<Phase>,
     }
     impl ConnectionFactory for LifecycleFactory {
-        fn connect(&mut self) -> Result<Box<dyn ConnectionStream>> {
-            assert!(self.suspended.get());
-            self.events.borrow_mut().push("connect");
+        fn connect(&mut self, _: &ConnectionContext) -> Result<Box<dyn ConnectionStream>> {
+            assert!(!self.suspended.load(Ordering::SeqCst));
+            self.events.lock().unwrap().push("connect");
             self.calls += 1;
             if self.calls == 1 {
                 anyhow::bail!("authentication failed");
@@ -1227,9 +1264,9 @@ fn every_connection_attempt_suspends_the_terminal_and_restores_it_even_when_conn
             )))
         }
     }
-    let suspended = Rc::new(Cell::new(false));
-    let events = Rc::new(RefCell::new(Vec::new()));
-    let phase = Rc::new(Cell::new(0));
+    let suspended = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let phase = Arc::new(Phase::default());
     let mut terminal = LifecycleTerminal {
         inner: ScriptedTerminal {
             phase: phase.clone(),
@@ -1241,26 +1278,21 @@ fn every_connection_attempt_suspends_the_terminal_and_restores_it_even_when_conn
         suspended: suspended.clone(),
         events: events.clone(),
     };
-    let mut factory = LifecycleFactory {
+    let factory = LifecycleFactory {
         calls: 0,
         suspended: suspended.clone(),
         events: events.clone(),
         phase,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
-    assert_eq!(
-        *events.borrow(),
-        [
-            "suspend", "connect", "resume", "suspend", "connect", "resume"
-        ]
-    );
-    assert!(!suspended.get());
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    assert_eq!(*events.lock().unwrap(), ["connect", "connect"]);
+    assert!(!suspended.load(Ordering::SeqCst));
 }
 
 #[test]
 fn new_input_acknowledges_an_error_so_the_command_prompt_becomes_visible() {
     for event in [key(KeyCode::Tab), Some(Event::Paste("pasted".into()))] {
-        let phase = Rc::new(Cell::new(0));
+        let phase = Arc::new(Phase::default());
         let state = SessionSnapshot {
             render_plan: zess_ui::RenderPlan {
                 width: 80,
@@ -1288,7 +1320,7 @@ fn new_input_acknowledges_an_error_so_the_command_prompt_becomes_visible() {
             ],
             None,
         );
-        let mut factory = ScriptedFactory(VecDeque::from([stream]));
+        let factory = ScriptedFactory(VecDeque::from([stream]));
         let mut frontend = ScriptedTerminal {
             phase,
             events: VecDeque::from([event, None]),
@@ -1296,8 +1328,7 @@ fn new_input_acknowledges_an_error_so_the_command_prompt_becomes_visible() {
             output: Vec::new(),
             mouse: false,
         };
-        run_connection_with_devices(&mut factory, &[], &mut frontend, &mut UnusedClipboard)
-            .unwrap();
+        run_connection_with_devices(factory, &[], &mut frontend, &mut UnusedClipboard).unwrap();
         let display = String::from_utf8(frontend.output).unwrap();
         let error = display.find("unexpected clipboard write").unwrap();
         let prompt = display.find(":hel").unwrap();
@@ -1308,7 +1339,7 @@ fn new_input_acknowledges_an_error_so_the_command_prompt_becomes_visible() {
 
 #[test]
 fn ordinary_keys_do_not_dismiss_the_replay_confirmation_notice() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let first = ScriptedStream::new(
         phase.clone(),
         vec![(0, vec![attached(), snapshot(1, SessionSnapshot::default())])],
@@ -1342,7 +1373,7 @@ fn ordinary_keys_do_not_dismiss_the_replay_confirmation_notice() {
         ],
         None,
     );
-    let mut factory = ScriptedFactory(VecDeque::from([first, second]));
+    let factory = ScriptedFactory(VecDeque::from([first, second]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([key(KeyCode::Char('a')), None, key(KeyCode::Tab), None]),
@@ -1350,7 +1381,7 @@ fn ordinary_keys_do_not_dismiss_the_replay_confirmation_notice() {
         output: Vec::new(),
         mouse: false,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
     let display = String::from_utf8(terminal.output).unwrap();
     assert_eq!(display.matches("Session changed: Ctrl-r replay").count(), 2);
     assert!(!display.contains(":hel"));
@@ -1361,7 +1392,7 @@ fn frontends_and_their_operations_have_distinct_ids_when_host_identity_facts_are
     let mut namespaces = Vec::new();
     let mut operation_ids = Vec::new();
     for _ in 0..2 {
-        let phase = Rc::new(Cell::new(0));
+        let phase = Arc::new(Phase::default());
         let stream = ScriptedStream::new(
             phase.clone(),
             vec![
@@ -1371,7 +1402,7 @@ fn frontends_and_their_operations_have_distinct_ids_when_host_identity_facts_are
             None,
         );
         let output = stream.output.clone();
-        let mut factory = ScriptedFactory(VecDeque::from([stream]));
+        let factory = ScriptedFactory(VecDeque::from([stream]));
         let mut frontend = ScriptedTerminal {
             phase,
             events: VecDeque::from([
@@ -1384,7 +1415,7 @@ fn frontends_and_their_operations_have_distinct_ids_when_host_identity_facts_are
             mouse: false,
         };
         run_connection_with_devices_and_platform(
-            &mut factory,
+            factory,
             &[],
             &mut frontend,
             &mut UnusedClipboard,
@@ -1458,7 +1489,7 @@ fn reconnect_recovery_preserves_pending_command_results() {
         fn poll_event(&mut self, timeout: Duration) -> Result<Option<Event>> {
             let output = &self.terminal.output[self.output_offset..];
             self.presentations.push((
-                self.terminal.phase.get(),
+                self.terminal.phase.load(Ordering::SeqCst),
                 String::from_utf8_lossy(output).into_owned(),
             ));
             self.output_offset = self.terminal.output.len();
@@ -1467,7 +1498,7 @@ fn reconnect_recovery_preserves_pending_command_results() {
     }
     for report in [Report::FailedCommand, Report::UnknownCommand] {
         for discard in [false, true] {
-            let phase = Rc::new(Cell::new(0));
+            let phase = Arc::new(Phase::default());
             let acknowledged = 1;
             let through = acknowledged + 1;
             let first = ScriptedStream::new(
@@ -1485,17 +1516,17 @@ fn reconnect_recovery_preserves_pending_command_results() {
                 Some(2),
             );
             let first_output = first.output.clone();
-            let second_output = Rc::<RefCell<Vec<u8>>>::default();
+            let second_output = Arc::<Mutex<Vec<u8>>>::default();
             struct ReconnectFactory {
                 first: Option<ScriptedStream>,
-                phase: Rc<Cell<usize>>,
-                first_output: Rc<RefCell<Vec<u8>>>,
-                second_output: Rc<RefCell<Vec<u8>>>,
+                phase: Arc<Phase>,
+                first_output: Arc<Mutex<Vec<u8>>>,
+                second_output: Arc<Mutex<Vec<u8>>>,
                 report: Report,
                 acknowledged: u64,
             }
             impl ConnectionFactory for ReconnectFactory {
-                fn connect(&mut self) -> Result<Box<dyn ConnectionStream>> {
+                fn connect(&mut self, _: &ConnectionContext) -> Result<Box<dyn ConnectionStream>> {
                     if let Some(first) = self.first.take() {
                         return Ok(Box::new(first));
                     }
@@ -1555,7 +1586,7 @@ fn reconnect_recovery_preserves_pending_command_results() {
                     Ok(Box::new(stream))
                 }
             }
-            let mut factory = ReconnectFactory {
+            let factory = ReconnectFactory {
                 first: Some(first),
                 phase: phase.clone(),
                 first_output,
@@ -1591,8 +1622,7 @@ fn reconnect_recovery_preserves_pending_command_results() {
                 presentations: Vec::new(),
                 output_offset: 0,
             };
-            run_connection_with_devices(&mut factory, &[], &mut frontend, &mut UnusedClipboard)
-                .unwrap();
+            run_connection_with_devices(factory, &[], &mut frontend, &mut UnusedClipboard).unwrap();
             let (_, notice) = frontend
                 .presentations
                 .iter()
@@ -1655,7 +1685,7 @@ fn reconnect_recovery_preserves_pending_command_results() {
 
 #[test]
 fn a_different_build_is_rejected_before_attachment() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let mut stream = ScriptedStream::new(phase.clone(), vec![], None);
     stream.batches[0].1 = framing::encode(&ServerMessage::Hello {
         build_id: "different-build".into(),
@@ -1663,7 +1693,7 @@ fn a_different_build_is_rejected_before_attachment() {
     .unwrap()
     .into();
     let output = stream.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::new(),
@@ -1671,8 +1701,8 @@ fn a_different_build_is_rejected_before_attachment() {
         output: Vec::new(),
         mouse: false,
     };
-    let error = run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard)
-        .unwrap_err();
+    let error =
+        run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap_err();
     assert!(
         error
             .downcast_ref::<zess_protocol::BuildMismatch>()
@@ -1687,7 +1717,7 @@ fn a_different_build_is_rejected_before_attachment() {
 
 #[test]
 fn attachment_uses_the_session_selected_by_the_transport() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let mut stream = ScriptedStream::new(
         phase.clone(),
         vec![
@@ -1703,7 +1733,7 @@ fn attachment_uses_the_session_selected_by_the_transport() {
     );
     stream.session_id = Some(SessionId("session".into()));
     let output = stream.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([None, None]),
@@ -1711,7 +1741,7 @@ fn attachment_uses_the_session_selected_by_the_transport() {
         output: Vec::new(),
         mouse: false,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
     let sent = messages(&output);
     assert!(matches!(&sent[0], ClientMessage::Hello { .. }));
     assert!(
@@ -1721,7 +1751,7 @@ fn attachment_uses_the_session_selected_by_the_transport() {
 
 #[test]
 fn stopping_waits_for_the_server_and_reports_a_process_that_did_not_exit() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let mut stream = ScriptedStream::new(
         phase.clone(),
         vec![
@@ -1737,7 +1767,7 @@ fn stopping_waits_for_the_server_and_reports_a_process_that_did_not_exit() {
     );
     stream.exit_result = false;
     let waited = stream.waited.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([None, None]),
@@ -1745,15 +1775,15 @@ fn stopping_waits_for_the_server_and_reports_a_process_that_did_not_exit() {
         output: Vec::new(),
         mouse: false,
     };
-    let error = run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard)
-        .unwrap_err();
+    let error =
+        run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap_err();
     assert!(error.to_string().contains("did not exit"));
-    assert_eq!(waited.get(), 1);
+    assert_eq!(waited.load(Ordering::SeqCst), 1);
 }
 
 #[test]
 fn retaining_the_session_does_not_wait_for_its_process() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let mut stream = ScriptedStream::new(
         phase.clone(),
         vec![
@@ -1769,7 +1799,7 @@ fn retaining_the_session_does_not_wait_for_its_process() {
     );
     stream.exit_result = false;
     let waited = stream.waited.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([stream]));
+    let factory = ScriptedFactory(VecDeque::from([stream]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([None, None]),
@@ -1777,13 +1807,13 @@ fn retaining_the_session_does_not_wait_for_its_process() {
         output: Vec::new(),
         mouse: false,
     };
-    run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
-    assert_eq!(waited.get(), 0);
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
+    assert_eq!(waited.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn reconnecting_to_a_replacement_session_does_not_replay_input() {
-    let phase = Rc::new(Cell::new(0));
+    let phase = Arc::new(Phase::default());
     let first = ScriptedStream::new(
         phase.clone(),
         vec![(0, vec![attached(), snapshot(1, SessionSnapshot::default())])],
@@ -1798,7 +1828,7 @@ fn reconnecting_to_a_replacement_session_does_not_replay_input() {
     }
     let second = ScriptedStream::new(phase.clone(), vec![(2, vec![replacement])], None);
     let output = second.output.clone();
-    let mut factory = ScriptedFactory(VecDeque::from([first, second]));
+    let factory = ScriptedFactory(VecDeque::from([first, second]));
     let mut terminal = ScriptedTerminal {
         phase,
         events: VecDeque::from([key(KeyCode::Char('x')), None, None]),
@@ -1806,8 +1836,8 @@ fn reconnecting_to_a_replacement_session_does_not_replay_input() {
         output: Vec::new(),
         mouse: false,
     };
-    let error = run_connection_with_devices(&mut factory, &[], &mut terminal, &mut UnusedClipboard)
-        .unwrap_err();
+    let error =
+        run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap_err();
     assert!(error.to_string().contains("original zess server"));
     assert!(!messages(&output).iter().any(|message| matches!(
         message,
