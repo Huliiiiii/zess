@@ -258,7 +258,7 @@ impl Connection {
             }),
         };
         connection.send(&ClientMessage::Hello {
-            build_id: zess_build::BUILD_ID.to_owned(),
+            version: zess_build::version().to_owned(),
         })?;
         Ok(connection)
     }
@@ -307,8 +307,11 @@ impl Connection {
                                 .expect("fragment completes a message");
                             if self.pending_attach.is_some() {
                                 match message {
-                                    ServerMessage::Hello { build_id } => {
-                                        zess_protocol::check_build_id(&build_id)?;
+                                    ServerMessage::Hello { version } => {
+                                        zess_protocol::check_version(
+                                            zess_build::version(),
+                                            &version,
+                                        )?;
                                         let attach = self.pending_attach.take().unwrap();
                                         self.send(&attach)?;
                                     }
@@ -833,7 +836,7 @@ fn run_client<C: Clipboard>(
             Ok(messages) => messages.unwrap_or_default(),
             Err(error) => {
                 if error
-                    .downcast_ref::<zess_protocol::BuildMismatch>()
+                    .downcast_ref::<zess_protocol::VersionMismatch>()
                     .is_some()
                 {
                     page.progress = ConnectionProgress {

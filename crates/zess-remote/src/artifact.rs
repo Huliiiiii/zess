@@ -62,6 +62,7 @@ pub trait ServerArtifacts: Send + Sync {
 
 pub struct GithubReleaseArtifacts {
     repository: String,
+    release_version: Option<&'static str>,
     file_system: Arc<dyn FileSystem>,
     platform: Arc<dyn Platform>,
     agent: ureq::Agent,
@@ -69,7 +70,7 @@ pub struct GithubReleaseArtifacts {
 
 #[derive(Deserialize)]
 struct Manifest {
-    build_id: String,
+    version: String,
     artifacts: Vec<ManifestArtifact>,
 }
 
@@ -88,6 +89,7 @@ impl GithubReleaseArtifacts {
     ) -> Self {
         Self {
             repository: repository.into(),
+            release_version: zess_build::RELEASE_VERSION,
             file_system,
             platform,
             agent: ureq::Agent::config_builder()
@@ -104,15 +106,15 @@ impl GithubReleaseArtifacts {
 
     fn download(
         &self,
+        version: &str,
         name: &str,
         cancellation: &dyn Cancellation,
         progress: Option<&dyn ProgressReporter>,
     ) -> Result<Vec<u8>> {
         cancellation.check()?;
         let url = format!(
-            "https://github.com/{}/releases/download/build-{}/{name}",
-            self.repository,
-            zess_build::BUILD_ID
+            "https://github.com/{}/releases/download/v{version}/{name}",
+            self.repository
         );
         let agent = self.agent.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -228,12 +230,13 @@ impl Drop for DownloadCancellation {
     }
 }
 
-fn artifact_hash(manifest: &[u8], target: ServerTarget) -> Result<String> {
+fn artifact_hash(manifest: &[u8], version: &str, target: ServerTarget) -> Result<String> {
     let manifest: Manifest =
         serde_json::from_slice(manifest).context("invalid server release manifest")?;
     ensure!(
-        manifest.build_id == zess_build::BUILD_ID,
-        "server release build ID does not match this client"
+        manifest.version == version,
+        "server release version {} does not match this client ({version})",
+        manifest.version
     );
     let mut matches = manifest
         .artifacts
@@ -273,17 +276,20 @@ impl ServerArtifacts for GithubReleaseArtifacts {
         progress: Option<&dyn ProgressReporter>,
     ) -> Result<ServerArtifact> {
         cancellation.check()?;
+        let version = self.release_version.context(
+            "this development build has no published server. Use a client from a stable or preview release",
+        )?;
         let directory = self
             .platform
             .user_dirs()?
             .cache
             .join("zess")
             .join("servers")
-            .join(zess_build::BUILD_ID);
+            .join(version);
         let path = directory.join(target.asset_name());
         let manifest_path = directory.join("manifest.json");
         if let Ok(manifest) = self.file_system.read(&manifest_path)
-            && let Ok(sha256) = artifact_hash(&manifest, target)
+            && let Ok(sha256) = artifact_hash(&manifest, version, target)
             && let Ok(bytes) = self.file_system.read(&path)
             && digest(&bytes) == sha256
         {
@@ -298,9 +304,9 @@ impl ServerArtifacts for GithubReleaseArtifacts {
         if let Some(progress) = progress {
             progress.report(RemoteProgress::Stage(RemoteStage::Downloading));
         }
-        let manifest = self.download("manifest.json", cancellation, None)?;
-        let sha256 = artifact_hash(&manifest, target)?;
-        let bytes = self.download(&target.asset_name(), cancellation, progress)?;
+        let manifest = self.download(version, "manifest.json", cancellation, None)?;
+        let sha256 = artifact_hash(&manifest, version, target)?;
+        let bytes = self.download(version, &target.asset_name(), cancellation, progress)?;
         ensure!(
             digest(&bytes) == sha256,
             "downloaded server SHA-256 does not match the release manifest"

@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, bail};
 use serde::{Serialize, de::DeserializeOwned};
 use zess_platform::{Cancellation, CancellationToken, ConsoleMode, ProcessRunner, ProcessSpec};
-use zess_protocol::{ClientMessage, ServerMessage, check_build_id};
+use zess_protocol::{ClientMessage, ServerMessage, check_version};
 
 use crate::{
     AskpassConfig, ProgressReporter, ProxyHandshake, RemoteProgress, RemoteStage, ServerBootstrap,
@@ -131,12 +131,12 @@ impl<R: ProcessRunner, Q: Serialize> Connector for SshConnector<R, Q> {
         write_initial_request(
             &mut connection,
             &ClientMessage::Hello {
-                build_id: zess_build::BUILD_ID.into(),
+                version: zess_build::version().into(),
             },
             &self.target,
         )?;
         match read_initial::<ServerMessage>(&mut connection, &self.target)? {
-            ServerMessage::Hello { build_id } => check_build_id(&build_id)?,
+            ServerMessage::Hello { version } => check_version(zess_build::version(), &version)?,
             _ => bail!("remote proxy did not send hello"),
         }
         write_initial_request(&mut connection, &self.request, &self.target)?;

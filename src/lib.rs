@@ -192,11 +192,9 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 return Ok(());
             }
             "--version" | "-V" => {
-                println!(
-                    "zess {} (build {})",
-                    env!("CARGO_PKG_VERSION"),
-                    zess_build::BUILD_ID
-                );
+                let version = zess_build::RELEASE_VERSION
+                    .unwrap_or(concat!(env!("CARGO_PKG_VERSION"), "-dev"));
+                println!("zess {version}");
                 return Ok(());
             }
             "--json" => json = true,
@@ -734,14 +732,14 @@ fn default_config(filesystem: &dyn FileSystem, host: &dyn Platform) -> Option<Pa
 }
 
 fn print_sessions(sessions: &[server::SessionInfo]) {
-    println!("NAME\tID\tSESSION\tBUILD\tPID\tCLIENT\tMODIFIED\tWORKSPACE");
+    println!("NAME\tID\tSESSION\tVERSION\tPID\tCLIENT\tMODIFIED\tWORKSPACE");
     for session in sessions {
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             session.name.as_deref().unwrap_or("-"),
             session.id,
             session.session_id.0,
-            session.build_id,
+            session.version,
             session.pid,
             if session.attached {
                 "attached"

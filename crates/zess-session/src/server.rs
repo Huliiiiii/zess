@@ -484,13 +484,15 @@ pub fn serve_with_platform(
                         break;
                     }
                     match message {
-                        ClientMessage::Hello { build_id }
+                        ClientMessage::Hello { version }
                             if matches!(connection.role, ConnectionRole::AwaitHello { .. }) =>
                         {
                             connection.send(&ServerMessage::Hello {
-                                build_id: zess_build::BUILD_ID.to_owned(),
+                                version: zess_build::version().to_owned(),
                             })?;
-                            if zess_protocol::check_build_id(&build_id).is_err() {
+                            if zess_protocol::check_version(zess_build::version(), &version)
+                                .is_err()
+                            {
                                 connection.close_after_flush();
                                 break;
                             }
@@ -506,7 +508,7 @@ pub fn serve_with_platform(
                             ) =>
                         {
                             connection.send(&ServerMessage::Status {
-                                build_id: zess_build::BUILD_ID.to_owned(),
+                                version: zess_build::version().to_owned(),
                                 session_id: published.session_id.clone(),
                                 name: session.name().map(str::to_owned),
                                 server_instance: server_instance.clone(),

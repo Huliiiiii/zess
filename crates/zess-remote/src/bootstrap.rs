@@ -236,7 +236,7 @@ impl RemotePlatform {
     fn check(&self) -> String {
         let posix = format!(
             "set -eu; d=\"$HOME/.cache/zess/servers/{}/current\"; test -x \"$d/zess\"; test -f \"$d/source.sha256\"; test -f \"$d/installed.sha256\"; cd \"$d\"; sha256sum -c --status installed.sha256",
-            zess_build::BUILD_ID
+            zess_build::version()
         );
         let windows = format!(
             "$ErrorActionPreference='Stop';{} $p=Join-Path $d 'zess.exe';$h=Join-Path $d 'sha256';if(!(Test-Path -LiteralPath $p) -or !(Test-Path -LiteralPath $h) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToLowerInvariant() -ne ([IO.File]::ReadAllText($h)).Trim()){{exit 1}}",
@@ -248,7 +248,7 @@ impl RemotePlatform {
     fn install(&self, hash: &str, length: usize) -> String {
         let posix = format!(
             "set -eu; umask 077; base=\"$HOME/.cache/zess/servers/{}\"; d=\"$base/current\"; mkdir -p \"$base\"; t=$(mktemp -d \"$base/install.XXXXXXXX\"); link=\"$base/.current.$$\"; trap 'rm -f \"$link\"; if [ -n \"$t\" ]; then rm -rf \"$t\"; fi' EXIT; trap 'exit 1' HUP INT TERM; head -c {length} > \"$t/archive.tar.gz\"; test \"$(wc -c < \"$t/archive.tar.gz\")\" -eq {length} || {{ echo 'server upload truncated' >&2; exit 1; }}; h=$(sha256sum \"$t/archive.tar.gz\"); h=${{h%% *}}; [ \"$h\" = '{hash}' ] || {{ echo 'server SHA-256 mismatch' >&2; exit 1; }}; tar -xzf \"$t/archive.tar.gz\" -C \"$t\"; rm \"$t/archive.tar.gz\"; test -x \"$t/patchelf\"; test -f \"$t/lib/ld-linux-x86-64.so.2\"; \"$t/patchelf\" --set-interpreter \"$d/lib/ld-linux-x86-64.so.2\" --set-rpath '$ORIGIN/lib' \"$t/zess\"; chmod 700 \"$t/zess\"; printf '%s' '{hash}' > \"$t/source.sha256\"; (cd \"$t\"; sha256sum zess lib/* > installed.sha256); ln -s \"$t\" \"$link\"; mv -Tf \"$link\" \"$d\"; t=''",
-            zess_build::BUILD_ID
+            zess_build::version()
         );
         let windows = format!(
             "$ErrorActionPreference='Stop';{} [IO.Directory]::CreateDirectory($d)>$null;$t=Join-Path $d ([Guid]::NewGuid().ToString()+'.tmp');try{{$f=[IO.File]::Create($t);try{{$source=[Console]::OpenStandardInput();$remaining=[long]{length};$buffer=New-Object byte[] 65536;while($remaining -gt 0){{$n=$source.Read($buffer,0,[int][Math]::Min($buffer.Length,$remaining));if($n -eq 0){{throw 'server upload truncated'}};$f.Write($buffer,0,$n);$remaining-=$n}}}}finally{{$f.Dispose()}};if((Get-FileHash -Algorithm SHA256 -LiteralPath $t).Hash.ToLowerInvariant() -ne '{hash}'){{throw 'server SHA-256 mismatch'}};$dest=Join-Path $d 'zess.exe';if(Test-Path -LiteralPath $dest){{[IO.File]::Replace($t,$dest,[NullString]::Value)}}else{{[IO.File]::Move($t,$dest)}};[IO.File]::WriteAllText((Join-Path $d 'sha256'),'{hash}')}}catch{{[Console]::Error.WriteLine($_);exit 1}}finally{{if(Test-Path -LiteralPath $t){{Remove-Item -LiteralPath $t -Force}}}}",
@@ -260,7 +260,7 @@ impl RemotePlatform {
     fn proxy(&self) -> String {
         let posix = format!(
             "exec \"$HOME/.cache/zess/servers/{}/current/zess\" remote-proxy",
-            zess_build::BUILD_ID
+            zess_build::version()
         );
         let windows = format!(
             "{} $s=[Diagnostics.ProcessStartInfo]::new();$s.FileName=Join-Path $d 'zess.exe';$s.Arguments='remote-proxy';$s.UseShellExecute=$false;$p=[Diagnostics.Process]::Start($s);$p.WaitForExit();exit $p.ExitCode",
@@ -273,7 +273,7 @@ impl RemotePlatform {
 fn windows_dir() -> String {
     format!(
         "$d=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Zess/servers/{}';",
-        zess_build::BUILD_ID
+        zess_build::version()
     )
 }
 

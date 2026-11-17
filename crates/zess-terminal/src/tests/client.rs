@@ -70,7 +70,7 @@ impl ScriptedStream {
         let batches = std::iter::once((
             0,
             vec![ServerMessage::Hello {
-                build_id: zess_build::BUILD_ID.into(),
+                version: zess_build::version().into(),
             }],
         ))
         .chain(messages)
@@ -1704,7 +1704,7 @@ fn a_different_build_is_rejected_before_attachment() {
     let phase = Arc::new(Phase::default());
     let mut stream = ScriptedStream::new(phase.clone(), vec![], None);
     stream.batches[0].1 = framing::encode(&ServerMessage::Hello {
-        build_id: "different-build".into(),
+        version: "different-build".into(),
     })
     .unwrap()
     .into();
@@ -1721,13 +1721,13 @@ fn a_different_build_is_rejected_before_attachment() {
         run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap_err();
     assert!(
         error
-            .downcast_ref::<zess_protocol::BuildMismatch>()
+            .downcast_ref::<zess_protocol::VersionMismatch>()
             .is_some()
     );
     let sent = messages(&output);
     assert_eq!(sent.len(), 1);
     assert!(
-        matches!(&sent[0], ClientMessage::Hello { build_id } if build_id == zess_build::BUILD_ID)
+        matches!(&sent[0], ClientMessage::Hello { version } if version == zess_build::version())
     );
 }
 
