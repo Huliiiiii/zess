@@ -13,10 +13,11 @@ use anyhow::Result;
 use zess_ipc::platform::{
     DaemonControl, DaemonHandle, DaemonSpec, NativeDaemonControl, ProcessWait,
 };
-use zess_ipc::{Listener, LocalIpc, NativeLocalIpc, ServerId, SocketPath, Stream};
+use zess_ipc::{Listener, LocalIpc, NativeLocalIpc, ServerId, SocketPath, Stream, framing};
 use zess_platform::{
     CancellationToken, HostInfo, NativeFileSystem, NativePlatform, Platform, UserDirs,
 };
+use zess_protocol::{ClientMessage, ServerMessage};
 
 #[path = "../src/server.rs"]
 pub mod server;
@@ -165,7 +166,7 @@ impl Server {
 
     fn start(&self) -> server::SessionInfo {
         self.manager
-            .start(&self.workspace, &self.endpoint, Some(&self.config), &[])
+            .create(&self.workspace, Some(&self.config), &[], None)
             .unwrap_or_else(|error| {
                 panic!(
                     "{error:#}\n{}",
@@ -175,16 +176,138 @@ impl Server {
     }
 }
 
+fn wait_for_endpoint_removal(endpoint: &SocketPath) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while endpoint.is_present().unwrap() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+fn receive_server_message(reader: &mut BufReader<Stream>) -> ServerMessage {
+    let frame = framing::read(reader, 1024 * 1024).unwrap().unwrap();
+    framing::decode(&frame).unwrap()
+}
+
+fn attach_to_pending_session(mut stream: Stream, info: &server::SessionInfo) -> BufReader<Stream> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    framing::write(
+        &mut stream,
+        &ClientMessage::Hello {
+            build_id: info.build_id.clone(),
+        },
+    )
+    .unwrap();
+
+    let mut reader = BufReader::new(stream);
+    assert!(matches!(
+        receive_server_message(&mut reader),
+        ServerMessage::Hello { build_id } if build_id == info.build_id
+    ));
+    framing::write(
+        reader.get_mut(),
+        &ClientMessage::Attach {
+            expected_session: Some(info.session_id.clone()),
+            client_id: "test-terminal".into(),
+            width: 80,
+            height: 24,
+            files: Vec::new(),
+            context_epoch: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        receive_server_message(&mut reader),
+        ServerMessage::AttachPending
+    ));
+    assert!(matches!(
+        receive_server_message(&mut reader),
+        ServerMessage::Attached { server_instance, .. } if server_instance == info.server_instance
+    ));
+    assert!(matches!(
+        receive_server_message(&mut reader),
+        ServerMessage::Snapshot { session_id, .. } if session_id == info.session_id
+    ));
+    reader
+}
+
 #[test]
 fn workspace_session_creation_uses_the_configured_endpoint_and_log_path() {
     let server = Server::new();
     let created = server
         .manager
-        .ensure_for_workspace(&server.workspace.join("."), Some(&server.config), &[])
+        .create(&server.workspace.join("."), Some(&server.config), &[], None)
         .unwrap();
     assert_eq!(Path::new(&created.endpoint), server.endpoint.as_path());
     assert_eq!(Path::new(&created.workspace), server.workspace);
     assert!(server.daemons.log.is_file());
+}
+
+#[test]
+fn retrying_after_an_interrupted_first_attach_opens_a_new_session() {
+    let server = Server::new();
+    let (stream, interrupted) = server
+        .manager
+        .open_workspace(
+            &server.workspace,
+            &server.endpoint,
+            Some(&server.config),
+            &[],
+        )
+        .unwrap();
+    #[cfg(any(target_os = "linux", windows))]
+    let process = server.manager.watch(&stream).unwrap();
+    let reader = attach_to_pending_session(stream, &interrupted);
+    assert!(server.manager.entries().unwrap().is_empty());
+
+    drop(reader);
+    #[cfg(any(target_os = "linux", windows))]
+    assert!(
+        process.wait(Duration::from_secs(3)).unwrap(),
+        "the interrupted session's daemon did not exit"
+    );
+    assert!(
+        wait_for_endpoint_removal(&server.endpoint),
+        "the interrupted session's endpoint remained present"
+    );
+
+    let (stream, retried) = server
+        .manager
+        .open_workspace(
+            &server.workspace,
+            &server.endpoint,
+            Some(&server.config),
+            &[],
+        )
+        .unwrap();
+    assert_ne!(retried.session_id, interrupted.session_id);
+    let mut reader = attach_to_pending_session(stream, &retried);
+    framing::write(reader.get_mut(), &ClientMessage::ConfirmAttach).unwrap();
+    assert!(matches!(
+        receive_server_message(&mut reader),
+        ServerMessage::AttachConfirmed
+    ));
+    drop(reader);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let entries = server.manager.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, retried.session_id);
+        if !entries[0].attached {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the terminal stayed attached");
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -223,9 +346,9 @@ fn an_existing_workspace_session_is_reused_and_routes_by_its_session_id() {
     assert!(!started.session_id.0.is_empty());
     assert!(!started.server_instance.0.is_empty());
     assert_eq!(Path::new(&started.endpoint), server.endpoint.as_path());
-    let reused = server
+    let (_stream, reused) = server
         .manager
-        .ensure(
+        .open_workspace(
             &server.workspace,
             &SocketPath::from(server.root.path().join("another.sock")),
             Some(&server.config),
@@ -270,13 +393,14 @@ fn cancelling_session_creation_before_it_starts_does_not_spawn_a_daemon() {
     cancellation.cancel();
     let manager = server.manager.clone().with_cancellation(cancellation);
     let error = manager
-        .ensure(
+        .open_workspace(
             &server.workspace,
             &server.endpoint,
             Some(&server.config),
             &[],
         )
-        .unwrap_err();
+        .err()
+        .expect("a cancelled workspace open succeeded");
     assert_eq!(error.to_string(), "operation was cancelled");
     assert_eq!(server.daemons.spawns.load(Ordering::Relaxed), 0);
 }
@@ -288,7 +412,7 @@ fn a_build_mismatch_does_not_start_another_session() {
     let manager = server.manager.clone();
     let workspace = server.workspace.clone();
     let endpoint = server.endpoint.clone();
-    let worker = thread::spawn(move || manager.ensure(&workspace, &endpoint, None, &[]));
+    let worker = thread::spawn(move || manager.open_workspace(&workspace, &endpoint, None, &[]));
     let mut stream = listener.accept().unwrap();
     zess_ipc::framing::read(
         &mut BufReader::new(stream.try_clone().unwrap()),
@@ -308,11 +432,16 @@ fn a_build_mismatch_does_not_start_another_session() {
                 workspace: server.workspace.to_string_lossy().into_owned(),
                 attached: false,
                 modified: true,
+                pending: false,
             })
             .unwrap(),
         )
         .unwrap();
-    let error = worker.join().unwrap().unwrap_err();
+    let error = worker
+        .join()
+        .unwrap()
+        .err()
+        .expect("a mismatched session was opened");
     assert!(
         error
             .downcast_ref::<zess_protocol::BuildMismatch>()
@@ -353,20 +482,22 @@ fn a_session_with_a_different_build_does_not_block_another_workspace() {
                     workspace: old_workspace.to_string_lossy().into_owned(),
                     attached: false,
                     modified: true,
+                    pending: false,
                 })
                 .unwrap(),
             )
             .unwrap();
     });
-    let info = server
+    let (stream, info) = server
         .manager
-        .ensure(&other, &new_endpoint, Some(&server.config), &[])
+        .open_workspace(&other, &new_endpoint, Some(&server.config), &[])
         .unwrap();
     fixture.join().unwrap();
     assert_eq!(Path::new(&info.workspace), other.canonicalize().unwrap());
     assert_eq!(info.build_id, zess_build::BUILD_ID);
     assert_eq!(server.daemons.spawns.load(Ordering::Relaxed), 1);
-    server.manager.stop(&new_endpoint, true).unwrap();
+    drop(stream);
+    assert!(wait_for_endpoint_removal(&new_endpoint));
 }
 
 #[cfg(unix)]
@@ -420,6 +551,7 @@ fn multiple_sessions_remain_visible_when_one_has_a_different_build() {
                             workspace: workspace.to_string_lossy().into_owned(),
                             attached: false,
                             modified: false,
+                            pending: false,
                         })
                         .unwrap(),
                     )
@@ -439,8 +571,9 @@ fn multiple_sessions_remain_visible_when_one_has_a_different_build() {
     );
     let error = server
         .manager
-        .ensure(&server.workspace, &server.endpoint, None, &[])
-        .unwrap_err();
+        .open_workspace(&server.workspace, &server.endpoint, None, &[])
+        .err()
+        .expect("opening a workspace with multiple sessions succeeded");
     assert!(error.to_string().contains("multiple sessions"));
     assert_eq!(server.daemons.spawns.load(Ordering::Relaxed), 0);
     for fixture in fixtures {
@@ -509,6 +642,7 @@ fn management_responses_can_arrive_across_poll_intervals() {
         workspace: server.workspace.to_string_lossy().into_owned(),
         attached: false,
         modified: false,
+        pending: false,
     })
     .unwrap();
     let middle = response.len() / 2;
@@ -547,9 +681,9 @@ fn discovery_skips_a_socket_left_by_a_dead_server() {
     drop(listener);
 
     assert!(server.manager.entries().unwrap().is_empty());
-    let session = server
+    let (stream, session) = server
         .manager
-        .ensure(
+        .open_workspace(
             &server.workspace,
             &server.endpoint,
             Some(&server.config),
@@ -557,6 +691,8 @@ fn discovery_skips_a_socket_left_by_a_dead_server() {
         )
         .unwrap();
     assert_eq!(Path::new(&session.endpoint), server.endpoint.as_path());
+    drop(stream);
+    assert!(wait_for_endpoint_removal(&server.endpoint));
 }
 
 #[test]

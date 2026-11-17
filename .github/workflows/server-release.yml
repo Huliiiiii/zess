@@ -29,9 +29,24 @@ jobs:
       - name: Test Windows console mode restoration
         if: runner.os == 'Windows'
         run: cargo test --locked --release --target x86_64-pc-windows-msvc -p zess-platform --lib console::tests -- --nocapture
+      - name: Test Windows process lifecycle
+        if: runner.os == 'Windows'
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc -p zess-platform --lib process::tests -- --nocapture
       - name: Test Windows terminal lifecycle
         if: runner.os == 'Windows'
         run: cargo test --locked --release --target x86_64-pc-windows-msvc -p zess-terminal --lib terminal::tests::windows -- --nocapture
+      - name: Test Windows remote connection UI
+        if: runner.os == 'Windows'
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc -p zess-terminal --lib connection::tests -- --nocapture
+      - name: Test Windows SSH askpass
+        if: runner.os == 'Windows'
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc -p zess-remote --lib askpass::tests -- --nocapture
+      - name: Test Windows Git paths
+        if: runner.os == 'Windows'
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc -p zess-git --lib status_and_decorations_preserve_workspace_relative_git_paths
+      - name: Test Windows session discovery
+        if: runner.os == 'Windows'
+        run: cargo test --locked --release --target x86_64-pc-windows-msvc --test session_manager discovery_
       - name: Build Linux server
         if: runner.os == 'Linux'
         run: bash scripts/server-build.sh build '${{ matrix.target }}'

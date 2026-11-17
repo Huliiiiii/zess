@@ -650,6 +650,7 @@ fn reconnecting_recovers_unacknowledged_results_without_repeating_commands() {
             &SocketPath::from(server_socket),
             Session::new(workspace, &[], None)?,
             &IdentityPlatform,
+            SessionLifetime::Retained,
         )
     });
     let server = RunningServer {

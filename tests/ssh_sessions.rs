@@ -1,9 +1,9 @@
 #![cfg(target_os = "linux")]
 
 use std::{
-    io::{self, Read},
+    io::{self, BufReader, Read},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use zess_platform::SystemProcessRunner;
+use zess_protocol::{ClientMessage, ServerMessage, SessionId};
 use zess_remote::{
     Connector, ProxyOperation, ProxyRequest, SshConnection, SshConnector, SshTarget,
 };
@@ -121,6 +122,45 @@ fn conflicting_ssh_addresses_are_rejected_before_connecting() -> Result<()> {
 }
 
 #[test]
+fn stop_and_restart_reject_ambiguous_targets_before_connecting() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    for (command, args, expected) in [
+        ("stop", vec!["first", "second"], "select a session once"),
+        ("restart", vec!["first", "second"], "select a session once"),
+        (
+            "stop",
+            vec!["first", "--session", "second"],
+            "select a session once",
+        ),
+        (
+            "restart",
+            vec!["--session", "first", "--session", "second"],
+            "select a session once",
+        ),
+        (
+            "stop",
+            vec!["first", "--remote-workspace", "/other"],
+            "usage: zess session stop",
+        ),
+        (
+            "stop",
+            vec!["--workspace", "/one", "--remote-workspace", "/two"],
+            "conflicts",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_zess"))
+            .args(["session", command, "--ssh", "test.invalid", "--force"])
+            .args(args)
+            .env("PATH", directory.path())
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+    Ok(())
+}
+
+#[test]
 fn an_ssh_address_after_double_dash_remains_a_positional_argument() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let output = Command::new(env!("CARGO_BIN_EXE_zess"))
@@ -130,6 +170,142 @@ fn an_ssh_address_after_double_dash_remains_a_positional_argument() -> Result<()
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown session: ssh://pca:/path"));
     Ok(())
+}
+
+#[test]
+fn a_disconnected_proxy_leaves_the_workspace_available_for_a_fresh_attach() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let runtime = root.path().join("runtime");
+    let workspace = root.path().join("workspace");
+    let config = root.path().join("config");
+    for path in [&runtime, &workspace, &config] {
+        std::fs::create_dir(path)?;
+    }
+    let binary = Path::new(env!("CARGO_BIN_EXE_zess"));
+    let command = || {
+        let mut command = Command::new(binary);
+        command
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_CONFIG_HOME", &config);
+        command
+    };
+    let listed = || -> Result<Vec<Value>> {
+        let output = command().args(["session", "list", "--json"]).output()?;
+        ensure!(
+            output.status.success(),
+            "session list: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+
+    let open = || -> Result<_> {
+        let mut proxy = command()
+            .arg("remote-proxy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let mut input = proxy.stdin.take().unwrap();
+        let mut output = BufReader::new(proxy.stdout.take().unwrap());
+        zess_remote::write_request(
+            &mut input,
+            &ClientMessage::Hello {
+                build_id: zess_build::BUILD_ID.into(),
+            },
+        )?;
+        let hello: ServerMessage = zess_remote::read_request(&mut output)?;
+        ensure!(
+            matches!(hello, ServerMessage::Hello { build_id } if build_id == zess_build::BUILD_ID)
+        );
+        let operation = ProxyOperation::Attach {
+            workspace: workspace.to_str().unwrap().to_owned(),
+            files: Vec::new(),
+            config: None,
+        };
+        zess_remote::write_request(&mut input, &ProxyRequest::new(operation))?;
+        let zess_remote::ProxyHandshake::Ready {
+            session_id: Some(id),
+        } = zess_remote::read_request(&mut output)?
+        else {
+            anyhow::bail!("proxy did not open the workspace");
+        };
+        Ok((proxy, input, output, id))
+    };
+
+    let (mut proxy, input, _output, abandoned_id) = open()?;
+    assert!(listed()?.is_empty());
+    // SSH closes the proxy input when the client disconnects before editor Hello/Attach.
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = proxy.try_wait()? {
+            assert!(status.success());
+            break;
+        }
+        if Instant::now() >= deadline {
+            proxy.kill()?;
+            proxy.wait()?;
+            anyhow::bail!("proxy did not exit after disconnection");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(listed()?.is_empty());
+    assert!(std::fs::read_dir(runtime.join("zess/run"))?.all(|entry| {
+        entry.is_ok_and(|entry| entry.path().extension().is_none_or(|ext| ext != "sock"))
+    }));
+
+    let (mut proxy, mut input, mut output, id) = open()?;
+    let attached = (|| -> Result<()> {
+        ensure!(id != abandoned_id);
+        zess_remote::write_request(
+            &mut input,
+            &ClientMessage::Hello {
+                build_id: zess_build::BUILD_ID.into(),
+            },
+        )?;
+        let hello: ServerMessage = zess_remote::read_request(&mut output)?;
+        ensure!(
+            matches!(hello, ServerMessage::Hello { build_id } if build_id == zess_build::BUILD_ID)
+        );
+        zess_remote::write_request(
+            &mut input,
+            &ClientMessage::Attach {
+                expected_session: Some(SessionId(id.clone())),
+                client_id: "retry".into(),
+                width: 80,
+                height: 24,
+                files: Vec::new(),
+                context_epoch: None,
+            },
+        )?;
+        for message in ["pending", "attached", "snapshot"] {
+            let reply: ServerMessage = zess_remote::read_request(&mut output)?;
+            ensure!(matches!(
+                (message, reply),
+                ("pending", ServerMessage::AttachPending)
+                    | ("attached", ServerMessage::Attached { .. })
+                    | ("snapshot", ServerMessage::Snapshot { .. })
+            ));
+        }
+        zess_remote::write_request(&mut input, &ClientMessage::ConfirmAttach)?;
+        let reply: ServerMessage = zess_remote::read_request(&mut output)?;
+        ensure!(matches!(reply, ServerMessage::AttachConfirmed));
+        let entries = listed()?;
+        ensure!(entries.len() == 1 && entries[0]["session_id"] == id);
+        Ok(())
+    })();
+    drop(input);
+    drop(output);
+    if attached.is_ok() || !listed()?.is_empty() {
+        let stopped = command().args(["session", "stop", &id]).output()?;
+        ensure!(
+            stopped.status.success(),
+            "fixture stop: {}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+    }
+    proxy.wait()?;
+    attached
 }
 
 struct RemoteSession {

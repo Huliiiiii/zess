@@ -37,6 +37,27 @@ impl DaemonHandle {
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.0.try_wait()
     }
+
+    pub fn reap(mut self) -> io::Result<()> {
+        std::thread::Builder::new()
+            .name("zess-daemon-reaper".into())
+            .spawn(move || {
+                let _ = self.0.wait();
+            })
+            .map(drop)
+    }
+
+    pub fn terminate(&mut self) -> io::Result<()> {
+        if self.0.try_wait()?.is_none() {
+            if let Err(error) = self.0.kill()
+                && self.0.try_wait()?.is_none()
+            {
+                return Err(error);
+            }
+            self.0.wait()?;
+        }
+        Ok(())
+    }
 }
 
 pub trait DaemonControl: Send + Sync {

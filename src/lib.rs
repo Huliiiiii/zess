@@ -4,11 +4,11 @@ use anyhow::{Context, Result, bail};
 use zess_ipc::platform::NativeDaemonControl;
 use zess_ipc::{LocalIpc, NativeLocalIpc, SocketPath};
 use zess_platform::{
-    CancellationToken, FileSystem, NativeFileSystem, NativePlatform, NativeWatchBackend, Platform,
-    ProcessRunner, SystemProcessRunner, WatchBackend,
+    FileSystem, NativeFileSystem, NativePlatform, NativeWatchBackend, Platform, ProcessRunner,
+    SystemProcessRunner, WatchBackend,
 };
-use zess_remote::SshTarget;
-use zess_session::Session;
+use zess_remote::{SshTarget, StopTarget};
+use zess_session::{Session, SessionLifetime};
 use zess_text::runtime::{GrammarToolchain, NativeGrammarToolchain};
 
 mod remote;
@@ -26,33 +26,78 @@ struct RuntimeDependencies {
     script_compiler: Arc<dyn zess_script::ScriptCompiler>,
 }
 
+enum LocalSessionTarget {
+    Workspace {
+        workspace: PathBuf,
+        endpoint: SocketPath,
+        config: Option<PathBuf>,
+    },
+    Session {
+        endpoint: SocketPath,
+        id: zess_protocol::SessionId,
+    },
+}
+
 struct SessionConnectionFactory {
     manager: server::SessionManager,
-    endpoint: SocketPath,
-    session_id: zess_protocol::SessionId,
+    target: LocalSessionTarget,
 }
 
 impl zess_terminal::ConnectionFactory for SessionConnectionFactory {
-    fn connect(&mut self) -> Result<Box<dyn zess_terminal::ConnectionStream>> {
-        let stream = self.manager.connect(&self.endpoint)?;
-        let process = self.manager.watch(&stream)?;
-        Ok(Box::new(
-            zess_terminal::LocalConnection::new(stream, process)
-                .with_session_id(self.session_id.clone()),
-        ))
-    }
-
-    fn connect_with_cancellation(
+    fn connect(
         &mut self,
-        cancellation: &CancellationToken,
+        context: &zess_terminal::ConnectionContext,
     ) -> Result<Box<dyn zess_terminal::ConnectionStream>> {
-        self.manager = self.manager.clone().with_cancellation(cancellation.clone());
-        self.connect()
+        let manager = self
+            .manager
+            .clone()
+            .with_cancellation(context.cancellation().clone());
+        let (stream, session_id) = match &self.target {
+            LocalSessionTarget::Session { endpoint, id } => {
+                (manager.connect(endpoint)?, id.clone())
+            }
+            LocalSessionTarget::Workspace {
+                workspace,
+                endpoint,
+                config,
+            } => {
+                if let Some(id) = context.session_id() {
+                    let endpoint = manager.resolve(&id.0)?;
+                    (manager.connect(&endpoint)?, id.clone())
+                } else {
+                    let (stream, info) =
+                        manager.open_workspace(workspace, endpoint, config.as_deref(), &[])?;
+                    (stream, info.session_id)
+                }
+            }
+        };
+        let process = manager.watch(&stream)?;
+        Ok(Box::new(
+            zess_terminal::LocalConnection::new(stream, process).with_session_id(session_id),
+        ))
     }
 }
 
 pub fn run() -> Result<()> {
+    anyhow::ensure!(
+        cfg!(any(target_os = "linux", windows)),
+        "Zess supports Linux and Windows"
+    );
     let initial = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(endpoint) = std::env::var_os("ZESS_SSH_ASKPASS_ENDPOINT") {
+        let hint = std::env::var("SSH_ASKPASS_PROMPT").ok();
+        let answer = zess_remote::run_askpass(
+            &NativeLocalIpc,
+            &SocketPath::from(PathBuf::from(endpoint)),
+            initial.first().cloned().unwrap_or_default(),
+            hint.as_deref(),
+        )?;
+        if let Some(answer) = answer {
+            println!("{answer}");
+            return Ok(());
+        }
+        std::process::exit(1);
+    }
     let filesystem: Arc<dyn FileSystem> = Arc::new(NativeFileSystem);
     let host: Arc<dyn Platform> = Arc::new(NativePlatform);
     let ipc: Arc<dyn LocalIpc> = Arc::new(NativeLocalIpc);
@@ -128,6 +173,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
     let mut json = false;
     let mut session_id = None;
     let mut session_name = None;
+    let mut session_lifetime = SessionLifetime::Retained;
     let mut connect_by_id = false;
     let mut ssh_host = None;
     let mut ssh_port = None;
@@ -183,7 +229,14 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 return Ok(());
             }
             "--json" => json = true,
-            "--session" => session_id = Some(arguments.next().context("--session needs an ID")?),
+            "--session" => {
+                if session_id
+                    .replace(arguments.next().context("--session needs an ID")?)
+                    .is_some()
+                {
+                    bail!("select a session once, by ID or --session");
+                }
+            }
             "--ssh" => {
                 ssh_host = Some(
                     arguments
@@ -213,24 +266,35 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
             }
             "--ssh-jump" => ssh_jump = Some(arguments.next().context("--ssh-jump needs a host")?),
             "--remote-workspace" => {
-                remote_workspace = Some(
-                    arguments
-                        .next()
-                        .context("--remote-workspace needs a path")?,
-                )
+                let path = arguments
+                    .next()
+                    .context("--remote-workspace needs a path")?;
+                if remote_workspace.replace(path).is_some() {
+                    bail!("select a remote workspace once");
+                }
+            }
+            "--pending-attach" if mode == Mode::Server => {
+                session_lifetime = SessionLifetime::Pending;
             }
             "--session-name" if mode == Mode::Server => {
                 session_name = Some(arguments.next().context("--session-name needs a name")?)
             }
             "--workspace" => {
+                if workspace_given {
+                    bail!("select a workspace once");
+                }
                 workspace_given = true;
                 workspace =
                     PathBuf::from(arguments.next().context("--workspace needs a directory")?)
             }
             "--socket" => {
-                socket = Some(SocketPath::from(PathBuf::from(
-                    arguments.next().context("--socket needs a path")?,
-                )))
+                let path = arguments.next().context("--socket needs a path")?;
+                if socket
+                    .replace(SocketPath::from(PathBuf::from(path)))
+                    .is_some()
+                {
+                    bail!("select a socket once");
+                }
             }
             "--config" => {
                 config = Some(PathBuf::from(
@@ -293,6 +357,29 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
     if mode == Mode::Edit && session_id.is_some() {
         mode = Mode::Attach;
     }
+    let workspace_selected = || workspace_given || remote_workspace.is_some();
+    let management_id = if matches!(mode, Mode::Stop | Mode::Restart) {
+        if files.len() > 1 || (session_id.is_some() && !files.is_empty()) {
+            bail!("select a session once, by ID or --session");
+        }
+        let session_id = match files.first() {
+            Some(path) => Some(path.to_str().context("session ID must be UTF-8")?),
+            None => session_id.as_deref(),
+        };
+        if mode == Mode::Stop {
+            let selectors = usize::from(workspace_selected())
+                + usize::from(socket.is_some())
+                + usize::from(session_id.is_some());
+            if selectors > 1 || config.is_some() {
+                bail!("usage: zess session stop [ID | --workspace DIR | --socket PATH] [--force]");
+            }
+        } else if session_id.is_some() && socket.is_some() {
+            bail!("select a session once, by ID or --socket");
+        }
+        session_id
+    } else {
+        None
+    };
     if let Some(ssh_host) = ssh_host {
         if socket.is_some() || matches!(mode, Mode::Grammar(_)) {
             bail!("SSH sessions select their remote endpoint by workspace or --session");
@@ -318,7 +405,13 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 filesystem: filesystem.clone(),
             }),
         };
-        let remote_workspace_given = remote_workspace.is_some() || workspace_given;
+        let remote_workspace_given = workspace_selected();
+        if let Some(remote_workspace) = &remote_workspace
+            && workspace_given
+            && workspace.to_str() != Some(remote_workspace)
+        {
+            bail!("--workspace conflicts with --remote-workspace");
+        }
         let workspace = remote_workspace
             .or_else(|| workspace_given.then(|| workspace.to_string_lossy().into_owned()))
             .unwrap_or_else(|| ".".to_owned());
@@ -338,8 +431,11 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 Ok(())
             }
             Mode::Stop => {
-                let id = session_id.or_else(|| paths.first().cloned());
-                remote.stop(id, Some(workspace), force)?;
+                let target = match management_id {
+                    Some(id) => StopTarget::Session(id.to_owned()),
+                    None => StopTarget::Workspace(workspace),
+                };
+                remote.stop(target, force)?;
                 if json {
                     println!(
                         "{}",
@@ -364,13 +460,13 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 Ok(())
             }
             Mode::Restart => {
-                let id = session_id.or_else(|| paths.first().cloned());
-                let workspace = if id.is_some() && !remote_workspace_given {
+                let workspace = if management_id.is_some() && !remote_workspace_given {
                     None
                 } else {
                     Some(workspace)
                 };
-                let session = remote.restart(id, workspace, config, force)?;
+                let session =
+                    remote.restart(management_id.map(str::to_owned), workspace, config, force)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&session)?);
                 } else {
@@ -379,38 +475,17 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 Ok(())
             }
             Mode::Edit | Mode::Attach => {
-                if let Some(id) = session_id {
-                    let session = remote
-                        .sessions()?
-                        .into_iter()
-                        .find(|entry| {
-                            entry.id == id
-                                || entry.session_id.0 == id
-                                || entry.name.as_deref() == Some(id.as_str())
-                        })
-                        .with_context(|| format!("remote session {id} was not found"))?;
-                    zess_protocol::check_build_id(&session.build_id)?;
-                    let mut factory = remote.session_factory(session.session_id.0)?;
-                    zess_terminal::run_connection_with_platform(&mut factory, &files, host.as_ref())
+                let selection = if let Some(id) = session_id {
+                    remote::RemoteSelection::Session(id)
                 } else {
-                    let sessions = remote.workspace_sessions(workspace.clone())?;
-                    if mode == Mode::Attach || sessions.len() > 1 {
-                        let selected = match sessions.as_slice() {
-                            [] => bail!("no session exists for the remote workspace"),
-                            [session] => session,
-                            _ => select_session(&sessions)?,
-                        };
-                        zess_protocol::check_build_id(&selected.build_id)?;
-                        let mut factory = remote.session_factory(selected.session_id.0.clone())?;
-                        return zess_terminal::run_connection_with_platform(
-                            &mut factory,
-                            &files,
-                            host.as_ref(),
-                        );
+                    remote::RemoteSelection::Workspace {
+                        workspace,
+                        config,
+                        attach_only: mode == Mode::Attach,
                     }
-                    let mut factory = remote.factory(workspace, Vec::new(), config)?;
-                    zess_terminal::run_connection_with_platform(&mut factory, &files, host.as_ref())
-                }
+                };
+                let factory = remote.connection_factory(selection, ipc, host.current_exe()?);
+                zess_terminal::run_connection_with_platform(factory, &files, host.as_ref())
             }
             Mode::Grammar(_) => unreachable!(),
         };
@@ -423,14 +498,6 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         || remote_workspace.is_some()
     {
         bail!("SSH connection options require --ssh HOST");
-    }
-    if matches!(mode, Mode::Stop | Mode::Restart)
-        && let Some(id) = session_id.take()
-    {
-        if !files.is_empty() {
-            bail!("select a session once, by ID or --session");
-        }
-        files.push(PathBuf::from(id));
     }
     if let Mode::Grammar(action) = mode {
         if workspace_given || socket.is_some() || config.is_some() {
@@ -469,15 +536,8 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         return Ok(());
     }
     if mode == Mode::Stop {
-        if files.len() > 1
-            || config.is_some()
-            || (!files.is_empty() && (socket.is_some() || workspace_given))
-            || (socket.is_some() && workspace_given)
-        {
-            bail!("usage: zess session stop [ID] [--workspace DIR | --socket PATH] [--force]");
-        }
-        let socket = if let Some(id) = files.first() {
-            manager.resolve(id.to_str().context("server ID must be hexadecimal")?)?
+        let socket = if let Some(id) = management_id {
+            manager.resolve(id)?
         } else if let Some(socket) = socket {
             socket
         } else {
@@ -501,12 +561,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         return Ok(());
     }
     if mode == Mode::Restart {
-        if files.len() > 1 || (!files.is_empty() && socket.is_some()) {
-            bail!(
-                "usage: zess session restart [ID | --socket PATH] [--workspace DIR] [--config FILE] [--force]"
-            );
-        }
-        let explicit_target = !files.is_empty() || socket.is_some();
+        let explicit_target = management_id.is_some() || socket.is_some();
         let workspace = if workspace_given || !explicit_target {
             Some(
                 filesystem
@@ -516,8 +571,8 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         } else {
             None
         };
-        let socket = if let Some(id) = files.first() {
-            manager.resolve(id.to_str().context("server ID must be hexadecimal")?)?
+        let socket = if let Some(id) = management_id {
+            manager.resolve(id)?
         } else if let Some(socket) = socket {
             socket
         } else {
@@ -538,7 +593,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
                 .or_else(|| default_config(filesystem.as_ref(), host.as_ref()))
                 .as_deref(),
             force,
-            files.first().and_then(|id| id.to_str()),
+            management_id,
         )?;
         if json {
             println!("{}", serde_json::to_string_pretty(&session)?);
@@ -607,53 +662,61 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         if let Some(name) = session_name {
             session.set_name(name);
         }
-        return zess_session::serve_with_platform(ipc.as_ref(), &socket, session, host.as_ref());
+        return zess_session::serve_with_platform(
+            ipc.as_ref(),
+            &socket,
+            session,
+            host.as_ref(),
+            session_lifetime,
+        );
     }
-    let (socket, session_id) = if matches!(mode, Mode::Edit | Mode::New) {
-        if mode == Mode::New {
-            if files.len() > 1 {
-                bail!("usage: zess session new [NAME]");
-            }
-            let name = files
-                .first()
-                .map(|path| path.to_str().context("session name must be UTF-8"))
-                .transpose()?;
-            let session = manager.create(&workspace, config.as_deref(), &[], name)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&session)?);
-            } else {
-                print_sessions(&[session]);
-            }
-            return Ok(());
+    if mode == Mode::New {
+        if files.len() > 1 {
+            bail!("usage: zess session new [NAME]");
         }
-        let sessions = manager.workspace_sessions(&workspace)?;
-        let session = if sessions.len() > 1 {
-            select_session(&sessions)?.clone()
+        let name = files
+            .first()
+            .map(|path| path.to_str().context("session name must be UTF-8"))
+            .transpose()?;
+        let session = manager.create(&workspace, config.as_deref(), &[], name)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&session)?);
         } else {
-            manager.ensure(&workspace, &socket, config.as_deref(), &files)?
-        };
-        (
-            SocketPath::from(PathBuf::from(session.endpoint)),
-            session.session_id,
-        )
+            print_sessions(&[session]);
+        }
+        return Ok(());
+    }
+
+    let target = if let Some(id) = selected_session {
+        LocalSessionTarget::Session {
+            endpoint: socket,
+            id,
+        }
+    } else if mode == Mode::Attach && socket_given {
+        let id = manager.inspect(&socket)?.session_id;
+        LocalSessionTarget::Session {
+            endpoint: socket,
+            id,
+        }
     } else {
-        if selected_session.is_none() && !socket_given {
-            let sessions = manager.workspace_sessions(&workspace)?;
+        let sessions = manager.workspace_sessions(&workspace)?;
+        if mode == Mode::Edit && sessions.is_empty() {
+            LocalSessionTarget::Workspace {
+                workspace: workspace.clone(),
+                endpoint: socket,
+                config,
+            }
+        } else {
             let session = match sessions.as_slice() {
                 [] => bail!("no session exists for {}", workspace.display()),
                 [session] => session,
                 _ => select_session(&sessions)?,
             };
-            (
-                SocketPath::from(PathBuf::from(&session.endpoint)),
-                session.session_id.clone(),
-            )
-        } else {
-            let session_id = match selected_session {
-                Some(id) => id,
-                None => manager.inspect(&socket)?.session_id,
-            };
-            (socket, session_id)
+            zess_protocol::check_build_id(&session.build_id)?;
+            LocalSessionTarget::Session {
+                endpoint: SocketPath::from(PathBuf::from(&session.endpoint)),
+                id: session.session_id.clone(),
+            }
         }
     };
     let files = files
@@ -667,11 +730,7 @@ fn run_with(initial: Vec<String>, dependencies: RuntimeDependencies) -> Result<(
         })
         .collect::<Vec<_>>();
     zess_terminal::run_connection_with_platform(
-        &mut SessionConnectionFactory {
-            manager,
-            endpoint: socket,
-            session_id,
-        },
+        SessionConnectionFactory { manager, target },
         &files,
         host.as_ref(),
     )

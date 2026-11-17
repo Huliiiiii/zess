@@ -359,6 +359,10 @@ pub enum CommandOutcome {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    ClaimPendingSession {
+        pid: u32,
+    },
+    ConfirmAttach,
     Hello {
         build_id: String,
     },
@@ -431,6 +435,8 @@ pub enum ClientMessage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    AttachPending,
+    AttachConfirmed,
     Hello {
         build_id: String,
     },
@@ -444,6 +450,8 @@ pub enum ServerMessage {
         workspace: String,
         attached: bool,
         modified: bool,
+        #[serde(default)]
+        pending: bool,
     },
     Attached {
         server_instance: ServerInstanceId,

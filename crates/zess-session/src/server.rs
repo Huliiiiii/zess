@@ -35,6 +35,9 @@ enum ConnectionRole {
     Attached {
         client: String,
     },
+    ConfirmingAttach {
+        client: String,
+    },
     Closing {
         client: Option<String>,
         deadline: Instant,
@@ -44,7 +47,7 @@ enum ConnectionRole {
 impl ConnectionRole {
     fn client(&self) -> Option<&String> {
         match self {
-            Self::Attached { client } => Some(client),
+            Self::Attached { client } | Self::ConfirmingAttach { client } => Some(client),
             Self::Closing { client, .. } => client.as_ref(),
             Self::Unidentified { .. } | Self::AwaitHello { .. } => None,
         }
@@ -72,6 +75,7 @@ impl ServerState {
 }
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const FIRST_ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct Connection {
     stream: Stream,
@@ -79,6 +83,7 @@ struct Connection {
     output: VecDeque<PendingMessage>,
     written: usize,
     role: ConnectionRole,
+    claimed_pending_session: bool,
     eof: bool,
     exit_disposition: Option<zess_protocol::ClientExitDisposition>,
 }
@@ -94,6 +99,7 @@ impl Connection {
             role: ConnectionRole::AwaitHello {
                 accepted: Instant::now(),
             },
+            claimed_pending_session: false,
             eof: false,
             exit_disposition: None,
         })
@@ -409,20 +415,44 @@ impl OperationTable {
     }
 }
 
-/// Serve a single active terminal while retaining all session state on detach.
-pub fn serve(ipc: &dyn LocalIpc, socket: &SocketPath, session: Session) -> Result<()> {
-    serve_with_platform(ipc, socket, session, &NativePlatform)
+pub enum SessionLifetime {
+    Retained,
+    Pending,
 }
 
-/// Serves with caller-supplied IPC and host identity facts.
+struct PendingSession {
+    deadline: Instant,
+    claimed: bool,
+}
+
+/// Serve a single active terminal while retaining all session state on detach.
+pub fn serve(ipc: &dyn LocalIpc, socket: &SocketPath, session: Session) -> Result<()> {
+    serve_with_platform(
+        ipc,
+        socket,
+        session,
+        &NativePlatform,
+        SessionLifetime::Retained,
+    )
+}
+
+/// Serves with caller-supplied IPC, host identity facts, and initial session lifetime.
 pub fn serve_with_platform(
     ipc: &dyn LocalIpc,
     socket: &SocketPath,
     mut session: Session,
     platform: &dyn Platform,
+    lifetime: SessionLifetime,
 ) -> Result<()> {
     let listener = ipc.bind(socket)?;
     listener.set_nonblocking(true)?;
+    let mut pending = match lifetime {
+        SessionLifetime::Retained => None,
+        SessionLifetime::Pending => Some(PendingSession {
+            deadline: Instant::now() + FIRST_ATTACH_TIMEOUT,
+            claimed: false,
+        }),
+    };
     let mut connections = Vec::<Connection>::new();
     let mut active = None::<String>;
     let mut acknowledged = HashMap::<String, u64>::new();
@@ -453,6 +483,12 @@ pub fn serve_with_platform(
         if matches!(state, ServerState::Stopped) {
             break;
         }
+        if pending
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.deadline)
+        {
+            break;
+        }
         loop {
             match listener.accept() {
                 Ok(stream) => connections.push(Connection::new(stream)?),
@@ -464,7 +500,10 @@ pub fn serve_with_platform(
         let mut index = 0;
         while index < connections.len() {
             let connection = &mut connections[index];
-            let messages = if matches!(connection.role, ConnectionRole::Closing { .. }) {
+            let messages = if matches!(
+                connection.role,
+                ConnectionRole::Closing { .. } | ConnectionRole::ConfirmingAttach { .. }
+            ) {
                 Ok(Vec::new())
             } else {
                 connection.receive()
@@ -473,7 +512,12 @@ pub fn serve_with_platform(
             if let Ok(messages) = messages {
                 for message in messages {
                     if matches!(connection.role, ConnectionRole::AwaitHello { .. })
-                        && !matches!(message, ClientMessage::Hello { .. } | ClientMessage::Status)
+                        && !matches!(
+                            message,
+                            ClientMessage::Hello { .. }
+                                | ClientMessage::Status
+                                | ClientMessage::ClaimPendingSession { .. }
+                        )
                     {
                         connection.send(&ServerMessage::Rejected {
                             reason:
@@ -482,6 +526,25 @@ pub fn serve_with_platform(
                         })?;
                         connection.close_after_flush();
                         break;
+                    }
+                    if pending.is_some() {
+                        let allowed = match &message {
+                            ClientMessage::Hello { .. }
+                            | ClientMessage::Status
+                            | ClientMessage::ClaimPendingSession { .. }
+                            | ClientMessage::Detach => true,
+                            ClientMessage::Attach { .. }
+                            | ClientMessage::Resync { .. }
+                            | ClientMessage::ConfirmAttach => connection.claimed_pending_session,
+                            _ => false,
+                        };
+                        if !allowed {
+                            connection.send(&ServerMessage::Rejected {
+                                reason: "session is awaiting its first terminal attachment".into(),
+                            })?;
+                            connection.close_after_flush();
+                            break;
+                        }
                     }
                     match message {
                         ClientMessage::Hello { build_id }
@@ -498,13 +561,35 @@ pub fn serve_with_platform(
                                 accepted: Instant::now(),
                             };
                         }
-                        ClientMessage::Status
+                        message @ (ClientMessage::Status
+                        | ClientMessage::ClaimPendingSession { .. })
                             if matches!(
                                 connection.role,
                                 ConnectionRole::Unidentified { .. }
                                     | ConnectionRole::AwaitHello { .. }
                             ) =>
                         {
+                            let claim = if let ClientMessage::ClaimPendingSession { pid } = message
+                            {
+                                if let Some(pending) = pending.as_mut()
+                                    && !pending.claimed
+                                    && pid == process_id
+                                    && matches!(connection.role, ConnectionRole::AwaitHello { .. })
+                                {
+                                    pending.claimed = true;
+                                    connection.claimed_pending_session = true;
+                                    true
+                                } else {
+                                    connection.send(&ServerMessage::Rejected {
+                                        reason: "session is unavailable for first attachment"
+                                            .into(),
+                                    })?;
+                                    connection.close_after_flush();
+                                    break;
+                                }
+                            } else {
+                                false
+                            };
                             connection.send(&ServerMessage::Status {
                                 build_id: zess_build::BUILD_ID.to_owned(),
                                 session_id: published.session_id.clone(),
@@ -515,9 +600,12 @@ pub fn serve_with_platform(
                                 workspace: session.workspace().to_string_lossy().into_owned(),
                                 attached: active.is_some(),
                                 modified: session.modified(),
+                                pending: pending.is_some(),
                             })?;
-                            connection.close_after_flush();
-                            break;
+                            if !claim {
+                                connection.close_after_flush();
+                                break;
+                            }
                         }
                         ClientMessage::Stop { force }
                             if matches!(connection.role, ConnectionRole::Unidentified { .. }) =>
@@ -580,6 +668,9 @@ pub fn serve_with_platform(
                                 if !acknowledged.contains_key(&client_id) {
                                     session.open_paths(&files);
                                 }
+                                if pending.is_some() {
+                                    connection.send(&ServerMessage::AttachPending)?;
+                                }
                                 let client_id_for_resend = client_id.clone();
                                 connection.send(&ServerMessage::Attached {
                                     server_instance: server_instance.clone(),
@@ -596,11 +687,27 @@ pub fn serve_with_platform(
                                     &server_instance,
                                     connection,
                                 )?;
-                                if let Some((id, primary)) = session.clipboard_request() {
+                                if pending.is_none()
+                                    && let Some((id, primary)) = session.clipboard_request()
+                                {
                                     connection
                                         .send(&ServerMessage::ClipboardRead { id, primary })?;
                                 }
                             }
+                        }
+                        ClientMessage::ConfirmAttach
+                            if connection.claimed_pending_session
+                                && matches!(connection.role, ConnectionRole::Attached { .. })
+                                && !connection.eof
+                                && pending
+                                    .as_ref()
+                                    .is_some_and(|pending| Instant::now() < pending.deadline) =>
+                        {
+                            connection.send(&ServerMessage::AttachConfirmed)?;
+                            connection.role = ConnectionRole::ConfirmingAttach {
+                                client: connection.role.client().unwrap().clone(),
+                            };
+                            break;
                         }
                         ClientMessage::Input {
                             sequence,
@@ -766,6 +873,10 @@ pub fn serve_with_platform(
                                 connection.send(&ServerMessage::Rejected {
                                     reason: "session identity changed".into(),
                                 })?;
+                                if pending.is_some() {
+                                    connection.close_after_flush();
+                                    break;
+                                }
                             } else {
                                 published.refresh(&mut session);
                                 connection.send(&published.snapshot())?;
@@ -857,7 +968,9 @@ pub fn serve_with_platform(
                             break;
                         }
                     }
-                    if matches!(connection.role, ConnectionRole::Attached { .. }) {
+                    if pending.is_none()
+                        && matches!(connection.role, ConnectionRole::Attached { .. })
+                    {
                         let copied = session.flush_clipboard_writes(|text| {
                             connection.send(&ServerMessage::ClipboardWrite { text })
                         });
@@ -880,6 +993,19 @@ pub fn serve_with_platform(
             if connection.eof {
                 disconnected = true;
             }
+            if !disconnected
+                && connection.output.is_empty()
+                && let ConnectionRole::ConfirmingAttach { client } = &connection.role
+            {
+                pending = None;
+                connection.claimed_pending_session = false;
+                connection.role = ConnectionRole::Attached {
+                    client: client.clone(),
+                };
+                if let Some((id, primary)) = session.clipboard_request() {
+                    connection.send(&ServerMessage::ClipboardRead { id, primary })?;
+                }
+            }
             if matches!(connection.role, ConnectionRole::Closing { .. })
                 && connection.output.is_empty()
             {
@@ -898,6 +1024,9 @@ pub fn serve_with_platform(
                 _ => {}
             }
             if disconnected {
+                if pending.is_some() && connection.claimed_pending_session {
+                    return Ok(());
+                }
                 let stopping = connection.exit_disposition
                     == Some(zess_protocol::ClientExitDisposition::Stopping);
                 connections
@@ -928,6 +1057,10 @@ pub fn serve_with_platform(
             state = ServerState::Draining {
                 deadline: Instant::now() + DRAIN_TIMEOUT,
             };
+            continue;
+        }
+        if pending.is_some() {
+            thread::sleep(Duration::from_millis(8));
             continue;
         }
         let changed = session.tick();

@@ -18,6 +18,12 @@ fn listener() -> (SocketPath, Listener) {
     (socket, listener)
 }
 
+fn local_connection(socket: &SocketPath) -> Box<dyn ConnectionStream> {
+    let stream = Stream::connect(socket).unwrap();
+    let process = NativeDaemonControl.watch(&stream).unwrap();
+    Box::new(LocalConnection::new(stream, process))
+}
+
 #[test]
 fn a_frame_is_presented_after_all_rows_are_written() {
     let frame = Frame {
@@ -77,6 +83,7 @@ fn reconnect_replays_keys_and_discards_mouse_coordinates_in_sequence() {
             writer.try_clone().unwrap(),
             NativeDaemonControl.watch(&writer).unwrap(),
         )),
+        expected_session: None,
         input: framing::Decoder::default(),
         output: VecDeque::new(),
         written: 0,
@@ -118,16 +125,8 @@ fn reconnect_replays_keys_and_discards_mouse_coordinates_in_sequence() {
 #[test]
 fn dropping_a_connection_closes_the_socket_without_waiting_for_the_peer() {
     let (socket, listener) = listener();
-    let connection = Connection::connect(
-        &mut LocalConnectionFactory(socket.clone()),
-        "close",
-        &[],
-        None,
-        None,
-        80,
-        24,
-    )
-    .unwrap();
+    let connection =
+        Connection::connect(local_connection(&socket), "close", &[], None, None, 80, 24).unwrap();
     let mut peer = listener.accept().unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
     drop(connection);
@@ -164,7 +163,7 @@ fn reconnecting_to_the_same_server_preserves_the_deduplication_sequence() {
 fn a_peer_that_stops_reading_does_not_block_terminal_progress() {
     let (socket, listener) = listener();
     let mut connection = Connection::connect(
-        &mut LocalConnectionFactory(socket.clone()),
+        local_connection(&socket),
         "stalled",
         &[],
         None,
@@ -348,7 +347,7 @@ fn a_clipboard_response_completed_while_disconnected_is_reused_after_reconnect()
     }
     let (socket, listener) = listener();
     let mut connection = Connection::connect(
-        &mut LocalConnectionFactory(socket.clone()),
+        local_connection(&socket),
         "clipboard-response",
         &[],
         None,
@@ -400,7 +399,7 @@ fn reconnecting_to_another_server_discards_the_previous_clipboard_response() {
 fn a_limit_sized_message_and_the_next_message_can_share_a_socket_read() {
     let (socket, listener) = listener();
     let mut connection = Connection::connect(
-        &mut LocalConnectionFactory(socket.clone()),
+        local_connection(&socket),
         "frame-limit",
         &[],
         None,
