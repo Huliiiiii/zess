@@ -10,19 +10,35 @@ fn shell(script: &str) -> ProcessSpec {
 #[cfg(unix)]
 #[test]
 fn process_input_and_both_output_streams_can_exceed_pipe_capacity() {
+    struct Progress(std::sync::Mutex<Vec<(u64, u64)>>);
+    impl InputProgress for Progress {
+        fn written(&self, completed: u64, total: u64) {
+            self.0.lock().unwrap().push((completed, total));
+        }
+    }
+
     let spec = shell("head -c 262144 /dev/zero; head -c 262144 /dev/zero >&2; cat");
     let cancellation = JobCancellation {
         cancelled: CancellationToken::default(),
         deadline: Instant::now() + Duration::from_secs(5),
     };
     let input = vec![b'x'; 262144];
+    let progress = Progress(std::sync::Mutex::new(Vec::new()));
     let output = SystemProcessRunner
-        .output(&spec, Some(&input), &cancellation)
+        .output_with_progress(&spec, Some(&input), &cancellation, &progress)
         .unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout[..262144], vec![0; 262144]);
     assert_eq!(output.stdout[262144..], input);
     assert_eq!(output.stderr, vec![0; 262144]);
+    let updates = progress.0.lock().unwrap();
+    assert_eq!(updates.first(), Some(&(0, input.len() as u64)));
+    assert_eq!(
+        updates.last(),
+        Some(&(input.len() as u64, input.len() as u64))
+    );
+    assert!(updates.len() > 2);
+    assert!(updates.windows(2).all(|pair| pair[0].0 < pair[1].0));
 }
 
 #[cfg(unix)]
