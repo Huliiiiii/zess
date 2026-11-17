@@ -11,15 +11,25 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::{ServerId, windows::security};
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SocketPath(PathBuf);
+pub struct SocketPath(PathBuf, Namespace);
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Namespace {
+    Session,
+    Private,
+}
 
 impl From<PathBuf> for SocketPath {
     fn from(path: PathBuf) -> Self {
-        Self(path)
+        Self(path, Namespace::Session)
     }
 }
 
 impl SocketPath {
+    pub fn private(path: PathBuf) -> Self {
+        Self(path, Namespace::Private)
+    }
+
     pub fn server_id(&self) -> Option<ServerId> {
         self.0.file_stem()?.to_str()?.parse().ok()
     }
@@ -57,7 +67,7 @@ impl SocketPath {
     }
 
     pub fn by_id(id: ServerId) -> Self {
-        Self(PathBuf::from(format!("{id}.pipe")))
+        Self(PathBuf::from(format!("{id}.pipe")), Namespace::Session)
     }
 
     pub fn discover() -> Result<Vec<Self>> {
@@ -74,8 +84,13 @@ impl SocketPath {
     }
 
     pub(crate) fn native_name(&self) -> Result<Vec<u16>> {
+        let namespace = match self.1 {
+            Namespace::Session => "zess",
+            Namespace::Private => "zess-private",
+        };
         Ok(format!(
-            r"\\.\pipe\zess-{}-{}",
+            r"\\.\pipe\{}-{}-{}",
+            namespace,
             security::current_user_sid()?,
             self.id()
         )
