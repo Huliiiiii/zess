@@ -3,8 +3,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
+    thread,
     time::Duration,
 };
 
@@ -12,6 +14,8 @@ use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zess_platform::{Cancellation, FileSystem, Platform};
+
+use crate::{ProgressReporter, RemoteProgress, RemoteStage};
 
 #[cfg(test)]
 mod tests;
@@ -48,7 +52,12 @@ pub struct ServerArtifact {
 }
 
 pub trait ServerArtifacts: Send + Sync {
-    fn get(&self, target: ServerTarget, cancellation: &dyn Cancellation) -> Result<ServerArtifact>;
+    fn get(
+        &self,
+        target: ServerTarget,
+        cancellation: &dyn Cancellation,
+        progress: Option<&dyn ProgressReporter>,
+    ) -> Result<ServerArtifact>;
 }
 
 pub struct GithubReleaseArtifacts {
@@ -93,30 +102,97 @@ impl GithubReleaseArtifacts {
         }
     }
 
-    fn download(&self, name: &str, cancellation: &dyn Cancellation) -> Result<Vec<u8>> {
+    fn download(
+        &self,
+        name: &str,
+        cancellation: &dyn Cancellation,
+        progress: Option<&dyn ProgressReporter>,
+    ) -> Result<Vec<u8>> {
         cancellation.check()?;
         let url = format!(
             "https://github.com/{}/releases/download/build-{}/{name}",
             self.repository,
             zess_build::BUILD_ID
         );
-        let response = self.agent.get(&url).call();
-        cancellation.check()?;
-        let response = response.with_context(|| format!("could not download {url}"))?;
-        let mut reader = response.into_body().into_reader();
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 64 * 1024];
+        let agent = self.agent.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let (sender, receiver) = mpsc::sync_channel(16);
+        thread::Builder::new()
+            .name("zess-release-download".into())
+            .spawn(move || {
+                let result = (|| -> Result<(Vec<u8>, Option<u64>)> {
+                    let response = agent
+                        .get(&url)
+                        .call()
+                        .with_context(|| format!("could not download {url}"))?;
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        return Ok((Vec::new(), None));
+                    }
+                    let total = response
+                        .headers()
+                        .get("content-length")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok());
+                    let mut reader = response.into_body().into_reader();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 64 * 1024];
+                    loop {
+                        if worker_cancelled.load(Ordering::Acquire) {
+                            return Ok((Vec::new(), None));
+                        }
+                        let count = reader
+                            .read(&mut buffer)
+                            .with_context(|| format!("could not read {url}"))?;
+                        if worker_cancelled.load(Ordering::Acquire) {
+                            return Ok((Vec::new(), None));
+                        }
+                        if count == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&buffer[..count]);
+                        let _ = sender.try_send(DownloadEvent::Progress {
+                            completed: bytes.len() as u64,
+                            total,
+                        });
+                    }
+                    Ok((bytes, total))
+                })();
+                let _ = sender.send(DownloadEvent::Finished(result));
+            })?;
+        let guard = DownloadCancellation(cancelled);
         loop {
             cancellation.check()?;
-            let count = reader.read(&mut buffer);
-            cancellation.check()?;
-            let count = count.with_context(|| format!("could not read {url}"))?;
-            if count == 0 {
-                break;
+            match receiver.recv_timeout(Duration::from_millis(20)) {
+                Ok(DownloadEvent::Progress { completed, total }) => {
+                    cancellation.check()?;
+                    if let Some(progress) = progress {
+                        progress.report(RemoteProgress::Transfer {
+                            stage: RemoteStage::Downloading,
+                            completed,
+                            total,
+                        });
+                    }
+                }
+                Ok(DownloadEvent::Finished(result)) => {
+                    cancellation.check()?;
+                    let (bytes, total) = result?;
+                    if let Some(progress) = progress {
+                        progress.report(RemoteProgress::Transfer {
+                            stage: RemoteStage::Downloading,
+                            completed: bytes.len() as u64,
+                            total,
+                        });
+                    }
+                    drop(guard);
+                    return Ok(bytes);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("release download worker stopped")
+                }
             }
-            bytes.extend_from_slice(&buffer[..count]);
         }
-        Ok(bytes)
     }
 
     fn publish(&self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -136,6 +212,19 @@ impl GithubReleaseArtifacts {
         }
         result?;
         Ok(())
+    }
+}
+
+enum DownloadEvent {
+    Progress { completed: u64, total: Option<u64> },
+    Finished(Result<(Vec<u8>, Option<u64>)>),
+}
+
+struct DownloadCancellation(Arc<AtomicBool>);
+
+impl Drop for DownloadCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -177,7 +266,12 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 impl ServerArtifacts for GithubReleaseArtifacts {
-    fn get(&self, target: ServerTarget, cancellation: &dyn Cancellation) -> Result<ServerArtifact> {
+    fn get(
+        &self,
+        target: ServerTarget,
+        cancellation: &dyn Cancellation,
+        progress: Option<&dyn ProgressReporter>,
+    ) -> Result<ServerArtifact> {
         cancellation.check()?;
         let directory = self
             .platform
@@ -193,6 +287,7 @@ impl ServerArtifacts for GithubReleaseArtifacts {
             && let Ok(bytes) = self.file_system.read(&path)
             && digest(&bytes) == sha256
         {
+            cancellation.check()?;
             return Ok(ServerArtifact {
                 target,
                 path,
@@ -200,16 +295,21 @@ impl ServerArtifacts for GithubReleaseArtifacts {
             });
         }
 
-        let manifest = self.download("manifest.json", cancellation)?;
+        if let Some(progress) = progress {
+            progress.report(RemoteProgress::Stage(RemoteStage::Downloading));
+        }
+        let manifest = self.download("manifest.json", cancellation, None)?;
         let sha256 = artifact_hash(&manifest, target)?;
-        let bytes = self.download(&target.asset_name(), cancellation)?;
+        let bytes = self.download(&target.asset_name(), cancellation, progress)?;
         ensure!(
             digest(&bytes) == sha256,
             "downloaded server SHA-256 does not match the release manifest"
         );
         cancellation.check()?;
         self.file_system.create_dir_all(&directory)?;
+        cancellation.check()?;
         self.publish(&path, &bytes)?;
+        cancellation.check()?;
         self.publish(&manifest_path, &manifest)?;
         Ok(ServerArtifact {
             target,

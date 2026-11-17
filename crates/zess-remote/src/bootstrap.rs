@@ -1,11 +1,16 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use sha2::{Digest, Sha256};
-use zess_platform::{Cancellation, FileSystem, ProcessRunner};
+use zess_platform::{Cancellation, FileSystem, InputProgress, ProcessRunner};
 
-use crate::{ServerArtifacts, ServerTarget, SshTarget};
+use crate::{
+    ProgressReporter, RemoteProgress, RemoteStage, ServerArtifacts, ServerTarget, SshTarget,
+};
 
 pub trait ServerBootstrap: Send + Sync {
     /// Returns a complete SSH command that starts the prepared proxy.
@@ -20,6 +25,7 @@ pub struct SshBootstrap {
 impl ServerBootstrap for SshBootstrap {
     fn prepare(&self, target: &SshTarget, runner: &dyn ProcessRunner) -> Result<String> {
         let cancellation = super::ssh::Deadline::new(target);
+        target.report(RemoteProgress::Stage(RemoteStage::DetectingPlatform));
         let posix = execute(
             runner,
             target,
@@ -53,11 +59,14 @@ impl ServerBootstrap for SshBootstrap {
             }
         };
         let remote = RemotePlatform::new(platform);
+        target.report(RemoteProgress::Stage(RemoteStage::CheckingCache));
         if execute(runner, target, &remote.check(), None, &cancellation).is_ok() {
             return Ok(remote.proxy());
         }
         cancellation.check()?;
-        let artifact = self.artifacts.get(platform, &cancellation)?;
+        let artifact = self
+            .artifacts
+            .get(platform, &cancellation, target.progress.as_deref())?;
         ensure!(
             artifact.target == platform,
             "server artifact targets the wrong platform"
@@ -74,14 +83,23 @@ impl ServerBootstrap for SshBootstrap {
             hash == artifact.sha256.to_ascii_lowercase(),
             "local server SHA-256 mismatch"
         );
-        execute(
+        target.report(RemoteProgress::Stage(RemoteStage::Uploading));
+        let upload = UploadProgress {
+            reporter: target.progress.as_deref(),
+            complete: AtomicBool::new(false),
+        };
+        execute_upload(
             runner,
             target,
             &remote.install(&hash),
-            Some(&bytes),
+            &bytes,
             &cancellation,
+            &upload,
         )
         .context("install remote server")?;
+        if !upload.complete.load(Ordering::Acquire) {
+            target.report(RemoteProgress::Stage(RemoteStage::Installing));
+        }
         execute(runner, target, &remote.check(), None, &cancellation)
             .context("verify remote server cache")?;
         Ok(remote.proxy())
@@ -102,6 +120,49 @@ fn execute(
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(output.stdout)
+}
+
+struct UploadProgress<'a> {
+    reporter: Option<&'a dyn ProgressReporter>,
+    complete: AtomicBool,
+}
+
+impl InputProgress for UploadProgress<'_> {
+    fn written(&self, completed: u64, total: u64) {
+        if let Some(reporter) = self.reporter {
+            reporter.report(RemoteProgress::Transfer {
+                stage: RemoteStage::Uploading,
+                completed,
+                total: Some(total),
+            });
+            if completed == total {
+                self.complete.store(true, Ordering::Release);
+                reporter.report(RemoteProgress::Stage(RemoteStage::Installing));
+            }
+        }
+    }
+}
+
+fn execute_upload(
+    runner: &dyn ProcessRunner,
+    target: &SshTarget,
+    command: &str,
+    input: &[u8],
+    cancellation: &dyn Cancellation,
+    progress: &UploadProgress<'_>,
+) -> Result<()> {
+    let output = runner.output_with_progress(
+        &target.command(command)?,
+        Some(input),
+        cancellation,
+        progress,
+    )?;
+    ensure!(
+        output.status.success(),
+        "SSH command failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 struct RemotePlatform(ServerTarget);

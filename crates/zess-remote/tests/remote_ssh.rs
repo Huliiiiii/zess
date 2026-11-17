@@ -365,6 +365,7 @@ impl zess_remote::ServerArtifacts for FixtureArtifacts {
         &self,
         target: zess_remote::ServerTarget,
         cancellation: &dyn Cancellation,
+        _: Option<&dyn zess_remote::ProgressReporter>,
     ) -> Result<zess_remote::ServerArtifact> {
         cancellation.check()?;
         self.requests
@@ -404,8 +405,17 @@ fn standard_tools(directory: &std::path::Path) -> Result<PathBuf> {
 #[test]
 fn ssh_deploys_and_reuses_a_verified_server() -> Result<()> {
     use sha2::{Digest, Sha256};
-    use zess_remote::ServerBootstrap;
+    use zess_remote::{ProgressReporter, RemoteProgress, RemoteStage, ServerBootstrap};
+    struct Reporter(std::sync::Mutex<Vec<RemoteProgress>>);
+    impl ProgressReporter for Reporter {
+        fn report(&self, event: RemoteProgress) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
     let fixture = SshFixture::new()?;
+    let reporter = std::sync::Arc::new(Reporter(std::sync::Mutex::new(Vec::new())));
+    let mut target = fixture.target.clone();
+    target.progress = Some(reporter.clone());
     let wrapper = fixture.directory.path().join("wrapper.sh");
     let tools = standard_tools(fixture.directory.path())?;
     std::fs::write(
@@ -450,12 +460,20 @@ fn ssh_deploys_and_reuses_a_verified_server() -> Result<()> {
         artifacts: artifacts.clone(),
         filesystem: std::sync::Arc::new(zess_platform::NativeFileSystem),
     };
-    let command = bootstrap.prepare(&fixture.target, &SystemProcessRunner)?;
-    assert!(command.contains(zess_build::BUILD_ID));
-    assert_eq!(
-        bootstrap.prepare(&fixture.target, &SystemProcessRunner)?,
-        command
+    let command = bootstrap.prepare(&target, &SystemProcessRunner)?;
+    assert!(
+        reporter
+            .0
+            .lock()
+            .unwrap()
+            .contains(&RemoteProgress::Transfer {
+                stage: RemoteStage::Uploading,
+                completed: bytes.len() as u64,
+                total: Some(bytes.len() as u64),
+            })
     );
+    assert!(command.contains(zess_build::BUILD_ID));
+    assert_eq!(bootstrap.prepare(&target, &SystemProcessRunner)?, command);
     assert_eq!(
         artifacts.requests.load(std::sync::atomic::Ordering::SeqCst),
         1
@@ -467,16 +485,13 @@ fn ssh_deploys_and_reuses_a_verified_server() -> Result<()> {
         .join(zess_build::BUILD_ID)
         .join("current");
     std::fs::write(installed.join("lib/ld-linux-x86-64.so.2"), "corrupt")?;
-    assert_eq!(
-        bootstrap.prepare(&fixture.target, &SystemProcessRunner)?,
-        command
-    );
+    assert_eq!(bootstrap.prepare(&target, &SystemProcessRunner)?, command);
     assert_eq!(
         artifacts.requests.load(std::sync::atomic::Ordering::SeqCst),
         2
     );
     let mut connector = SshConnector {
-        target: fixture.target.clone(),
+        target,
         bootstrap: std::sync::Arc::new(bootstrap),
         runner: SystemProcessRunner,
         request: ProxyRequest::new(ProxyOperation::Status),
@@ -586,5 +601,47 @@ fn installed_server_starts_a_session_with_its_own_executable() -> Result<()> {
     let session: serde_json::Value = serde_json::from_slice(&result)?;
     let id = session["id"].as_str().context("missing session ID")?;
     invoke(&format!("session stop '{id}' --force"))?;
+    Ok(())
+}
+
+#[test]
+fn ssh_diagnostics_are_reported_to_the_observer() -> Result<()> {
+    struct Reporter(std::sync::Mutex<Vec<zess_remote::RemoteProgress>>);
+    impl zess_remote::ProgressReporter for Reporter {
+        fn report(&self, event: zess_remote::RemoteProgress) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    let fixture = SshFixture::new()?;
+    let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
+        build_id: zess_build::BUILD_ID.into(),
+    })?;
+    std::fs::write(
+        fixture.directory.path().join("zess"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' 'ssh diagnostic' >&2\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"session_id\":null}}'\nexec cat >/dev/null\n"
+        ),
+    )?;
+    let reporter = std::sync::Arc::new(Reporter(std::sync::Mutex::new(Vec::new())));
+    let mut target = fixture.target.clone();
+    target.progress = Some(reporter.clone());
+    let mut connector = SshConnector {
+        target,
+        bootstrap: std::sync::Arc::new(Preinstalled),
+        runner: SystemProcessRunner,
+        request: ProxyRequest::new(ProxyOperation::Status),
+    };
+    let connection = connector.connect()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let events = reporter.0.lock().unwrap();
+        if events.iter().any(|event| matches!(event, zess_remote::RemoteProgress::Diagnostic(message) if message.contains("ssh diagnostic"))) {
+            break;
+        }
+        drop(events);
+        anyhow::ensure!(Instant::now() < deadline, "diagnostic was not reported");
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(connection);
     Ok(())
 }

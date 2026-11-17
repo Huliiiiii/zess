@@ -63,3 +63,29 @@ fn ssh_uses_system_configuration_without_tty_or_forwarding() {
             .is_err()
     );
 }
+
+#[test]
+fn interactive_ssh_uses_the_askpass_broker_without_a_console() {
+    let mut target = SshTarget::new("host".into());
+    target.askpass = Some(crate::AskpassConfig {
+        program: "helper path".into(),
+        endpoint: std::path::PathBuf::from("endpoint path").into(),
+    });
+    let spec = target.command("remote command").unwrap();
+    assert!(matches!(
+        spec.console_mode,
+        zess_platform::ConsoleMode::Hidden
+    ));
+    let value = |name: &str| {
+        spec.env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+    };
+    assert_eq!(value("SSH_ASKPASS").as_deref(), Some("helper path"));
+    assert_eq!(value("SSH_ASKPASS_REQUIRE").as_deref(), Some("force"));
+    assert_eq!(
+        value("ZESS_SSH_ASKPASS_ENDPOINT").as_deref(),
+        Some("endpoint path")
+    );
+}

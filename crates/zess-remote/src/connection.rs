@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     io::{self, Read, Write},
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
     },
@@ -11,6 +12,8 @@ use std::{
 
 use anyhow::Context;
 use zess_platform::{CancellationToken, OwnedProcess};
+
+use crate::{ProgressReporter, RemoteProgress};
 
 pub struct SshConnection {
     process: OwnedProcess,
@@ -34,12 +37,13 @@ enum Outgoing {
 
 impl SshConnection {
     pub fn new(process: OwnedProcess) -> anyhow::Result<Self> {
-        Self::with_cancellation(process, None)
+        Self::with_cancellation(process, None, None)
     }
 
     pub(crate) fn with_cancellation(
         mut process: OwnedProcess,
         cancellation: Option<CancellationToken>,
+        progress: Option<Arc<dyn ProgressReporter>>,
     ) -> anyhow::Result<Self> {
         let mut stdin = process.take_stdin().context("SSH stdin unavailable")?;
         let mut stdout = process.take_stdout().context("SSH stdout unavailable")?;
@@ -98,7 +102,19 @@ impl SshConnection {
         let diagnostics = match thread::Builder::new()
             .name("zess-ssh-diagnostics".into())
             .spawn(move || {
-                let _ = io::copy(&mut stderr, &mut io::stderr());
+                if let Some(progress) = progress {
+                    let mut bytes = [0; 1024];
+                    while let Ok(count) = stderr.read(&mut bytes) {
+                        if count == 0 {
+                            break;
+                        }
+                        progress.report(RemoteProgress::Diagnostic(
+                            String::from_utf8_lossy(&bytes[..count]).into_owned(),
+                        ));
+                    }
+                } else {
+                    let _ = io::copy(&mut stderr, &mut io::stderr());
+                }
             }) {
             Ok(thread) => thread,
             Err(error) => {

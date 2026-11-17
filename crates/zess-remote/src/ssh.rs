@@ -12,9 +12,12 @@ use serde::{Serialize, de::DeserializeOwned};
 use zess_platform::{Cancellation, CancellationToken, ConsoleMode, ProcessRunner, ProcessSpec};
 use zess_protocol::{ClientMessage, ServerMessage, check_build_id};
 
-use crate::{ProxyHandshake, ServerBootstrap, SshConnection};
+use crate::{
+    AskpassConfig, ProgressReporter, ProxyHandshake, RemoteProgress, RemoteStage, ServerBootstrap,
+    SshConnection,
+};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SshTarget {
     pub host: String,
     pub port: Option<u16>,
@@ -23,6 +26,8 @@ pub struct SshTarget {
     pub config_file: Option<PathBuf>,
     pub jump_host: Option<String>,
     pub cancellation: Option<CancellationToken>,
+    pub progress: Option<Arc<dyn ProgressReporter>>,
+    pub askpass: Option<AskpassConfig>,
 }
 
 impl SshTarget {
@@ -35,6 +40,8 @@ impl SshTarget {
             config_file: None,
             jump_host: None,
             cancellation: None,
+            progress: None,
+            askpass: None,
         }
     }
 
@@ -63,9 +70,22 @@ impl SshTarget {
         if let Some(jump) = &self.jump_host {
             spec.arg("-J").arg(jump);
         }
-        spec.console_mode = ConsoleMode::Inherit;
+        if let Some(askpass) = &self.askpass {
+            spec.env("SSH_ASKPASS", &askpass.program)
+                .env("SSH_ASKPASS_REQUIRE", "force")
+                .env("ZESS_SSH_ASKPASS_ENDPOINT", askpass.endpoint.as_path());
+            spec.console_mode = ConsoleMode::Hidden;
+        } else {
+            spec.console_mode = ConsoleMode::Inherit;
+        }
         spec.arg("--").arg(&self.host).arg(remote_command);
         Ok(spec)
+    }
+
+    pub(crate) fn report(&self, event: RemoteProgress) {
+        if let Some(progress) = &self.progress {
+            progress.report(event);
+        }
     }
 
     pub(crate) fn check_cancellation(&self) -> anyhow::Result<()> {
@@ -94,10 +114,13 @@ impl<R: ProcessRunner, Q: Serialize> Connector for SshConnector<R, Q> {
     fn connect(&mut self) -> anyhow::Result<Self::Connection> {
         self.target.check_cancellation()?;
         let command = self.bootstrap.prepare(&self.target, &self.runner)?;
+        self.target
+            .report(RemoteProgress::Stage(RemoteStage::Connecting));
         let spec = self.target.command(&command)?;
         let mut connection = SshConnection::with_cancellation(
             self.runner.spawn(&spec)?,
             self.target.cancellation.clone(),
+            self.target.progress.clone(),
         )?;
         write_initial_request(
             &mut connection,
@@ -118,6 +141,8 @@ impl<R: ProcessRunner, Q: Serialize> Connector for SshConnector<R, Q> {
         connection.set_nonblocking(false)?;
         self.target.check_cancellation()?;
         connection.release_console()?;
+        self.target
+            .report(RemoteProgress::Stage(RemoteStage::Ready));
         Ok(connection)
     }
 }
