@@ -22,8 +22,8 @@ use zess_platform::{NativePlatform, Platform};
 use zess_plugin::HostRequest;
 use zess_protocol::{
     ClientActionKind, ClientMessage, CommandAction, CommandOutcome, CommandTarget, MAX_INPUT_BYTES,
-    MAX_MESSAGE_BYTES, RequestId, ServerInstanceId, ServerMessage, SessionId,
-    editor_events::EventSource,
+    MAX_MESSAGE_BYTES, ProtocolMismatch, RequestId, ServerInstanceId, ServerMessage, SessionId,
+    VersionInfo, editor_events::EventSource,
 };
 use zess_ui::{CursorShape, Frame, FrameRow, MouseEvent, MouseKind, fitting_prefix};
 
@@ -271,7 +271,7 @@ impl Connection {
             }),
         };
         connection.send(&ClientMessage::Hello {
-            version: zess_build::version().to_owned(),
+            version: VersionInfo::new(zess_build::version()),
         })?;
         Ok(connection)
     }
@@ -334,10 +334,8 @@ impl Connection {
                             if self.pending_attach.is_some() {
                                 match message {
                                     ServerMessage::Hello { version } => {
-                                        zess_protocol::check_version(
-                                            zess_build::version(),
-                                            &version,
-                                        )?;
+                                        VersionInfo::new(zess_build::version())
+                                            .check_compatible(&version)?;
                                         let attach = self.pending_attach.take().unwrap();
                                         self.send(&attach)?;
                                     }
@@ -1019,10 +1017,7 @@ fn run_client<C: Clipboard>(
         let messages = match connection.active_mut().map(Connection::poll).transpose() {
             Ok(messages) => messages.unwrap_or_default(),
             Err(error) => {
-                if error
-                    .downcast_ref::<zess_protocol::VersionMismatch>()
-                    .is_some()
-                {
+                if error.downcast_ref::<ProtocolMismatch>().is_some() {
                     connection = ClientConnection::Failed(error);
                 } else {
                     ui.notice = Some(format!("Disconnected; reconnecting: {error}"));

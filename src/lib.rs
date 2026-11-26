@@ -175,14 +175,12 @@ pub fn run() -> Result<()> {
         match argument.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "Zess — terminal editor with Wisp plugins\n\nUsage: zess [OPTIONS] [FILES...]\n       zess ssh://[USER@]HOST[:PORT]/WORKSPACE\n       zess session new [NAME] [OPTIONS]\n       zess session list [OPTIONS]\n       zess session attach [NAME|ID] [OPTIONS]\n       zess session stop [NAME|ID] [OPTIONS]\n       zess session restart [NAME|ID] [OPTIONS]\n\nOptions: --workspace DIR, --config FILE, --ssh HOST, --json\nCtrl-z detaches; :q exits when only a clean scratch remains.\nRestart creates a fresh session and resets open buffers, layout and undo history.\nA matching server is deployed automatically over SSH."
+                    "Zess — terminal editor with Wisp plugins\n\nUsage: zess [OPTIONS] [FILES...]\n       zess ssh://[USER@]HOST[:PORT]/WORKSPACE\n       zess session new [NAME] [OPTIONS]\n       zess session list [OPTIONS]\n       zess session attach [NAME|ID] [OPTIONS]\n       zess session stop [NAME|ID] [OPTIONS]\n       zess session restart [NAME|ID] [OPTIONS]\n\nOptions: --workspace DIR, --config FILE, --ssh HOST, --json\nCtrl-z detaches; :q exits when only a clean scratch remains.\nRestart creates a fresh session and resets open buffers, layout and undo history.\nRelease clients deploy matching SSH servers. Development clients use a compatible Zess installed on the SSH host."
                 );
                 return Ok(());
             }
             "--version" | "-V" => {
-                let version = zess_build::RELEASE_VERSION
-                    .unwrap_or(concat!(env!("CARGO_PKG_VERSION"), "-dev"));
-                println!("zess {version}");
+                println!("zess {}", zess_build::version());
                 return Ok(());
             }
             "--json" => json = true,
@@ -352,21 +350,23 @@ pub fn run() -> Result<()> {
         target.jump_host = ssh_jump;
         let filesystem = Arc::new(NativeFileSystem);
         let host = Arc::new(NativePlatform);
-        let artifacts = Arc::new(zess_remote::GithubReleaseArtifacts::new(
-            env!("CARGO_PKG_REPOSITORY")
-                .strip_prefix("https://github.com/")
-                .context("repository must be on GitHub")?
-                .trim_end_matches(".git"),
-            filesystem.clone(),
-            host.clone(),
-        ));
-        let remote = remote::RemoteOptions {
-            target,
-            bootstrap: Arc::new(zess_remote::SshBootstrap {
-                artifacts,
-                filesystem: filesystem.clone(),
-            }),
-        };
+        let bootstrap: Arc<dyn zess_remote::ServerBootstrap> =
+            if zess_build::RELEASE_VERSION.is_some() {
+                Arc::new(zess_remote::SshBootstrap {
+                    artifacts: Arc::new(zess_remote::GithubReleaseArtifacts::new(
+                        env!("CARGO_PKG_REPOSITORY")
+                            .strip_prefix("https://github.com/")
+                            .context("repository must be on GitHub")?
+                            .trim_end_matches(".git"),
+                        filesystem.clone(),
+                        host.clone(),
+                    )),
+                    filesystem: filesystem.clone(),
+                })
+            } else {
+                Arc::new(zess_remote::InstalledSshBootstrap)
+            };
+        let remote = remote::RemoteOptions { target, bootstrap };
         let remote_workspace_given = workspace_selected();
         if let Some(remote_workspace) = &remote_workspace
             && workspace
@@ -672,7 +672,7 @@ pub fn run() -> Result<()> {
                 [session] => session,
                 _ => select_session(&sessions)?,
             };
-            zess_protocol::check_version(zess_build::version(), &session.version)?;
+            manager.check_protocol(&session.version)?;
             LocalSessionTarget::Session {
                 endpoint: SocketPath::from(PathBuf::from(&session.endpoint)),
                 id: session.session_id.clone(),
@@ -733,7 +733,7 @@ fn print_sessions(sessions: &[server::SessionInfo]) {
             session.name.as_deref().unwrap_or("-"),
             session.id,
             session.session_id.0,
-            session.version,
+            session.version.build_id,
             session.pid,
             if session.attached {
                 "attached"

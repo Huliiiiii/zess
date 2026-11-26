@@ -20,6 +20,67 @@ pub trait ServerBootstrap: Send + Sync {
     fn prepare(&self, target: &SshTarget, runner: &dyn ProcessRunner) -> Result<String>;
 }
 
+fn powershell(script: &str) -> String {
+    let script = format!("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);{script}");
+    let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    format!(
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}",
+        BASE64_STANDARD.encode(bytes)
+    )
+}
+
+fn execute(
+    runner: &dyn ProcessRunner,
+    target: &SshTarget,
+    command: &str,
+    input: Option<&[u8]>,
+    cancellation: &dyn Cancellation,
+) -> Result<Vec<u8>> {
+    let output = runner.output(&target.command(command)?, input, cancellation)?;
+    ensure!(
+        output.status.success(),
+        "SSH command failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+
+fn detect_platform(target: &SshTarget, runner: &dyn ProcessRunner) -> Result<ServerTarget> {
+    target.report(RemoteProgress::Stage(RemoteStage::DetectingPlatform));
+    let posix = execute(
+        runner,
+        target,
+        "sh -c 'uname -s; uname -m'",
+        None,
+        &super::ssh::Deadline::new(target),
+    );
+    match posix {
+        Ok(bytes) => {
+            let output = String::from_utf8_lossy(&bytes);
+            let mut lines = output.lines();
+            match (lines.next(), lines.next()) {
+                (Some("Linux"), Some("x86_64")) => Ok(ServerTarget::LinuxX86_64),
+                (Some(os), Some(arch)) => bail!("unsupported remote platform {os}/{arch}"),
+                _ => bail!("invalid remote platform probe response"),
+            }
+        }
+        Err(_) => {
+            target.check_cancellation()?;
+            let output = execute(runner, target, &powershell("[Console]::WriteLine('Windows');if($env:PROCESSOR_ARCHITEW6432){[Console]::WriteLine($env:PROCESSOR_ARCHITEW6432)}else{[Console]::WriteLine($env:PROCESSOR_ARCHITECTURE)}"), None, &super::ssh::Deadline::new(target)).context("detect remote platform")?;
+            let output = String::from_utf8_lossy(&output);
+            let mut lines = output.trim_start_matches('\u{feff}').lines();
+            match (lines.next(), lines.next()) {
+                (Some("Windows"), Some("AMD64")) => Ok(ServerTarget::WindowsX86_64),
+                (os, arch) => bail!(
+                    "unsupported remote platform {}/{}",
+                    os.unwrap_or("unknown"),
+                    arch.unwrap_or("unknown")
+                ),
+            }
+        }
+    }
+}
+
 pub struct SshBootstrap {
     pub artifacts: Arc<dyn ServerArtifacts>,
     pub filesystem: Arc<dyn FileSystem>,
@@ -27,39 +88,7 @@ pub struct SshBootstrap {
 
 impl ServerBootstrap for SshBootstrap {
     fn prepare(&self, target: &SshTarget, runner: &dyn ProcessRunner) -> Result<String> {
-        target.report(RemoteProgress::Stage(RemoteStage::DetectingPlatform));
-        let posix = execute(
-            runner,
-            target,
-            "sh -c 'uname -s; uname -m'",
-            None,
-            &super::ssh::Deadline::new(target),
-        );
-        let platform = match &posix {
-            Ok(bytes) => {
-                let output = String::from_utf8_lossy(bytes);
-                let mut lines = output.lines();
-                match (lines.next(), lines.next()) {
-                    (Some("Linux"), Some("x86_64")) => ServerTarget::LinuxX86_64,
-                    (Some(os), Some(arch)) => bail!("unsupported remote platform {os}/{arch}"),
-                    _ => bail!("invalid remote platform probe response"),
-                }
-            }
-            Err(_) => {
-                target.check_cancellation()?;
-                let output = execute(runner, target, &powershell("[Console]::WriteLine('Windows');if($env:PROCESSOR_ARCHITEW6432){[Console]::WriteLine($env:PROCESSOR_ARCHITEW6432)}else{[Console]::WriteLine($env:PROCESSOR_ARCHITECTURE)}"), None, &super::ssh::Deadline::new(target)).context("detect remote platform")?;
-                let output = String::from_utf8_lossy(&output);
-                let mut lines = output.trim_start_matches('\u{feff}').lines();
-                match (lines.next(), lines.next()) {
-                    (Some("Windows"), Some("AMD64")) => ServerTarget::WindowsX86_64,
-                    (os, arch) => bail!(
-                        "unsupported remote platform {}/{}",
-                        os.unwrap_or("unknown"),
-                        arch.unwrap_or("unknown")
-                    ),
-                }
-            }
-        };
+        let platform = detect_platform(target, runner)?;
         let remote = RemotePlatform::new(platform);
         target.report(RemoteProgress::Stage(RemoteStage::CheckingCache));
         if execute(
@@ -125,22 +154,6 @@ impl ServerBootstrap for SshBootstrap {
         .context("verify remote server cache")?;
         Ok(remote.proxy())
     }
-}
-
-fn execute(
-    runner: &dyn ProcessRunner,
-    target: &SshTarget,
-    command: &str,
-    input: Option<&[u8]>,
-    cancellation: &dyn Cancellation,
-) -> Result<Vec<u8>> {
-    let output = runner.output(&target.command(command)?, input, cancellation)?;
-    ensure!(
-        output.status.success(),
-        "SSH command failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(output.stdout)
 }
 
 struct UploadProgress<'a> {
@@ -219,6 +232,12 @@ fn execute_upload(
     Ok(())
 }
 
+fn windows_proxy(executable: &str) -> String {
+    format!(
+        "$s=[Diagnostics.ProcessStartInfo]::new();$s.FileName={executable};$s.Arguments='remote-proxy';$s.UseShellExecute=$false;$p=[Diagnostics.Process]::Start($s);$p.WaitForExit();exit $p.ExitCode"
+    )
+}
+
 struct RemotePlatform(ServerTarget);
 
 impl RemotePlatform {
@@ -263,10 +282,51 @@ impl RemotePlatform {
             zess_build::version()
         );
         let windows = format!(
-            "{} $s=[Diagnostics.ProcessStartInfo]::new();$s.FileName=Join-Path $d 'zess.exe';$s.Arguments='remote-proxy';$s.UseShellExecute=$false;$p=[Diagnostics.Process]::Start($s);$p.WaitForExit();exit $p.ExitCode",
-            windows_dir()
+            "{} {}",
+            windows_dir(),
+            windows_proxy("Join-Path $d 'zess.exe'")
         );
         self.command(&posix, &windows)
+    }
+}
+
+pub struct InstalledSshBootstrap;
+
+impl ServerBootstrap for InstalledSshBootstrap {
+    fn prepare(&self, target: &SshTarget, runner: &dyn ProcessRunner) -> Result<String> {
+        let remote = RemotePlatform::new(detect_platform(target, runner)?);
+        target.report(RemoteProgress::Stage(RemoteStage::CheckingInstalledServer));
+        let probe = remote.command(
+            r#"p="$HOME/.cargo/bin/zess"; if [ -f "$p" ] && [ -x "$p" ]; then printf 'cargo\n'; elif command -v zess >/dev/null 2>&1; then printf 'path\n'; else printf 'missing\n'; fi"#,
+            "$p=Join-Path $HOME '.cargo/bin/zess.exe';if(Test-Path -LiteralPath $p -PathType Leaf){[Console]::WriteLine('cargo')}elseif(Get-Command zess.exe -CommandType Application -ErrorAction SilentlyContinue){[Console]::WriteLine('path')}else{[Console]::WriteLine('missing')}",
+        );
+        let output = execute(
+            runner,
+            target,
+            &probe,
+            None,
+            &super::ssh::Deadline::new(target),
+        )
+        .context("find installed Zess on the remote host")?;
+        let output = String::from_utf8_lossy(&output);
+        let (posix, windows) = match output.trim_start_matches('\u{feff}').trim() {
+            "cargo" => (
+                r#""$HOME/.cargo/bin/zess""#,
+                "Join-Path $HOME '.cargo/bin/zess.exe'",
+            ),
+            "path" => (
+                "zess",
+                "(Get-Command zess.exe -CommandType Application -ErrorAction Stop).Path",
+            ),
+            "missing" => bail!(
+                "Zess was not found on the remote host. Install a compatible Zess build with `cargo install --path . --force` as the SSH user, or put a compatible executable on the SSH user's PATH."
+            ),
+            _ => bail!("invalid remote Zess probe response"),
+        };
+        Ok(remote.command(
+            &format!("exec {posix} remote-proxy"),
+            &windows_proxy(windows),
+        ))
     }
 }
 
@@ -279,13 +339,4 @@ fn windows_dir() -> String {
 
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn powershell(script: &str) -> String {
-    let script = format!("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);{script}");
-    let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    format!(
-        "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}",
-        BASE64_STANDARD.encode(bytes)
-    )
 }

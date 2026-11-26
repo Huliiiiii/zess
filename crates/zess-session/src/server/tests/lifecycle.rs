@@ -75,7 +75,7 @@ impl Drop for Server {
             let _ = framing::write(
                 &mut stream,
                 &ClientMessage::Hello {
-                    version: zess_build::version().into(),
+                    version: VersionInfo::new(zess_build::version()),
                 },
             );
             let _ = framing::write(&mut stream, &ClientMessage::Stop { force: true });
@@ -91,13 +91,22 @@ impl Drop for Server {
 }
 
 #[test]
-fn session_status_is_available_before_the_build_handshake() {
+fn session_status_is_available_before_the_protocol_handshake() {
     let server = Server::start("keep");
     let (mut stream, mut reader) = server.connect();
     framing::write(&mut stream, &ClientMessage::Status).unwrap();
-    assert!(
-        matches!(receive(&mut reader), ServerMessage::Status { version, name: Some(name), workspace, .. } if version == zess_build::version() && name == "work" && workspace == server.root.to_string_lossy())
-    );
+    let ServerMessage::Status {
+        version,
+        name,
+        workspace,
+        ..
+    } = receive(&mut reader)
+    else {
+        panic!("status expected")
+    };
+    assert_eq!(version, VersionInfo::new(zess_build::version()));
+    assert_eq!(name.as_deref(), Some("work"));
+    assert_eq!(workspace, server.root.to_string_lossy());
 }
 
 fn receive(reader: &mut BufReader<UnixStream>) -> ServerMessage {
@@ -110,39 +119,101 @@ fn hello(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>) {
     framing::write(
         stream,
         &ClientMessage::Hello {
-            version: zess_build::version().into(),
+            version: VersionInfo::new(zess_build::version()),
         },
     )
     .unwrap();
     assert!(
-        matches!(receive(reader), ServerMessage::Hello { version } if version == zess_build::version())
+        matches!(receive(reader), ServerMessage::Hello { version } if version == VersionInfo::new(zess_build::version()))
     );
 }
 
+fn assert_incompatible_hello_closes_connection(server: &Server, request: &ClientMessage) {
+    let (mut stream, mut reader) = server.connect();
+    let version = VersionInfo::new(zess_build::version());
+    let mut requests = framing::encode(&ClientMessage::Hello {
+        version: VersionInfo {
+            protocol_version: version.protocol_version + 1,
+            build_id: version.build_id.clone(),
+        },
+    })
+    .unwrap();
+    requests.extend(framing::encode(request).unwrap());
+    stream.write_all(&requests).unwrap();
+
+    assert!(
+        matches!(receive(&mut reader), ServerMessage::Hello { version: actual } if actual == version)
+    );
+    assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+}
+
 #[test]
-fn stopping_requires_a_matching_build_handshake() {
+fn stopping_requires_a_matching_protocol_version() {
     let server = Server::start("keep");
     let (mut stream, mut reader) = server.connect();
     framing::write(&mut stream, &ClientMessage::Stop { force: true }).unwrap();
     assert!(
         matches!(receive(&mut reader), ServerMessage::Rejected { reason } if reason.contains("Hello"))
     );
-    let (mut stream, mut reader) = server.connect();
-    framing::write(
-        &mut stream,
-        &ClientMessage::Hello {
-            version: "different".into(),
-        },
-    )
-    .unwrap();
-    framing::write(&mut stream, &ClientMessage::Stop { force: true }).unwrap();
-    assert!(
-        matches!(receive(&mut reader), ServerMessage::Hello { version } if version == zess_build::version())
-    );
-    assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+    assert_incompatible_hello_closes_connection(&server, &ClientMessage::Stop { force: true });
     assert!(
         matches!(server.status(), ServerMessage::Status { name: Some(name), .. } if name == "work")
     );
+}
+
+#[test]
+fn attaching_requires_a_matching_protocol_version() {
+    let server = Server::start("keep");
+    let path = server.root.join("new-file");
+    fs::write(&path, "must remain unopened\n").unwrap();
+
+    assert_incompatible_hello_closes_connection(
+        &server,
+        &ClientMessage::Attach {
+            expected_session: None,
+            client_id: "client".into(),
+            width: 80,
+            height: 24,
+            files: vec![path.to_string_lossy().into_owned()],
+        },
+    );
+
+    let (mut stream, mut reader) = server.connect();
+    let version = VersionInfo::new(zess_build::version());
+    framing::write(
+        &mut stream,
+        &ClientMessage::Hello {
+            version: VersionInfo::new(format!("{}-other", version.build_id)),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(receive(&mut reader), ServerMessage::Hello { version: actual } if actual == version)
+    );
+    framing::write(
+        &mut stream,
+        &ClientMessage::Attach {
+            expected_session: None,
+            client_id: "client".into(),
+            width: 80,
+            height: 24,
+            files: vec![],
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        receive(&mut reader),
+        ServerMessage::Attached { .. }
+    ));
+    let ServerMessage::Snapshot { state, .. } = receive(&mut reader) else {
+        panic!("snapshot expected")
+    };
+    assert_eq!(state.buffers.len(), 1);
+    assert!(matches!(
+        state.buffers[0].kind,
+        zess_protocol::BufferKind::Text { path: None }
+    ));
 }
 
 #[test]

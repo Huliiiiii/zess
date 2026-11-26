@@ -58,7 +58,7 @@ impl Drop for Server {
             let _ = framing::write(
                 &mut stream,
                 &ClientMessage::Hello {
-                    version: zess_build::version().into(),
+                    version: VersionInfo::new(zess_build::version()),
                 },
             );
             let _ = framing::write(&mut stream, &ClientMessage::Stop { force: true });
@@ -92,7 +92,7 @@ impl Client {
         framing::write(
             &mut stream,
             &ClientMessage::Hello {
-                version: zess_build::version().into(),
+                version: VersionInfo::new(zess_build::version()),
             },
         )
         .unwrap();

@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use zess_ipc::{LocalIpc, Stream, platform::ProcessWait};
 use zess_platform::{Cancellation, FileSystem, Platform, SystemProcessRunner};
+use zess_protocol::{ClientMessage, ServerMessage, VersionInfo};
 use zess_remote::{
     AskpassBroker, Connector, ProgressReporter, ProxyHandshake, ProxyOperation, ProxyRequest,
     RemoteProgress, RemoteStage, SshConnection, SshConnector, SshPrompt, SshPromptHandler,
@@ -131,6 +132,9 @@ impl ProgressReporter for ConnectionObserver {
         };
         let message = match stage {
             RemoteStage::DetectingPlatform => "Detecting remote platform…",
+            RemoteStage::CheckingInstalledServer => {
+                "Looking for installed Zess on the remote host…"
+            }
             RemoteStage::CheckingCache => "Checking for a matching server…",
             RemoteStage::Downloading => "Downloading matching server…",
             RemoteStage::Uploading => "Uploading server…",
@@ -254,7 +258,7 @@ impl ConnectionFactory for RemoteConnectionFactory {
                 }
             };
             if let Some(session) = selected {
-                zess_protocol::check_version(zess_build::version(), &session.version)?;
+                VersionInfo::new(zess_build::version()).check_compatible(&session.version)?;
                 self.session_id = Some(session.session_id.clone());
             }
         }
@@ -437,17 +441,18 @@ pub fn serve_proxy(
     host: Arc<dyn Platform>,
 ) -> Result<()> {
     let mut input = BufReader::new(io::stdin());
-    let hello: zess_protocol::ClientMessage = zess_remote::read_request(&mut input)?;
-    let zess_protocol::ClientMessage::Hello { version } = hello else {
+    let hello: ClientMessage = zess_remote::read_request(&mut input)?;
+    let ClientMessage::Hello { version: peer } = hello else {
         bail!("remote proxy expected hello");
     };
+    let version = VersionInfo::new(zess_build::version());
     zess_remote::write_request(
         &mut io::stdout().lock(),
-        &zess_protocol::ServerMessage::Hello {
-            version: zess_build::version().into(),
+        &ServerMessage::Hello {
+            version: version.clone(),
         },
     )?;
-    zess_protocol::check_version(zess_build::version(), &version)?;
+    version.check_compatible(&peer)?;
     let prepared = zess_remote::read_request(&mut input)
         .and_then(|request| prepare_proxy(request, &manager, filesystem.as_ref(), host.as_ref()));
     let output = match prepared {
@@ -523,6 +528,7 @@ fn prepare_proxy(
                 (stream, info, peer)
             }
         };
+        manager.check_protocol(&info.version)?;
         return Ok(ProxyOutput::Stream {
             stream,
             session_id: info.session_id.0,

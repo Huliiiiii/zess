@@ -13,13 +13,13 @@ use zess_ipc::platform::{
 };
 use zess_ipc::{LocalIpc, NativeLocalIpc, ServerId, SocketPath, Stream, framing};
 use zess_platform::{CancellationToken, FileSystem, NativeFileSystem, NativePlatform, Platform};
-use zess_protocol::{ClientMessage, ServerInstanceId, ServerMessage, SessionId};
+use zess_protocol::{ClientMessage, ServerInstanceId, ServerMessage, SessionId, VersionInfo};
 use zess_session::SessionLifetime;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
-    #[serde(rename = "build_id")]
-    pub version: String,
+    #[serde(flatten)]
+    pub version: VersionInfo,
     pub id: String,
     pub endpoint: String,
     pub session_id: SessionId,
@@ -70,7 +70,7 @@ pub struct SessionManager {
     ipc: Arc<dyn LocalIpc>,
     daemons: Arc<dyn DaemonControl>,
     host: Arc<dyn Platform>,
-    development_version: Arc<OnceLock<String>>,
+    development_build_id: Arc<OnceLock<String>>,
     cancellation: Option<CancellationToken>,
 }
 
@@ -95,7 +95,7 @@ impl SessionManager {
             ipc,
             daemons,
             host,
-            development_version: Arc::default(),
+            development_build_id: Arc::default(),
             cancellation: None,
         }
     }
@@ -137,28 +137,32 @@ impl SessionManager {
         self.request_on(&mut stream, message)
     }
 
-    fn version(&self) -> Result<&str> {
-        if let Some(version) = zess_build::RELEASE_VERSION {
-            return Ok(version);
+    fn build_id(&self) -> Result<&str> {
+        if let Some(build_id) = zess_build::BUILD_VERSION {
+            return Ok(build_id);
         }
-        if let Some(version) = self.development_version.get() {
-            return Ok(version);
+        if let Some(build_id) = self.development_build_id.get() {
+            return Ok(build_id);
         }
-        let version = zess_build::development_version(&self.host.current_exe()?)?;
-        Ok(self.development_version.get_or_init(|| version))
+        let build_id = zess_build::development_version(&self.host.current_exe()?)?;
+        Ok(self.development_build_id.get_or_init(|| build_id))
+    }
+
+    pub(crate) fn check_protocol(&self, peer: &VersionInfo) -> Result<()> {
+        Ok(VersionInfo::new(self.build_id()?).check_compatible(peer)?)
     }
 
     fn handshake(&self, stream: &mut Stream) -> Result<()> {
-        let expected = self.version()?;
+        let version = VersionInfo::new(self.build_id()?);
         self.request_on(
             stream,
             ClientMessage::Hello {
-                version: expected.to_owned(),
+                version: version.clone(),
             },
         )
         .and_then(|reply| match reply {
-            ServerMessage::Hello { version } => {
-                zess_protocol::check_version(expected, &version).map_err(Into::into)
+            ServerMessage::Hello { version: peer } => {
+                version.check_compatible(&peer).map_err(Into::into)
             }
             _ => Err(anyhow::anyhow!("unexpected server handshake")),
         })
@@ -578,7 +582,7 @@ impl SessionManager {
         };
         if let Some(info) = existing {
             self.check_workspace(&info, &workspace)?;
-            zess_protocol::check_version(self.version()?, &info.version)?;
+            self.check_protocol(&info.version)?;
             ensure!(
                 !info.pending,
                 "the workspace session is awaiting its first attach"
@@ -600,7 +604,7 @@ impl SessionManager {
                 started.pending,
                 "the new session was published before its first attach"
             );
-            zess_protocol::check_version(self.version()?, &started.version)?;
+            self.check_protocol(&started.version)?;
             let mut stream = self.connect(endpoint)?;
             let claimed = Self::decode_status(
                 endpoint,

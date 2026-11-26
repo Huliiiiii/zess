@@ -11,7 +11,7 @@ use zess_platform::{NativePlatform, Platform};
 use zess_protocol::{
     ClientMessage, CommandAction, CommandOutcome, MAX_INPUT_BYTES, MAX_MESSAGE_BYTES,
     OperationResult, RequestId, ServerInstanceId, ServerMessage, SessionDelta, SessionId,
-    SessionSnapshot, resource::ResourceCacheInvalidation,
+    SessionSnapshot, VersionInfo, resource::ResourceCacheInvalidation,
 };
 
 use crate::Session;
@@ -542,6 +542,10 @@ pub fn serve_with_platform(
     let mut previous_client = None::<String>;
     let mut workspace_view = None;
     let mut state = ServerState::Running;
+    let version = VersionInfo::new(zess_build::version());
+    let hello = ServerMessage::Hello {
+        version: version.clone(),
+    };
     let process_id = platform.process_id();
     let server_instance = ServerInstanceId(format!(
         "{}-{}",
@@ -622,7 +626,7 @@ pub fn serve_with_platform(
                     {
                         connection.send(&ServerMessage::Rejected {
                             reason:
-                                "Hello with a matching build is required before session requests"
+                                "session requests require Hello with a matching protocol version"
                                     .into(),
                         })?;
                         connection.close_after_flush();
@@ -648,15 +652,11 @@ pub fn serve_with_platform(
                         }
                     }
                     match message {
-                        ClientMessage::Hello { version }
+                        ClientMessage::Hello { version: peer }
                             if matches!(connection.role, ConnectionRole::AwaitHello { .. }) =>
                         {
-                            connection.send(&ServerMessage::Hello {
-                                version: zess_build::version().to_owned(),
-                            })?;
-                            if zess_protocol::check_version(zess_build::version(), &version)
-                                .is_err()
-                            {
+                            connection.send(&hello)?;
+                            if version.check_compatible(&peer).is_err() {
                                 connection.close_after_flush();
                                 break;
                             }
@@ -694,7 +694,7 @@ pub fn serve_with_platform(
                                 false
                             };
                             connection.send(&ServerMessage::Status {
-                                version: zess_build::version().to_owned(),
+                                version: version.clone(),
                                 session_id: published.session_id.clone(),
                                 name: session.name().map(str::to_owned),
                                 server_instance: server_instance.clone(),

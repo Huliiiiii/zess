@@ -12,7 +12,7 @@ pub use artifact::{GithubReleaseArtifacts, ServerArtifact, ServerArtifacts, Serv
 pub use askpass::{
     AskpassBroker, AskpassConfig, SshPrompt, SshPromptHandler, SshPromptKind, run_askpass,
 };
-pub use bootstrap::{ServerBootstrap, SshBootstrap};
+pub use bootstrap::{InstalledSshBootstrap, ServerBootstrap, SshBootstrap};
 pub use connection::SshConnection;
 pub use progress::{ProgressReporter, RemoteProgress, RemoteStage};
 pub use ssh::{Connector, SshConnector, SshTarget};

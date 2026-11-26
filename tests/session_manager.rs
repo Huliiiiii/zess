@@ -17,7 +17,9 @@ use zess_ipc::{Listener, LocalIpc, NativeLocalIpc, ServerId, SocketPath, Stream,
 use zess_platform::{
     CancellationToken, HostInfo, NativeFileSystem, NativePlatform, Platform, UserDirs,
 };
-use zess_protocol::{ClientMessage, ServerMessage};
+use zess_protocol::{
+    ClientMessage, PROTOCOL_VERSION, ProtocolMismatch, ServerMessage, VersionInfo,
+};
 
 #[path = "../src/server.rs"]
 pub mod server;
@@ -559,8 +561,13 @@ fn cancelling_named_session_startup_reaps_the_spawned_daemon() {
 }
 
 #[test]
-fn a_version_mismatch_does_not_start_another_session() {
+fn a_protocol_mismatch_does_not_start_another_session() {
     let server = Server::new();
+    let build_id = zess_build::BUILD_VERSION
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            zess_build::development_version(Path::new(env!("CARGO_BIN_EXE_zess"))).unwrap()
+        });
     let listener = NativeLocalIpc.bind(&server.endpoint).unwrap();
     let manager = server.manager.clone();
     let workspace = server.workspace.clone();
@@ -576,7 +583,10 @@ fn a_version_mismatch_does_not_start_another_session() {
     stream
         .write_all(
             &zess_ipc::framing::encode(&zess_protocol::ServerMessage::Status {
-                version: "0.1.0-dev.9999".into(),
+                version: VersionInfo {
+                    protocol_version: PROTOCOL_VERSION + 1,
+                    build_id: build_id.clone(),
+                },
                 session_id: zess_protocol::SessionId("old".into()),
                 name: None,
                 server_instance: zess_protocol::ServerInstanceId("old-instance".into()),
@@ -595,16 +605,16 @@ fn a_version_mismatch_does_not_start_another_session() {
         .unwrap()
         .err()
         .expect("a mismatched session was opened");
-    assert!(
-        error
-            .downcast_ref::<zess_protocol::VersionMismatch>()
-            .is_some()
-    );
+    let mismatch = error.downcast_ref::<ProtocolMismatch>().unwrap();
+    assert_eq!(mismatch.expected.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(mismatch.actual.protocol_version, PROTOCOL_VERSION + 1);
+    assert_eq!(mismatch.expected.build_id, build_id);
+    assert_eq!(mismatch.actual.build_id, build_id);
     assert_eq!(server.daemons.spawns.load(Ordering::Relaxed), 0);
 }
 
 #[test]
-fn a_session_with_a_different_version_does_not_block_another_workspace() {
+fn an_incompatible_session_does_not_block_another_workspace() {
     let server = Server::new();
     let other = server.root.path().join("other");
     std::fs::create_dir(&other).unwrap();
@@ -626,7 +636,10 @@ fn a_session_with_a_different_version_does_not_block_another_workspace() {
         stream
             .write_all(
                 &zess_ipc::framing::encode(&zess_protocol::ServerMessage::Status {
-                    version: "0.1.0-dev.9999".into(),
+                    version: VersionInfo {
+                        protocol_version: 0,
+                        build_id: "older-build".into(),
+                    },
                     session_id: zess_protocol::SessionId("old".into()),
                     name: None,
                     server_instance: zess_protocol::ServerInstanceId("old-instance".into()),
@@ -647,7 +660,7 @@ fn a_session_with_a_different_version_does_not_block_another_workspace() {
         .unwrap();
     fixture.join().unwrap();
     assert_eq!(Path::new(&info.workspace), other.canonicalize().unwrap());
-    assert_ne!(info.version, "0.1.0-dev.9999");
+    assert_eq!(info.version.protocol_version, PROTOCOL_VERSION);
     assert_eq!(server.daemons.spawns.load(Ordering::Relaxed), 1);
     drop(stream);
     assert!(wait_for_endpoint_removal(&new_endpoint));
@@ -666,7 +679,7 @@ fn workspace_lookup_resolves_symbolic_links() {
 }
 
 #[test]
-fn multiple_sessions_remain_visible_when_one_has_a_different_build() {
+fn multiple_sessions_remain_visible_when_one_has_an_incompatible_protocol() {
     let server = Server::new();
     let endpoints = [
         server.endpoint.clone(),
@@ -689,11 +702,13 @@ fn multiple_sessions_remain_visible_when_one_has_a_different_build() {
                     .write_all(
                         &zess_ipc::framing::encode(&zess_protocol::ServerMessage::Status {
                             version: if index == 0 {
-                                "0.1.0-dev.9999"
+                                VersionInfo {
+                                    protocol_version: 0,
+                                    build_id: "older-build".into(),
+                                }
                             } else {
-                                zess_build::version()
-                            }
-                            .into(),
+                                VersionInfo::new(zess_build::version())
+                            },
                             session_id: zess_protocol::SessionId(format!("session-{index}")),
                             name: Some(format!("session-{index}")),
                             server_instance: zess_protocol::ServerInstanceId(format!(
@@ -720,7 +735,8 @@ fn multiple_sessions_remain_visible_when_one_has_a_different_build() {
     assert!(
         sessions
             .iter()
-            .any(|session| session.version == "0.1.0-dev.9999")
+            .any(|session| session.version.protocol_version == 0
+                && session.version.build_id == "older-build")
     );
     let error = server
         .manager
@@ -786,7 +802,7 @@ fn management_responses_can_arrive_across_poll_intervals() {
     .unwrap()
     .unwrap();
     let response = zess_ipc::framing::encode(&zess_protocol::ServerMessage::Status {
-        version: zess_build::version().to_owned(),
+        version: VersionInfo::new(zess_build::version()),
         session_id: zess_protocol::SessionId("fragmented-session".into()),
         name: None,
         server_instance: zess_protocol::ServerInstanceId("fragmented-instance".into()),

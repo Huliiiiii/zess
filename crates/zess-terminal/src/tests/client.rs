@@ -82,7 +82,7 @@ impl ScriptedStream {
         let batches = std::iter::once((
             0,
             vec![ServerMessage::Hello {
-                version: zess_build::version().into(),
+                version: VersionInfo::new(zess_build::version()),
             }],
         ))
         .chain(messages)
@@ -1690,11 +1690,14 @@ fn frontends_scope_ordered_operation_ids_to_distinct_clients() {
 }
 
 #[test]
-fn a_different_build_is_rejected_before_attachment() {
+fn a_different_protocol_is_rejected_before_attachment_even_with_the_same_build() {
     let phase = Arc::new(Phase::default());
     let mut stream = ScriptedStream::new(phase.clone(), vec![], None);
+    let client_version = VersionInfo::new(zess_build::version());
+    let mut peer_version = client_version.clone();
+    peer_version.protocol_version += 1;
     stream.batches[0].1 = framing::encode(&ServerMessage::Hello {
-        version: "different-build".into(),
+        version: peer_version.clone(),
     })
     .unwrap()
     .into();
@@ -1709,16 +1712,49 @@ fn a_different_build_is_rejected_before_attachment() {
     };
     let error =
         run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap_err();
+    let mismatch = error.downcast_ref::<ProtocolMismatch>().unwrap();
+    assert_eq!(mismatch.expected, client_version);
+    assert_eq!(mismatch.actual, peer_version);
     assert!(
-        error
-            .downcast_ref::<zess_protocol::VersionMismatch>()
-            .is_some()
+        matches!(messages(&output).as_slice(), [ClientMessage::Hello { version }] if version == &client_version)
     );
+}
+
+#[test]
+fn the_client_sends_attach_for_the_same_protocol_with_a_different_build() {
+    let phase = Arc::new(Phase::default());
+    let mut stream = ScriptedStream::new(
+        phase.clone(),
+        vec![
+            (0, vec![attached(), snapshot(1, SessionSnapshot::default())]),
+            (2, vec![ServerMessage::Exited]),
+        ],
+        None,
+    );
+    stream.batches[0].1 = framing::encode(&ServerMessage::Hello {
+        version: VersionInfo::new(format!("{}-other-build", zess_build::version())),
+    })
+    .unwrap()
+    .into();
+    let output = stream.output.clone();
+    let factory = ScriptedFactory(VecDeque::from([stream]));
+    let mut terminal = ScriptedTerminal {
+        phase,
+        events: VecDeque::from([None, None]),
+        wait_at: None,
+        output: Vec::new(),
+        mouse: false,
+    };
+    run_connection_with_devices(factory, &[], &mut terminal, &mut UnusedClipboard).unwrap();
     let sent = messages(&output);
-    assert_eq!(sent.len(), 1);
-    assert!(
-        matches!(&sent[0], ClientMessage::Hello { version } if version == zess_build::version())
-    );
+    assert!(matches!(
+        sent.as_slice(),
+        [
+            ClientMessage::Hello { .. },
+            ClientMessage::Attach { .. },
+            ..
+        ]
+    ));
 }
 
 #[test]

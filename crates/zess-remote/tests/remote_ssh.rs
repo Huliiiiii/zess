@@ -11,8 +11,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use zess_platform::{Cancellation, OwnedProcess, ProcessRunner, ProcessSpec, SystemProcessRunner};
+use zess_protocol::{PROTOCOL_VERSION, ProtocolMismatch, ServerMessage, VersionInfo};
 use zess_remote::{
-    Connector, ProxyOperation, ProxyRequest, SshConnection, SshConnector, SshTarget,
+    Connector, InstalledSshBootstrap, ProxyOperation, ProxyRequest, SshConnection, SshConnector,
+    SshTarget,
 };
 
 struct NeverCancel;
@@ -112,8 +114,8 @@ impl SshFixture {
             ),
         )?;
         let binary = root.join("zess");
-        let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
-            version: zess_build::version().into(),
+        let hello = serde_json::to_string(&ServerMessage::Hello {
+            version: VersionInfo::new("fixture-proxy"),
         })?;
         let script = format!(
             "#!/bin/sh\nset -eu\n[ \"$1\" = remote-proxy ]\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"session_id\":null}}'\nprintf '%s\\n' \"$request\"\nexec cat\n"
@@ -152,7 +154,7 @@ fn run(program: &str, args: &[&str]) -> Result<Vec<u8>> {
 }
 
 #[test]
-fn ssh_uses_preinstalled_server_and_preserves_workspace_data() -> Result<()> {
+fn ssh_connects_to_an_installed_server_on_path() -> Result<()> {
     let fixture = SshFixture::new()?;
     let workspace = "work space/'\";$()/项目";
     let request = ProxyRequest::new(ProxyOperation::Attach {
@@ -162,7 +164,7 @@ fn ssh_uses_preinstalled_server_and_preserves_workspace_data() -> Result<()> {
     });
     let encoded = serde_json::to_string(&request)?;
     let mut connector = SshConnector {
-        bootstrap: std::sync::Arc::new(Preinstalled),
+        bootstrap: std::sync::Arc::new(InstalledSshBootstrap),
         target: fixture.target.clone(),
         runner: SystemProcessRunner,
         request,
@@ -178,6 +180,33 @@ fn ssh_uses_preinstalled_server_and_preserves_workspace_data() -> Result<()> {
     connection.read_line(&mut actual)?;
     assert_eq!(actual, "protocol payload\n");
     drop(connection);
+    Ok(())
+}
+
+#[test]
+fn ssh_rejects_a_proxy_without_an_advertised_protocol_version() -> Result<()> {
+    let fixture = SshFixture::new()?;
+    std::fs::write(
+        fixture.directory.path().join("zess"),
+        format!(
+            "#!/bin/sh\nset -eu\nIFS= read -r hello\nprintf '%s\\n' '{{\"type\":\"hello\",\"build_id\":\"{}\"}}'\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"session_id\":null}}'\n",
+            zess_build::version()
+        ),
+    )?;
+    let mut connector = SshConnector {
+        bootstrap: std::sync::Arc::new(InstalledSshBootstrap),
+        target: fixture.target.clone(),
+        runner: SystemProcessRunner,
+        request: ProxyRequest::new(ProxyOperation::Status),
+    };
+    let error = connector
+        .connect()
+        .err()
+        .context("legacy proxy connected")?;
+    let mismatch = error.downcast_ref::<ProtocolMismatch>().unwrap();
+    assert_eq!(mismatch.expected.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(mismatch.actual.protocol_version, 0);
+    assert_eq!(mismatch.expected.build_id, mismatch.actual.build_id);
     Ok(())
 }
 
@@ -229,8 +258,8 @@ fn a_stalled_peer_does_not_block_client_reads_or_writes() -> Result<()> {
 fn cancelling_a_connection_interrupts_the_remote_ready_wait() -> Result<()> {
     let fixture = SshFixture::new()?;
     let marker = fixture.directory.path().join("waiting-for-ready");
-    let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
-        version: zess_build::version().into(),
+    let hello = serde_json::to_string(&ServerMessage::Hello {
+        version: VersionInfo::new(zess_build::version()),
     })?;
     let script = format!(
         "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\ntouch '{}'\nexec cat >/dev/null\n",
@@ -269,8 +298,8 @@ fn cancelling_a_connection_interrupts_the_remote_ready_wait() -> Result<()> {
 #[test]
 fn cancelling_after_ready_interrupts_a_blocking_response_read() -> Result<()> {
     let fixture = SshFixture::new()?;
-    let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
-        version: zess_build::version().into(),
+    let hello = serde_json::to_string(&ServerMessage::Hello {
+        version: VersionInfo::new(zess_build::version()),
     })?;
     let script = format!(
         "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"session_id\":null}}'\nexec cat >/dev/null\n"
@@ -312,8 +341,8 @@ fn waiting_for_ssh_exit_reports_failure_status() -> Result<()> {
 #[test]
 fn cancelling_interrupts_wait_for_ssh_exit() -> Result<()> {
     let fixture = SshFixture::new()?;
-    let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
-        version: zess_build::version().into(),
+    let hello = serde_json::to_string(&ServerMessage::Hello {
+        version: VersionInfo::new(zess_build::version()),
     })?;
     let script = format!(
         "#!/bin/sh\nIFS= read -r hello\nprintf '%s\\n' '{hello}'\nIFS= read -r request\nprintf '%s\\n' '{{\"status\":\"ready\",\"session_id\":null}}'\nexec cat >/dev/null\n"
@@ -458,6 +487,33 @@ fn standard_tools(directory: &std::path::Path) -> Result<PathBuf> {
         std::os::unix::fs::symlink(path.trim(), tools.join(name))?;
     }
     Ok(tools)
+}
+
+#[test]
+fn missing_installed_server_reports_how_to_install_it() -> Result<()> {
+    use zess_remote::ServerBootstrap;
+
+    let fixture = SshFixture::new()?;
+    let home = fixture.directory.path();
+    let tools = standard_tools(home)?;
+    std::fs::write(
+        home.join("wrapper.sh"),
+        format!(
+            "#!/bin/sh\nexport HOME='{}' PATH='{}'\nexec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\"\n",
+            home.display(),
+            tools.display()
+        ),
+    )?;
+    let error = InstalledSshBootstrap
+        .prepare(&fixture.target, &SystemProcessRunner)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Zess was not found on the remote host"),
+        "{error}"
+    );
+    assert!(error.contains("cargo install --path . --force"), "{error}");
+    Ok(())
 }
 
 #[test]
@@ -671,8 +727,8 @@ fn ssh_diagnostics_are_reported_to_the_observer() -> Result<()> {
         }
     }
     let fixture = SshFixture::new()?;
-    let hello = serde_json::to_string(&zess_protocol::ServerMessage::Hello {
-        version: zess_build::version().into(),
+    let hello = serde_json::to_string(&ServerMessage::Hello {
+        version: VersionInfo::new(zess_build::version()),
     })?;
     std::fs::write(
         fixture.directory.path().join("zess"),

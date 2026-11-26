@@ -437,7 +437,7 @@ fn reconnecting_recovers_unacknowledged_results_without_repeating_commands() {
                 let _ = framing::write(
                     &mut stream,
                     &ClientMessage::Hello {
-                        version: zess_build::version().into(),
+                        version: VersionInfo::new(zess_build::version()),
                     },
                 );
                 let _ = framing::write(&mut stream, &ClientMessage::Stop { force: true });
@@ -456,7 +456,7 @@ fn reconnecting_recovers_unacknowledged_results_without_repeating_commands() {
             framing::write(
                 stream,
                 &ClientMessage::Hello {
-                    version: zess_build::version().into(),
+                    version: VersionInfo::new(zess_build::version()),
                 },
             )
             .unwrap();
@@ -469,7 +469,7 @@ fn reconnecting_recovers_unacknowledged_results_without_repeating_commands() {
         assert!(reader.read_line(&mut line).unwrap() > 0);
         let message = serde_json::from_str(&line).unwrap();
         if let ServerMessage::Hello { version } = message {
-            zess_protocol::check_version(zess_build::version(), &version).unwrap();
+            assert_eq!(version, VersionInfo::new(zess_build::version()));
             receive(reader)
         } else {
             message

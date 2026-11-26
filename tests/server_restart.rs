@@ -137,7 +137,7 @@ impl Drop for Server {
 
 fn connect(socket: &Path) -> UnixStream {
     static VERSION: LazyLock<String> = LazyLock::new(|| {
-        zess_build::RELEASE_VERSION
+        zess_build::BUILD_VERSION
             .map(str::to_owned)
             .unwrap_or_else(|| {
                 zess_build::development_version(Path::new(env!("CARGO_BIN_EXE_zess"))).unwrap()
@@ -146,10 +146,15 @@ fn connect(socket: &Path) -> UnixStream {
     let mut stream = UnixStream::connect(socket).unwrap();
     send(
         &mut stream,
-        json!({"type": "hello", "build_id": VERSION.as_str()}),
+        json!({
+            "type": "hello",
+            "protocol_version": zess_protocol::PROTOCOL_VERSION,
+            "build_id": VERSION.as_str(),
+        }),
     );
     let hello = receive(&mut BufReader::new(stream.try_clone().unwrap()));
     assert_eq!(hello["type"], "hello");
+    assert_eq!(hello["protocol_version"], zess_protocol::PROTOCOL_VERSION);
     assert_eq!(hello["build_id"], VERSION.as_str());
     stream
 }

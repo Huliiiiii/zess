@@ -16,33 +16,58 @@ mod tests;
 
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
+pub const PROTOCOL_VERSION: u32 = 4;
 
-#[derive(Debug)]
-pub struct VersionMismatch {
-    pub expected: String,
-    pub actual: String,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionInfo {
+    /// Zero denotes a peer with no advertised protocol version.
+    #[serde(default)]
+    pub protocol_version: u32,
+    pub build_id: String,
 }
 
-impl std::fmt::Display for VersionMismatch {
+#[derive(Debug)]
+pub struct ProtocolMismatch {
+    pub expected: VersionInfo,
+    pub actual: VersionInfo,
+}
+
+impl std::fmt::Display for ProtocolMismatch {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "zess version mismatch: expected {}, received {}",
-            self.expected, self.actual
-        )
+            "zess protocol mismatch: expected protocol {} (build {}), received protocol {} (build {})",
+            self.expected.protocol_version,
+            self.expected.build_id,
+            self.actual.protocol_version,
+            self.actual.build_id,
+        )?;
+        if self.actual.protocol_version == 0 {
+            formatter.write_str(" (peer did not advertise a protocol version)")?;
+        }
+        Ok(())
     }
 }
 
-impl std::error::Error for VersionMismatch {}
+impl std::error::Error for ProtocolMismatch {}
 
-pub fn check_version(expected: &str, actual: &str) -> Result<(), VersionMismatch> {
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(VersionMismatch {
-            expected: expected.to_owned(),
-            actual: actual.to_owned(),
-        })
+impl VersionInfo {
+    pub fn new(build_id: impl Into<String>) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            build_id: build_id.into(),
+        }
+    }
+
+    pub fn check_compatible(&self, actual: &Self) -> Result<(), ProtocolMismatch> {
+        if self.protocol_version != 0 && self.protocol_version == actual.protocol_version {
+            Ok(())
+        } else {
+            Err(ProtocolMismatch {
+                expected: self.clone(),
+                actual: actual.clone(),
+            })
+        }
     }
 }
 
@@ -591,8 +616,8 @@ pub enum ClientMessage {
     },
     ConfirmAttach,
     Hello {
-        #[serde(rename = "build_id")]
-        version: String,
+        #[serde(flatten)]
+        version: VersionInfo,
     },
     Status,
     Stop {
@@ -659,12 +684,12 @@ pub enum ServerMessage {
     AttachPending,
     AttachConfirmed,
     Hello {
-        #[serde(rename = "build_id")]
-        version: String,
+        #[serde(flatten)]
+        version: VersionInfo,
     },
     Status {
-        #[serde(rename = "build_id")]
-        version: String,
+        #[serde(flatten)]
+        version: VersionInfo,
         session_id: SessionId,
         name: Option<String>,
         server_instance: ServerInstanceId,

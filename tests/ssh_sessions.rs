@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use zess_platform::SystemProcessRunner;
-use zess_protocol::{ClientMessage, ServerMessage, SessionId};
+use zess_protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, SessionId, VersionInfo};
 use zess_remote::{
     Connector, ProxyOperation, ProxyRequest, SshConnection, SshConnector, SshTarget,
 };
@@ -29,6 +29,7 @@ for arg do command=$arg; done
 case "$command" in
     *uname*) printf '%s\n' Linux x86_64; exit 0 ;;
     *sha256sum*) exit 0 ;;
+    *"command -v zess"*) printf '%s\n' path; exit 0 ;;
     *remote-proxy*) ;;
     *) printf '%s\n' 'unexpected SSH command' >&2; exit 1 ;;
 esac
@@ -181,10 +182,11 @@ fn a_disconnected_proxy_leaves_the_workspace_available_for_a_fresh_attach() -> R
         std::fs::create_dir(path)?;
     }
     let binary = Path::new(env!("CARGO_BIN_EXE_zess"));
-    let version = match zess_build::RELEASE_VERSION {
+    let build_id = match zess_build::BUILD_VERSION {
         Some(version) => version.to_owned(),
         None => zess_build::development_version(binary)?,
     };
+    let version = VersionInfo::new(build_id);
     let command = || {
         let mut command = Command::new(binary);
         command
@@ -318,10 +320,6 @@ struct RemoteSession {
 
 impl RemoteSession {
     fn new() -> Result<Self> {
-        ensure!(
-            zess_build::RELEASE_VERSION.is_some(),
-            "build the SSH test harness and its client and server with the same ZESS_RELEASE_VERSION"
-        );
         let directory = tempfile::Builder::new()
             .prefix("zess-ssh-sessions-")
             .tempdir()?;
@@ -341,6 +339,14 @@ impl RemoteSession {
             tmux_socket,
             pane_started: false,
         })
+    }
+
+    fn new_release() -> Result<Self> {
+        ensure!(
+            zess_build::RELEASE_VERSION.is_some(),
+            "build the SSH test harness and its client and server with the same ZESS_RELEASE_VERSION"
+        );
+        Self::new()
     }
 
     fn command(&self, arguments: &[&str]) -> Command {
@@ -399,18 +405,19 @@ impl RemoteSession {
         let mut connection = self.connect_operation(ProxyOperation::AttachSession {
             session_id: session.to_owned(),
         })?;
+        let version = VersionInfo::new(zess_build::version());
         zess_remote::write_request(
             &mut connection,
-            &zess_protocol::ClientMessage::Hello {
-                version: zess_build::version().into(),
+            &ClientMessage::Hello {
+                version: version.clone(),
             },
         )?;
-        let hello: zess_protocol::ServerMessage =
+        let hello: ServerMessage =
             zess_remote::read_request(&mut io::BufReader::new(&mut connection))?;
-        let zess_protocol::ServerMessage::Hello { version } = hello else {
+        let ServerMessage::Hello { version: peer } = hello else {
             anyhow::bail!("missing server hello")
         };
-        zess_protocol::check_version(zess_build::version(), &version)?;
+        version.check_compatible(&peer)?;
         connection.set_nonblocking(true)?;
         Ok(RemoteWire {
             connection,
@@ -612,13 +619,112 @@ impl Drop for RemoteSession {
     }
 }
 
+/// The localhost fixture must use an isolated HOME, put a compatible server with a
+/// distinct build ID at ~/.cargo/bin/zess, expose a failing zess on PATH, and have no
+/// release server cache.
+#[test]
+#[ignore = "requires an isolated localhost SSH fixture through ZESS_TEST_SSH_CONFIG and tmux"]
+fn git_clients_can_edit_over_ssh_with_a_different_installed_build() -> Result<()> {
+    ensure!(
+        zess_build::BUILD_VERSION.is_some_and(|id| id.starts_with("dev-")),
+        "build the SSH test harness and client from Git without ZESS_RELEASE_VERSION"
+    );
+    let mut fixture = RemoteSession::new()?;
+    let installed_version = |fixture: &RemoteSession| -> Result<String> {
+        let output = Command::new("ssh")
+            .args(["-T", "-o", "ConnectTimeout=5", "-F"])
+            .arg(&fixture.ssh_config)
+            .arg("--")
+            .arg(&fixture.host)
+            .arg(r#"test -x "$HOME/.cargo/bin/zess" && command -v zess >/dev/null && ! zess --version && test ! -e "$HOME/.cache/zess/servers" && "$HOME/.cargo/bin/zess" --version"#)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "fixture must have a Cargo-installed zess, a failing zess on PATH, and no release server cache: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    };
+    let client = Command::new(&fixture.binary).arg("--version").output()?;
+    ensure!(
+        client.status.success(),
+        "fixture client cannot report its version"
+    );
+    let client = String::from_utf8(client.stdout)?;
+    let installed = installed_version(&fixture)?;
+    let build_id = installed
+        .strip_prefix("zess ")
+        .context("server build ID missing")?;
+    ensure!(
+        client.trim().starts_with("zess dev-"),
+        "fixture client must be a Git build"
+    );
+    ensure!(
+        client.trim() != installed,
+        "fixture requires distinct client and server build IDs"
+    );
+    assert!(fixture.entries()?.is_empty());
+
+    let workspace = fixture.directory.path().join("workspace");
+    std::fs::create_dir(&workspace)?;
+    let file = workspace.join("notes.txt");
+    std::fs::write(&file, "base\n")?;
+    let config = workspace.join("init.w");
+    std::fs::write(
+        &config,
+        "set-session-options! : obj 'on-client-exit 'keep\n",
+    )?;
+    let info = fixture.json(&[
+        "new",
+        "--remote-workspace",
+        workspace.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--json",
+    ])?;
+    let session = info["session_id"].as_str().context("session ID missing")?;
+    fixture.sessions.push(session.to_owned());
+    assert_eq!(info["build_id"], build_id);
+    assert_eq!(info["protocol_version"], PROTOCOL_VERSION);
+
+    let mut command = Command::new(&fixture.binary);
+    command
+        .arg(format!("ssh://{}{}", fixture.host, workspace.display()))
+        .arg(&file)
+        .arg("--ssh-config")
+        .arg(&fixture.ssh_config);
+    fixture.connect_terminal(command)?;
+    fixture.wait_screen(|screen| screen.contains("base") && screen.contains("notes.txt"))?;
+    fixture.keys(&["i"])?;
+    fixture.wait_screen(|screen| screen.contains(" INS "))?;
+    fixture.literal("edited ")?;
+    fixture.wait_screen(|screen| screen.contains("edited base"))?;
+    fixture.normal()?;
+    fixture.save()?;
+    fixture.wait_file(&file, "edited base\n")?;
+    fixture.detach()?;
+
+    let entries = fixture.entries()?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["session_id"], session);
+    assert_eq!(entries[0]["server_instance"], info["server_instance"]);
+    assert_eq!(entries[0]["attached"], false);
+    assert_eq!(entries[0]["modified"], false);
+    let stopped = fixture.json(&["stop", "--session", session, "--json"])?;
+    assert_eq!(stopped["status"], "stopped");
+    fixture.sessions.clear();
+    assert!(fixture.entries()?.is_empty());
+    assert_eq!(installed_version(&fixture)?, installed);
+    Ok(())
+}
+
 /// The SSH server must share this machine's temporary filesystem, isolate its runtime,
 /// have the same build of zess on PATH for direct connector checks, and make the
 /// matching server artifact available to the CLI deployment flow.
 #[test]
 #[ignore = "requires an isolated localhost SSH fixture through ZESS_TEST_SSH_CONFIG and tmux"]
 fn remote_sessions_keep_edits_and_undo_across_terminal_detachment() -> Result<()> {
-    let mut fixture = RemoteSession::new()?;
+    let mut fixture = RemoteSession::new_release()?;
     let missing = fixture.directory.path().join("workspace-does-not-exist");
     let started = Instant::now();
     let failed = fixture.connect_operation(ProxyOperation::Attach {
@@ -753,7 +859,7 @@ fn remote_sessions_keep_edits_and_undo_across_terminal_detachment() -> Result<()
 #[test]
 #[ignore = "requires an isolated localhost SSH fixture through ZESS_TEST_SSH_CONFIG"]
 fn replaying_a_document_edit_after_an_ssh_disconnect_saves_it_once() -> Result<()> {
-    let mut fixture = RemoteSession::new()?;
+    let mut fixture = RemoteSession::new_release()?;
     let workspace = fixture.directory.path().join("replay workspace");
     std::fs::create_dir(&workspace)?;
     let file = workspace.join("saved.txt");

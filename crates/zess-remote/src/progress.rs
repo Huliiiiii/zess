@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteStage {
     DetectingPlatform,
+    CheckingInstalledServer,
     CheckingCache,
     Downloading,
     Uploading,
